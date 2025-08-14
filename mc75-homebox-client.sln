@@ -1,0 +1,29 @@
+Microsoft Visual Studio Solution File, Format Version 10.00
+# Visual Studio 2008
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "HBXClient", "proj\HBXClient.vcproj", "{A1E5E9B1-7B2B-4B5D-8D49-DB9B24B7B111}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "HBXClientCab", "proj\HBXClientCab.vcproj", "{B2F6FA02-AB33-4A5B-9F50-0F2C6BF8E222}"
+	ProjectSection(ProjectDependencies) = postProject
+		{A1E5E9B1-7B2B-4B5D-8D49-DB9B24B7B111} = {A1E5E9B1-7B2B-4B5D-8D49-DB9B24B7B111}
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Windows Mobile 6 Professional SDK (ARMV4I) = Debug|Windows Mobile 6 Professional SDK (ARMV4I)
+		Release|Windows Mobile 6 Professional SDK (ARMV4I) = Release|Windows Mobile 6 Professional SDK (ARMV4I)
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{A1E5E9B1-7B2B-4B5D-8D49-DB9B24B7B111}.Debug|Windows Mobile 6 Professional SDK (ARMV4I).ActiveCfg = Debug|Windows Mobile 6 Professional SDK (ARMV4I)
+		{A1E5E9B1-7B2B-4B5D-8D49-DB9B24B7B111}.Debug|Windows Mobile 6 Professional SDK (ARMV4I).Build.0 = Debug|Windows Mobile 6 Professional SDK (ARMV4I)
+		{A1E5E9B1-7B2B-4B5D-8D49-DB9B24B7B111}.Release|Windows Mobile 6 Professional SDK (ARMV4I).ActiveCfg = Release|Windows Mobile 6 Professional SDK (ARMV4I)
+		{A1E5E9B1-7B2B-4B5D-8D49-DB9B24B7B111}.Release|Windows Mobile 6 Professional SDK (ARMV4I).Build.0 = Release|Windows Mobile 6 Professional SDK (ARMV4I)
+
+		{B2F6FA02-AB33-4A5B-9F50-0F2C6BF8E222}.Debug|Windows Mobile 6 Professional SDK (ARMV4I).ActiveCfg = Debug|Windows Mobile 6 Professional SDK (ARMV4I)
+		{B2F6FA02-AB33-4A5B-9F50-0F2C6BF8E222}.Debug|Windows Mobile 6 Professional SDK (ARMV4I).Build.0 = Debug|Windows Mobile 6 Professional SDK (ARMV4I)
+		{B2F6FA02-AB33-4A5B-9F50-0F2C6BF8E222}.Release|Windows Mobile 6 Professional SDK (ARMV4I).ActiveCfg = Release|Windows Mobile 6 Professional SDK (ARMV4I)
+		{B2F6FA02-AB33-4A5B-9F50-0F2C6BF8E222}.Release|Windows Mobile 6 Professional SDK (ARMV4I).Build.0 = Release|Windows Mobile 6 Professional SDK (ARMV4I)
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal
