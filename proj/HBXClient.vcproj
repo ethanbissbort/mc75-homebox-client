@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="Windows-1252"?>
+<VisualStudioProject
+	ProjectType="Visual C++"
+	Version="9.00"
+	Name="HBXClient"
+	ProjectGUID="{A1E5E9B1-7B2B-4B5D-8D49-DB9B24B7B111}"
+	RootNamespace="HBXClient"
+	Keyword="Win32Proj"
+	TargetFrameworkVersion="0"
+	>
+	<Platforms>
+		<Platform Name="Windows Mobile 6 Professional SDK (ARMV4I)"/>
+	</Platforms>
+	<ToolFiles/>
+	<Configurations>
+
+		<Configuration
+			Name="Debug|Windows Mobile 6 Professional SDK (ARMV4I)"
+			OutputDirectory=".\..\bin\Debug"
+			IntermediateDirectory=".\..\obj\Debug"
+			ConfigurationType="1"
+			UseOfMFC="0"
+			CharacterSet="1">
+			<Tool Name="VCPreBuildEventTool"/>
+			<Tool Name="VCCustomBuildTool"/>
+			<Tool Name="VCXMLDataGeneratorTool"/>
+			<Tool Name="VCWebServiceProxyGeneratorTool"/>
+			<Tool Name="VCMIDLTool"/>
+			<Tool Name="VCCLCompilerTool"
+				Optimization="0"
+				AdditionalIncludeDirectories="..\include;C:\Program Files\Windows Mobile 6 SDK\PocketPC\Include\Armv4i;C:\Program Files\Zebra EMDK\C\Include"
+				PreprocessorDefinitions="WIN32;_WIN32_WCE=0x0600;UNDER_CE;WIN32_PLATFORM_PSPC;_DEBUG"
+				RuntimeLibrary="3"
+				UsePrecompiledHeader="0"
+				WarningLevel="3"
+				DebugInformationFormat="3"/>
+			<Tool Name="VCLinkerTool"
+				AdditionalDependencies="coredll.lib aygshell.lib commctrl.lib ole32.lib oleaut32.lib winsock.lib"
+				AdditionalLibraryDirectories="C:\Program Files\Windows Mobile 6 SDK\PocketPC\Lib\Armv4i;C:\Program Files\Zebra EMDK\C\Lib\ARMV4I"
+				SubSystem="8"
+				EntryPointSymbol="WinMainCRTStartup"
+				GenerateDebugInformation="true"/>
+			<Tool Name="VCALinkTool"/>
+			<Tool Name="VCManifestTool"/>
+			<Tool Name="VCXDCMakeTool"/>
+			<Tool Name="VCBscMakeTool"/>
+			<Tool Name="VCFxCopTool"/>
+			<Tool Name="VCAppVerifierTool"/>
+			<Tool Name="VCPostBuildEventTool"/>
+		</Configuration>
+
+		<Configuration
+			Name="Release|Windows Mobile 6 Professional SDK (ARMV4I)"
+			OutputDirectory=".\..\bin\Release"
+			IntermediateDirectory=".\..\obj\Release"
+			ConfigurationType="1"
+			UseOfMFC="0"
+			CharacterSet="1">
+			<Tool Name="VCPreBuildEventTool"/>
+			<Tool Name="VCCustomBuildTool"/>
+			<Tool Name="VCXMLDataGeneratorTool"/>
+			<Tool Name="VCWebServiceProxyGeneratorTool"/>
+			<Tool Name="VCMIDLTool"/>
+			<Tool Name="VCCLCompilerTool"
+				Optimization="2"
+				InlineFunctionExpansion="1"
+				EnableIntrinsicFunctions="true"
+				FavorSizeOrSpeed="1"
+				OmitFramePointers="true"
+				AdditionalIncludeDirectories="..\include;C:\Program Files\Windows Mobile 6 SDK\PocketPC\Include\Armv4i;C:\Program Files\Zebra EMDK\C\Include"
+				PreprocessorDefinitions="WIN32;_WIN32_WCE=0x0600;UNDER_CE;WIN32_PLATFORM_PSPC;NDEBUG"
+				RuntimeLibrary="2"
+				UsePrecompiledHeader="0"
+				WarningLevel="3"
+				DebugInformationFormat="3"/>
+			<Tool Name="VCLinkerTool"
+				AdditionalDependencies="coredll.lib aygshell.lib commctrl.lib ole32.lib oleaut32.lib winsock.lib"
+				AdditionalLibraryDirectories="C:\Program Files\Windows Mobile 6 SDK\PocketPC\Lib\Armv4i;C:\Program Files\Zebra EMDK\C\Lib\ARMV4I"
+				SubSystem="8"
+				EntryPointSymbol="WinMainCRTStartup"
+				GenerateDebugInformation="false"/>
+			<Tool Name="VCALinkTool"/>
+			<Tool Name="VCManifestTool"/>
+			<Tool Name="VCXDCMakeTool"/>
+			<Tool Name="VCBscMakeTool"/>
+			<Tool Name="VCFxCopTool"/>
+			<Tool Name="VCAppVerifierTool"/>
+			<Tool Name="VCPostBuildEventTool"/>
+		</Configuration>
+
+	</Configurations>
+
+	<Files>
+		<File RelativePath="..\src\main.cpp"/>
+		<File RelativePath="..\src\Controller.cpp"/>
+		<File RelativePath="..\src\HttpClient.cpp"/>
+		<File RelativePath="..\src\HbClient.cpp"/>
+		<File RelativePath="..\src\Journal.cpp"/>
+		<File RelativePath="..\src\SyncEngine.cpp"/>
+		<File RelativePath="..\src\Config.cpp"/>
+		<Filter Name="Views">
+			<File RelativePath="..\src\Views\ScanView.cpp"/>
+			<File RelativePath="..\src\Views\ItemView.cpp"/>
+			<File RelativePath="..\src\Views\QueueView.cpp"/>
+			<File RelativePath="..\src\Views\ViewHelpers.cpp"/>
+		</Filter>
+		<Filter Name="Models">
+			<File RelativePath="..\src\Models\Item.cpp"/>
+			<File RelativePath="..\src\Models\Location.cpp"/>
+			<File RelativePath="..\src\Models\JsonLite.cpp"/>
+		</Filter>
+		<File RelativePath="..\resources\layout.rc"/>
+		<File RelativePath="..\resources\strings.rc"/>
+		<File RelativePath="..\resources\resource.h"/>
+		<Filter Name="Headers">
+			<File RelativePath="..\include\Controller.hpp"/>
+			<File RelativePath="..\include\HttpClient.hpp"/>
+			<File RelativePath="..\include\HbClient.hpp"/>
+			<File RelativePath="..\include\Journal.hpp"/>
+			<File RelativePath="..\include\SyncEngine.hpp"/>
+			<File RelativePath="..\include\Config.hpp"/>
+			<File RelativePath="..\include\ScannerHAL.hpp"/>
+			<File RelativePath="..\include\Models\Models.hpp"/>
+			<File RelativePath="..\include\Models\Item.hpp"/>
+			<File RelativePath="..\include\Models\Location.hpp"/>
+			<File RelativePath="..\include\Models\JsonLite.hpp"/>
+			<File RelativePath="..\include\Views\ScanView.hpp"/>
+			<File RelativePath="..\include\Views\ItemView.hpp"/>
+			<File RelativePath="..\include\Views\QueueView.hpp"/>
+			<File RelativePath="..\include\Views\ViewHelpers.hpp"/>
+		</Filter>
+	</Files>
+
+	<Globals/>
+</VisualStudioProject>

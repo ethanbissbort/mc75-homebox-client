@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="Windows-1252"?>
+<VisualStudioProject
+	ProjectType="SmartDeviceCab"
+	Version="9.00"
+	Name="HBXClientCab"
+	ProjectGUID="{B2F6FA02-AB33-4A5B-9F50-0F2C6BF8E222}"
+	TargetFrameworkVersion="0">
+
+	<Configurations>
+		<Configuration Name="Debug|Windows Mobile 6 Professional SDK (ARMV4I)" OutputDirectory="..\bin\Debug" IntermediateDirectory="..\obj\Debug">
+			<Tool Name="SmartDeviceCabBuildTool"
+				CabOutputFile="HBXClient_Debug.CAB"
+				Manufacturer="Homestead"
+				Product="HBXClient"
+				Version="1.0.0.0"
+				RemovePrevious="true"
+				DefaultInstallDir="\Program Files\HBXClient\"/>
+			<DeploymentFiles>
+				<DeployFile Name="..\bin\Debug\HBXClient.exe" DestinationDir="\Program Files\HBXClient\"/>
+				<DeployFile Name="..\resources\strings.rc" DestinationDir="\Program Files\HBXClient\"/>
+				<DeployFile Name="..\resources\layout.rc" DestinationDir="\Program Files\HBXClient\"/>
+				<DeployFile Name="..\hb_conf.json" DestinationDir="\Program Files\HBXClient\" Condition="IfExists"/>
+			</DeploymentFiles>
+		</Configuration>
+
+		<Configuration Name="Release|Windows Mobile 6 Professional SDK (ARMV4I)" OutputDirectory="..\bin\Release" IntermediateDirectory="..\obj\Release">
+			<Tool Name="SmartDeviceCabBuildTool"
+				CabOutputFile="HBXClient.CAB"
+				Manufacturer="Homestead"
+				Product="HBXClient"
+				Version="1.0.0.0"
+				RemovePrevious="true"
+				DefaultInstallDir="\Program Files\HBXClient\"/>
+			<DeploymentFiles>
+				<DeployFile Name="..\bin\Release\HBXClient.exe" DestinationDir="\Program Files\HBXClient\"/>
+				<DeployFile Name="..\hb_conf.json" DestinationDir="\Program Files\HBXClient\" Condition="IfExists"/>
+			</DeploymentFiles>
+		</Configuration>
+	</Configurations>
+</VisualStudioProject>
