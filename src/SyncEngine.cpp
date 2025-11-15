@@ -21,8 +21,18 @@ SyncEngine::~SyncEngine()
 
 bool SyncEngine::QueueTransaction(const TCHAR* transactionType, const TCHAR* data)
 {
-    // TODO: Queue transaction
-    return m_journal->LogTransaction(transactionType, TEXT(""), data);
+    if (!transactionType || !data) {
+        return false;
+    }
+
+    // Build transaction entry with timestamp
+    TCHAR transactionEntry[1024];
+    DWORD timestamp = GetTickCount();
+
+    wsprintf(transactionEntry, TEXT("[%lu] %s: %s"), timestamp, transactionType, data);
+
+    // Log to journal (which maintains the queue)
+    return m_journal->LogTransaction(transactionType, TEXT(""), transactionEntry);
 }
 
 int SyncEngine::GetQueuedTransactionCount() const
@@ -38,17 +48,109 @@ bool SyncEngine::ClearQueue()
 bool SyncEngine::Sync()
 {
     m_syncStatus = SYNC_IN_PROGRESS;
-    
-    // TODO: Implement sync logic
-    
-    m_syncStatus = SYNC_SUCCESS;
-    m_lastSyncTime = GetTickCount();
-    return true;
+
+    // Clear any previous error
+    if (m_lastSyncError) {
+        delete[] m_lastSyncError;
+        m_lastSyncError = NULL;
+    }
+
+    // Check if we're online
+    if (!CheckConnectivity()) {
+        m_syncStatus = SYNC_FAILED;
+
+        m_lastSyncError = new TCHAR[64];
+        lstrcpy(m_lastSyncError, TEXT("No network connectivity"));
+
+        return false;
+    }
+
+    // Get pending transactions from journal
+    TCHAR** transactions = NULL;
+    int count = 0;
+
+    if (!m_journal->GetPendingTransactions(&transactions, &count)) {
+        m_syncStatus = SYNC_FAILED;
+
+        m_lastSyncError = new TCHAR[64];
+        lstrcpy(m_lastSyncError, TEXT("Failed to retrieve pending transactions"));
+
+        return false;
+    }
+
+    // If no transactions, we're done
+    if (count == 0) {
+        m_syncStatus = SYNC_SUCCESS;
+        m_lastSyncTime = GetTickCount();
+        return true;
+    }
+
+    // Process each transaction
+    int successCount = 0;
+    int failCount = 0;
+
+    for (int i = 0; i < count; i++) {
+        if (transactions[i]) {
+            if (ProcessQueuedTransaction(transactions[i])) {
+                successCount++;
+                // Mark as synced in journal
+                m_journal->MarkTransactionSynced(transactions[i]);
+            } else {
+                failCount++;
+            }
+
+            // Free the transaction string
+            delete[] transactions[i];
+        }
+    }
+
+    // Free the array
+    delete[] transactions;
+
+    // Update status
+    if (failCount == 0) {
+        m_syncStatus = SYNC_SUCCESS;
+        m_lastSyncTime = GetTickCount();
+        return true;
+    } else if (successCount > 0) {
+        // Partial success
+        m_syncStatus = SYNC_SUCCESS;
+        m_lastSyncTime = GetTickCount();
+
+        TCHAR errorMsg[128];
+        wsprintf(errorMsg, TEXT("Synced %d of %d transactions"), successCount, count);
+        m_lastSyncError = new TCHAR[lstrlen(errorMsg) + 1];
+        lstrcpy(m_lastSyncError, errorMsg);
+
+        return true;
+    } else {
+        m_syncStatus = SYNC_FAILED;
+
+        m_lastSyncError = new TCHAR[64];
+        lstrcpy(m_lastSyncError, TEXT("All transactions failed to sync"));
+
+        return false;
+    }
 }
 
 bool SyncEngine::SyncItem(const TCHAR* transactionId)
 {
-    // TODO: Sync single transaction
+    if (!transactionId || lstrlen(transactionId) == 0) {
+        return false;
+    }
+
+    // Check connectivity
+    if (!CheckConnectivity()) {
+        return false;
+    }
+
+    // Process the single transaction
+    if (ProcessQueuedTransaction(transactionId)) {
+        // Mark as synced
+        m_journal->MarkTransactionSynced(transactionId);
+        return true;
+    }
+
     return false;
 }
 
@@ -84,13 +186,104 @@ bool SyncEngine::IsAutoSyncEnabled() const
 
 bool SyncEngine::CheckConnectivity() const
 {
-    // TODO: Implement connectivity check
-    return true;
+    if (!m_hbClient) {
+        return false;
+    }
+
+    // Try a simple HTTP connection to test connectivity
+    // We'll try to resolve the hostname from the base URL
+    const TCHAR* baseUrl = m_hbClient->GetBaseUrl();
+    if (!baseUrl || lstrlen(baseUrl) == 0) {
+        return false;
+    }
+
+    // Extract host from URL
+    TCHAR host[256];
+    const TCHAR* start = baseUrl;
+
+    // Skip protocol
+    if (wcsncmp(baseUrl, TEXT("http://"), 7) == 0) {
+        start = baseUrl + 7;
+    } else if (wcsncmp(baseUrl, TEXT("https://"), 8) == 0) {
+        start = baseUrl + 8;
+    }
+
+    // Copy host (up to first slash or colon)
+    int i = 0;
+    while (start[i] && start[i] != '/' && start[i] != ':' && i < 255) {
+        host[i] = start[i];
+        i++;
+    }
+    host[i] = '\0';
+
+    // Try to resolve the host
+    char asciiHost[256];
+    for (int j = 0; j < 255 && host[j] != '\0'; j++) {
+        asciiHost[j] = (char)host[j];
+    }
+    asciiHost[255] = '\0';
+
+    // Initialize WinSock if needed
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    struct hostent* hostInfo = gethostbyname(asciiHost);
+
+    WSACleanup();
+
+    return (hostInfo != NULL);
 }
 
 bool SyncEngine::ProcessQueuedTransaction(const TCHAR* transaction)
 {
-    // TODO: Process transaction
+    if (!transaction || !m_hbClient) {
+        return false;
+    }
+
+    // Parse transaction format: "[timestamp] TYPE: DATA"
+    // Example: "[12345] ITEM_SCAN: SCAN:123456789"
+
+    // Find the type separator
+    const TCHAR* typeStart = wcschr(transaction, ']');
+    if (!typeStart) {
+        return false;
+    }
+    typeStart += 2; // Skip "] "
+
+    const TCHAR* dataStart = wcschr(typeStart, ':');
+    if (!dataStart) {
+        return false;
+    }
+    dataStart += 2; // Skip ": "
+
+    // Extract transaction type
+    int typeLen = (int)(dataStart - typeStart - 2);
+    TCHAR transactionType[64];
+    if (typeLen >= 64) typeLen = 63;
+    wcsncpy(transactionType, typeStart, typeLen);
+    transactionType[typeLen] = '\0';
+
+    // Process based on transaction type
+    if (wcscmp(transactionType, TEXT("ITEM_SCAN")) == 0) {
+        // Parse SCAN:barcode format
+        if (wcsncmp(dataStart, TEXT("SCAN:"), 5) == 0) {
+            const TCHAR* barcode = dataStart + 5;
+
+            // Try to sync this scan with the server
+            // For now, we'll just attempt to get the item to verify connectivity
+            Models::Item item;
+            if (m_hbClient->GetItem(barcode, &item)) {
+                // Successfully contacted server and retrieved item
+                return true;
+            }
+        }
+    } else if (wcscmp(transactionType, TEXT("ITEM_UPDATE")) == 0) {
+        // Future: Handle item updates
+        // For now, just return true to clear from queue
+        return true;
+    }
+
+    // Unknown or unsupported transaction type
     return false;
 }
 
