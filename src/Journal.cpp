@@ -62,8 +62,70 @@ bool Journal::LogInfo(const TCHAR* message)
 
 bool Journal::GetPendingTransactions(TCHAR*** transactions, int* count)
 {
-    // TODO: Implement
+    if (!transactions || !count) {
+        return false;
+    }
+
+    *transactions = NULL;
     *count = 0;
+
+    if (m_fileHandle == INVALID_HANDLE_VALUE || m_transactionCount == 0) {
+        return true; // No transactions
+    }
+
+    // Allocate array for transaction pointers
+    int maxTransactions = m_transactionCount;
+    TCHAR** transArray = new TCHAR*[maxTransactions];
+    int transCount = 0;
+
+    // Read file from beginning
+    SetFilePointer(m_fileHandle, 0, NULL, FILE_BEGIN);
+
+    char buffer[1024];
+    DWORD bytesRead;
+    char line[1024];
+    int linePos = 0;
+
+    while (ReadFile(m_fileHandle, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+        for (DWORD i = 0; i < bytesRead; i++) {
+            if (buffer[i] == '\n' || buffer[i] == '\r') {
+                if (linePos > 0) {
+                    line[linePos] = '\0';
+
+                    // Check if line contains transaction (simple check for "TRANS")
+                    if (strstr(line, "TRANS") && !strstr(line, "SYNCED")) {
+                        // Convert to TCHAR and store
+                        int len = linePos + 1;
+                        TCHAR* trans = new TCHAR[len];
+                        for (int j = 0; j < linePos; j++) {
+                            trans[j] = (TCHAR)line[j];
+                        }
+                        trans[linePos] = '\0';
+
+                        transArray[transCount++] = trans;
+
+                        if (transCount >= maxTransactions) {
+                            break;
+                        }
+                    }
+
+                    linePos = 0;
+                }
+            } else {
+                if (linePos < sizeof(line) - 1) {
+                    line[linePos++] = buffer[i];
+                }
+            }
+        }
+
+        if (transCount >= maxTransactions) {
+            break;
+        }
+    }
+
+    *transactions = transArray;
+    *count = transCount;
+
     return true;
 }
 

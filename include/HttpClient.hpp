@@ -30,16 +30,28 @@ public:
     const TCHAR* GetLastError() const;
 
 private:
+    // Header storage structure
+    struct HttpHeader {
+        TCHAR* key;
+        TCHAR* value;
+        HttpHeader* next;
+    };
+
     SOCKET m_socket;
     DWORD m_timeoutMs;
     int m_lastStatusCode;
     TCHAR* m_lastError;
+    HttpHeader* m_headers;
 
     // Internal request handling
     bool SendRequest(const TCHAR* method, const TCHAR* url, const TCHAR* body, TCHAR* response, DWORD maxResponseLen);
     bool Connect(const TCHAR* host, int port);
     void Disconnect();
     bool ParseUrl(const TCHAR* url, TCHAR* host, int* port, TCHAR* path);
+
+    // Header management
+    void ClearHeaders();
+    void BuildHeaderString(char* buffer, int maxLen);
 };
 
 } // namespace HBX

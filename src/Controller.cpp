@@ -170,8 +170,56 @@ void Controller::OnScanReceived(const TCHAR* barcode)
 
     m_journal->LogTransaction(TEXT("SCAN"), barcode, TEXT("Barcode scanned"));
 
-    // TODO: Lookup item and display
-    // TODO: Queue transaction if offline
+    SetState(STATE_SCANNING);
+
+    // Try to lookup item from API
+    Models::Item item;
+    bool success = m_hbClient->GetItem(barcode, &item);
+
+    if (success && item.IsValid()) {
+        // Item found - display it
+        TCHAR message[512];
+        wsprintf(message, TEXT("Item Found:\n%s\nBarcode: %s\nLocation: %s\nQuantity: %d"),
+                 item.GetName() ? item.GetName() : TEXT("Unknown"),
+                 item.GetBarcode() ? item.GetBarcode() : TEXT(""),
+                 item.GetLocationId() ? item.GetLocationId() : TEXT("None"),
+                 item.GetQuantity());
+
+        MessageBox(m_mainWindow, message, TEXT("Item Details"), MB_OK | MB_ICONINFORMATION);
+
+        m_journal->LogInfo(TEXT("Item lookup successful"));
+    } else {
+        // Item not found or offline - queue the transaction
+        if (!m_syncEngine->IsOnline()) {
+            // Queue transaction for later sync
+            TCHAR transactionData[512];
+            wsprintf(transactionData, TEXT("SCAN:%s"), barcode);
+
+            if (m_syncEngine->QueueTransaction(TEXT("ITEM_SCAN"), transactionData)) {
+                MessageBox(m_mainWindow,
+                          TEXT("Device is offline. Scan queued for synchronization."),
+                          TEXT("Offline Mode"),
+                          MB_OK | MB_ICONWARNING);
+
+                m_journal->LogInfo(TEXT("Scan queued for offline sync"));
+            } else {
+                MessageBox(m_mainWindow,
+                          TEXT("Failed to queue transaction."),
+                          TEXT("Error"),
+                          MB_OK | MB_ICONERROR);
+
+                m_journal->LogError(TEXT("QUEUE_FAILED"), TEXT("Failed to queue offline transaction"));
+            }
+        } else {
+            // Online but item not found
+            MessageBox(m_mainWindow,
+                      TEXT("Item not found in database."),
+                      TEXT("Not Found"),
+                      MB_OK | MB_ICONWARNING);
+
+            m_journal->LogInfo(TEXT("Item not found"));
+        }
+    }
 
     SetState(STATE_IDLE);
 }
@@ -203,7 +251,45 @@ bool Controller::InitializeUI()
 
 void Controller::UpdateUI()
 {
-    // TODO: Update UI based on current state
+    if (!m_mainWindow) {
+        return;
+    }
+
+    // Update window title based on state
+    TCHAR title[128];
+
+    switch (m_state) {
+    case STATE_INIT:
+        lstrcpy(title, TEXT("HomeBox Client - Initializing..."));
+        break;
+
+    case STATE_IDLE:
+        wsprintf(title, TEXT("HomeBox Client - Ready [Queue: %d]"),
+                m_syncEngine ? m_syncEngine->GetQueuedTransactionCount() : 0);
+        break;
+
+    case STATE_SCANNING:
+        lstrcpy(title, TEXT("HomeBox Client - Scanning..."));
+        break;
+
+    case STATE_SYNCING:
+        lstrcpy(title, TEXT("HomeBox Client - Syncing..."));
+        break;
+
+    case STATE_ERROR:
+        lstrcpy(title, TEXT("HomeBox Client - Error"));
+        break;
+
+    default:
+        lstrcpy(title, TEXT("HomeBox Client"));
+        break;
+    }
+
+    SetWindowText(m_mainWindow, title);
+
+    // Force window redraw
+    InvalidateRect(m_mainWindow, NULL, TRUE);
+    UpdateWindow(m_mainWindow);
 }
 
 bool Controller::CreateMainWindow()
