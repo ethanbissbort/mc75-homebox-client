@@ -1,1 +1,7 @@
-// placeholder
+#include "resource.h"
+
+STRINGTABLE
+BEGIN
+    IDS_APP_TITLE           "HomeBox Client"
+    IDS_APP_VERSION         "Version 1.0.0"
+END
