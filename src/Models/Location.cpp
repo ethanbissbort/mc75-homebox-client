@@ -1,4 +1,5 @@
 #include "../../include/Models/Location.hpp"
+#include "../../include/Models/JsonLite.hpp"
 
 namespace HBX {
 namespace Models {
@@ -91,14 +92,88 @@ void Location::SetPath(const TCHAR* path)
 
 bool Location::FromJson(const TCHAR* json)
 {
-    // TODO: Parse JSON
-    return false;
+    if (!json) {
+        return false;
+    }
+
+    JsonLite parser;
+    if (!parser.Parse(json)) {
+        return false;
+    }
+
+    // Extract fields
+    TCHAR buffer[512];
+
+    if (parser.GetString(TEXT("id"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
+        SetId(buffer);
+    }
+
+    if (parser.GetString(TEXT("name"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
+        SetName(buffer);
+    }
+
+    if (parser.GetString(TEXT("description"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
+        SetDescription(buffer);
+    }
+
+    if (parser.GetString(TEXT("parentId"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
+        SetParentId(buffer);
+    }
+
+    if (parser.GetString(TEXT("path"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
+        SetPath(buffer);
+    }
+
+    return IsValid();
 }
 
 TCHAR* Location::ToJson() const
 {
-    // TODO: Generate JSON
-    return NULL;
+    // Build JSON string manually
+    TCHAR* json = new TCHAR[2048];
+    int pos = 0;
+
+    json[pos++] = '{';
+
+    // Add id
+    if (m_id) {
+        wsprintf(json + pos, TEXT("\"id\":\"%s\","), m_id);
+        pos = lstrlen(json);
+    }
+
+    // Add name
+    if (m_name) {
+        wsprintf(json + pos, TEXT("\"name\":\"%s\","), m_name);
+        pos = lstrlen(json);
+    }
+
+    // Add description
+    if (m_description) {
+        wsprintf(json + pos, TEXT("\"description\":\"%s\","), m_description);
+        pos = lstrlen(json);
+    }
+
+    // Add parentId
+    if (m_parentId) {
+        wsprintf(json + pos, TEXT("\"parentId\":\"%s\","), m_parentId);
+        pos = lstrlen(json);
+    }
+
+    // Add path (remove trailing comma)
+    if (m_path) {
+        wsprintf(json + pos, TEXT("\"path\":\"%s\""), m_path);
+        pos = lstrlen(json);
+    } else {
+        // Remove trailing comma if exists
+        if (pos > 1 && json[pos - 1] == ',') {
+            pos--;
+        }
+    }
+
+    json[pos++] = '}';
+    json[pos] = '\0';
+
+    return json;
 }
 
 bool Location::IsValid() const

@@ -110,14 +110,103 @@ void Item::SetCategory(const TCHAR* category)
 
 bool Item::FromJson(const TCHAR* json)
 {
-    // TODO: Parse JSON
-    return false;
+    if (!json) {
+        return false;
+    }
+
+    JsonLite parser;
+    if (!parser.Parse(json)) {
+        return false;
+    }
+
+    // Extract fields
+    TCHAR buffer[512];
+
+    if (parser.GetString(TEXT("id"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
+        SetId(buffer);
+    }
+
+    if (parser.GetString(TEXT("barcode"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
+        SetBarcode(buffer);
+    }
+
+    if (parser.GetString(TEXT("name"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
+        SetName(buffer);
+    }
+
+    if (parser.GetString(TEXT("description"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
+        SetDescription(buffer);
+    }
+
+    if (parser.GetString(TEXT("locationId"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
+        SetLocationId(buffer);
+    }
+
+    if (parser.GetString(TEXT("category"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
+        SetCategory(buffer);
+    }
+
+    int quantity = 0;
+    if (parser.GetInt(TEXT("quantity"), &quantity)) {
+        SetQuantity(quantity);
+    }
+
+    return IsValid();
 }
 
 TCHAR* Item::ToJson() const
 {
-    // TODO: Generate JSON
-    return NULL;
+    // Build JSON string manually
+    TCHAR* json = new TCHAR[2048];
+    int pos = 0;
+
+    // Helper lambda for adding strings (manual implementation for C++03)
+    json[pos++] = '{';
+
+    // Add id
+    if (m_id) {
+        wsprintf(json + pos, TEXT("\"id\":\"%s\","), m_id);
+        pos = lstrlen(json);
+    }
+
+    // Add barcode
+    if (m_barcode) {
+        wsprintf(json + pos, TEXT("\"barcode\":\"%s\","), m_barcode);
+        pos = lstrlen(json);
+    }
+
+    // Add name
+    if (m_name) {
+        wsprintf(json + pos, TEXT("\"name\":\"%s\","), m_name);
+        pos = lstrlen(json);
+    }
+
+    // Add description
+    if (m_description) {
+        wsprintf(json + pos, TEXT("\"description\":\"%s\","), m_description);
+        pos = lstrlen(json);
+    }
+
+    // Add locationId
+    if (m_locationId) {
+        wsprintf(json + pos, TEXT("\"locationId\":\"%s\","), m_locationId);
+        pos = lstrlen(json);
+    }
+
+    // Add category
+    if (m_category) {
+        wsprintf(json + pos, TEXT("\"category\":\"%s\","), m_category);
+        pos = lstrlen(json);
+    }
+
+    // Add quantity
+    wsprintf(json + pos, TEXT("\"quantity\":%d"), m_quantity);
+    pos = lstrlen(json);
+
+    json[pos++] = '}';
+    json[pos] = '\0';
+
+    return json;
 }
 
 bool Item::IsValid() const
