@@ -131,8 +131,25 @@ bool Journal::GetPendingTransactions(TCHAR*** transactions, int* count)
 
 bool Journal::MarkTransactionSynced(const TCHAR* transactionId)
 {
-    // TODO: Implement
-    return false;
+    if (!transactionId || m_fileHandle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    // Mark transaction as synced by writing a SYNCED entry
+    // Format: [TIMESTAMP] SYNCED: transactionId
+    TCHAR syncEntry[512];
+    wsprintf(syncEntry, TEXT("%s"), transactionId);
+
+    bool result = WriteEntry(TEXT("SYNCED"), syncEntry);
+
+    if (result) {
+        // Decrement transaction count since it's now synced
+        if (m_transactionCount > 0) {
+            m_transactionCount--;
+        }
+    }
+
+    return result;
 }
 
 int Journal::GetTransactionCount() const
@@ -142,15 +159,130 @@ int Journal::GetTransactionCount() const
 
 bool Journal::Compact()
 {
-    // TODO: Implement journal compaction
-    return false;
+    if (m_fileHandle == INVALID_HANDLE_VALUE || !m_journalPath) {
+        return false;
+    }
+
+    // Read all entries
+    SetFilePointer(m_fileHandle, 0, NULL, FILE_BEGIN);
+
+    char* fileContent = NULL;
+    DWORD fileSize = GetFileSize(m_fileHandle, NULL);
+
+    if (fileSize == INVALID_FILE_SIZE || fileSize == 0) {
+        return false;
+    }
+
+    fileContent = new char[fileSize + 1];
+    DWORD bytesRead;
+
+    if (!ReadFile(m_fileHandle, fileContent, fileSize, &bytesRead, NULL)) {
+        delete[] fileContent;
+        return false;
+    }
+    fileContent[bytesRead] = '\0';
+
+    // Create temporary file for compacted journal
+    TCHAR tempPath[MAX_PATH];
+    wsprintf(tempPath, TEXT("%s.tmp"), m_journalPath);
+
+    HANDLE tempHandle = CreateFile(
+        tempPath,
+        GENERIC_WRITE,
+        0,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+    if (tempHandle == INVALID_HANDLE_VALUE) {
+        delete[] fileContent;
+        return false;
+    }
+
+    // Write only unsynced transactions and recent INFO/ERROR entries
+    char line[2048];
+    int linePos = 0;
+    int newTransactionCount = 0;
+
+    for (DWORD i = 0; i < bytesRead; i++) {
+        if (fileContent[i] == '\n' || fileContent[i] == '\r') {
+            if (linePos > 0) {
+                line[linePos] = '\0';
+
+                // Keep unsynced transactions
+                bool keepLine = false;
+                if (strstr(line, "TRANS") && !strstr(line, "SYNCED")) {
+                    keepLine = true;
+                    newTransactionCount++;
+                }
+                // Keep recent errors (for debugging)
+                else if (strstr(line, "ERROR")) {
+                    keepLine = true;
+                }
+
+                if (keepLine) {
+                    DWORD written;
+                    WriteFile(tempHandle, line, linePos, &written, NULL);
+                    WriteFile(tempHandle, "\r\n", 2, &written, NULL);
+                }
+
+                linePos = 0;
+            }
+        } else {
+            if (linePos < sizeof(line) - 1) {
+                line[linePos++] = fileContent[i];
+            }
+        }
+    }
+
+    CloseHandle(tempHandle);
+    delete[] fileContent;
+
+    // Replace original file with compacted version
+    CloseHandle(m_fileHandle);
+    DeleteFile(m_journalPath);
+    MoveFile(tempPath, m_journalPath);
+
+    // Reopen journal file
+    m_fileHandle = CreateFile(
+        m_journalPath,
+        GENERIC_WRITE | GENERIC_READ,
+        0,
+        NULL,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+    m_transactionCount = newTransactionCount;
+
+    return (m_fileHandle != INVALID_HANDLE_VALUE);
 }
 
 bool Journal::Clear()
 {
+    if (m_fileHandle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    // Close and reopen file to truncate it
+    CloseHandle(m_fileHandle);
+
+    m_fileHandle = CreateFile(
+        m_journalPath,
+        GENERIC_WRITE | GENERIC_READ,
+        0,
+        NULL,
+        CREATE_ALWAYS, // Truncate existing file
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
     m_transactionCount = 0;
-    // TODO: Clear journal file
-    return true;
+
+    return (m_fileHandle != INVALID_HANDLE_VALUE);
 }
 
 bool Journal::WriteEntry(const TCHAR* level, const TCHAR* message)
@@ -158,19 +290,48 @@ bool Journal::WriteEntry(const TCHAR* level, const TCHAR* message)
     if (m_fileHandle == INVALID_HANDLE_VALUE) {
         return false;
     }
-    
-    // TODO: Format and write entry with timestamp
+
+    // Format and write entry with timestamp
+    // Format: [TIMESTAMP] LEVEL: message\r\n
+    TCHAR* timestamp = FormatTimestamp();
+
+    // Build entry string
+    TCHAR entry[2048];
+    wsprintf(entry, TEXT("[%s] %s: %s\r\n"), timestamp, level, message);
+
+    // Convert to ANSI for file writing (journal file is ANSI)
+    char ansiEntry[2048];
+    for (int i = 0; i < lstrlen(entry) && i < 2047; i++) {
+        ansiEntry[i] = (char)entry[i];
+    }
+    ansiEntry[lstrlen(entry)] = '\0';
+
+    // Seek to end of file
+    SetFilePointer(m_fileHandle, 0, NULL, FILE_END);
+
+    // Write entry
     DWORD bytesWritten;
-    WriteFile(m_fileHandle, message, lstrlen(message) * sizeof(TCHAR), &bytesWritten, NULL);
-    
-    return FlushToDisk();
+    bool success = WriteFile(m_fileHandle, ansiEntry, strlen(ansiEntry), &bytesWritten, NULL);
+
+    if (success) {
+        FlushToDisk();
+    }
+
+    return success;
 }
 
 TCHAR* Journal::FormatTimestamp()
 {
-    // TODO: Format timestamp
+    // Format timestamp as YYYY-MM-DD HH:MM:SS
     static TCHAR buffer[32];
-    wsprintf(buffer, TEXT("%d"), GetTickCount());
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    wsprintf(buffer, TEXT("%04d-%02d-%02d %02d:%02d:%02d"),
+        st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond);
+
     return buffer;
 }
 
