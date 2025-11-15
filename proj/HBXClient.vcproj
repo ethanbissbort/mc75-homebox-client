@@ -9,13 +9,13 @@
 	TargetFrameworkVersion="0"
 	>
 	<Platforms>
-		<Platform Name="Windows Mobile 6 Professional SDK (ARMV4I)"/>
+		<Platform Name="Windows Mobile 6.5 Professional SDK (ARMV4I)"/>
 	</Platforms>
 	<ToolFiles/>
 	<Configurations>
 
 		<Configuration
-			Name="Debug|Windows Mobile 6 Professional SDK (ARMV4I)"
+			Name="Debug|Windows Mobile 6.5 Professional SDK (ARMV4I)"
 			OutputDirectory=".\..\bin\Debug"
 			IntermediateDirectory=".\..\obj\Debug"
 			ConfigurationType="1"
@@ -28,7 +28,7 @@
 			<Tool Name="VCMIDLTool"/>
 			<Tool Name="VCCLCompilerTool"
 				Optimization="0"
-				AdditionalIncludeDirectories="..\include;C:\Program Files\Windows Mobile 6 SDK\PocketPC\Include\Armv4i;C:\Program Files\Zebra EMDK\C\Include"
+				AdditionalIncludeDirectories="..\include;C:\Program Files\Windows Mobile 6.5 SDK\PocketPC\Include\Armv4i;C:\Program Files\Zebra EMDK\C\Include"
 				PreprocessorDefinitions="WIN32;_WIN32_WCE=0x0600;UNDER_CE;WIN32_PLATFORM_PSPC;_DEBUG"
 				RuntimeLibrary="3"
 				UsePrecompiledHeader="0"
@@ -36,7 +36,7 @@
 				DebugInformationFormat="3"/>
 			<Tool Name="VCLinkerTool"
 				AdditionalDependencies="coredll.lib aygshell.lib commctrl.lib ole32.lib oleaut32.lib winsock.lib"
-				AdditionalLibraryDirectories="C:\Program Files\Windows Mobile 6 SDK\PocketPC\Lib\Armv4i;C:\Program Files\Zebra EMDK\C\Lib\ARMV4I"
+				AdditionalLibraryDirectories="C:\Program Files\Windows Mobile 6.5 SDK\PocketPC\Lib\Armv4i;C:\Program Files\Zebra EMDK\C\Lib\ARMV4I"
 				SubSystem="8"
 				EntryPointSymbol="WinMainCRTStartup"
 				GenerateDebugInformation="true"/>
@@ -50,7 +50,7 @@
 		</Configuration>
 
 		<Configuration
-			Name="Release|Windows Mobile 6 Professional SDK (ARMV4I)"
+			Name="Release|Windows Mobile 6.5 Professional SDK (ARMV4I)"
 			OutputDirectory=".\..\bin\Release"
 			IntermediateDirectory=".\..\obj\Release"
 			ConfigurationType="1"
@@ -67,7 +67,7 @@
 				EnableIntrinsicFunctions="true"
 				FavorSizeOrSpeed="1"
 				OmitFramePointers="true"
-				AdditionalIncludeDirectories="..\include;C:\Program Files\Windows Mobile 6 SDK\PocketPC\Include\Armv4i;C:\Program Files\Zebra EMDK\C\Include"
+				AdditionalIncludeDirectories="..\include;C:\Program Files\Windows Mobile 6.5 SDK\PocketPC\Include\Armv4i;C:\Program Files\Zebra EMDK\C\Include"
 				PreprocessorDefinitions="WIN32;_WIN32_WCE=0x0600;UNDER_CE;WIN32_PLATFORM_PSPC;NDEBUG"
 				RuntimeLibrary="2"
 				UsePrecompiledHeader="0"
@@ -75,7 +75,7 @@
 				DebugInformationFormat="3"/>
 			<Tool Name="VCLinkerTool"
 				AdditionalDependencies="coredll.lib aygshell.lib commctrl.lib ole32.lib oleaut32.lib winsock.lib"
-				AdditionalLibraryDirectories="C:\Program Files\Windows Mobile 6 SDK\PocketPC\Lib\Armv4i;C:\Program Files\Zebra EMDK\C\Lib\ARMV4I"
+				AdditionalLibraryDirectories="C:\Program Files\Windows Mobile 6.5 SDK\PocketPC\Lib\Armv4i;C:\Program Files\Zebra EMDK\C\Lib\ARMV4I"
 				SubSystem="8"
 				EntryPointSymbol="WinMainCRTStartup"
 				GenerateDebugInformation="false"/>

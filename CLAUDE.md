@@ -2,14 +2,14 @@
 
 ## Project Overview
 
-**MC75 HomeBox Client** is a native C++ application for Motorola MC75 handheld devices running Windows Mobile 6 Professional. The application integrates with the HomeBox inventory management system, providing scanning, data synchronization, and offline queue management capabilities.
+**MC75 HomeBox Client** is a native C++ application for Motorola MC75 handheld devices running Windows Mobile 6.5 Professional. The application integrates with the HomeBox inventory management system, providing scanning, data synchronization, and offline queue management capabilities.
 
 ### Key Technologies
 - **Language**: C++ (Visual Studio 2008)
-- **Platform**: Windows Mobile 6 Professional SDK (ARMV4I)
+- **Platform**: Windows Mobile 6.5 Professional SDK (ARMV4I)
 - **Target Device**: Motorola MC75 handheld scanner
 - **SDK Dependencies**:
-  - Windows Mobile 6 SDK
+  - Windows Mobile 6.5 SDK
   - Zebra EMDK (Enterprise Mobility Development Kit)
 - **Build System**: Visual Studio 2008 solution/project files (.sln, .vcproj)
 
@@ -122,13 +122,13 @@ The application follows a modified MVC pattern suitable for embedded Windows Mob
 - **HBXClientCab**: CAB installer project (depends on HBXClient)
 
 ### Build Configurations
-- **Debug|Windows Mobile 6 Professional SDK (ARMV4I)**
+- **Debug|Windows Mobile 6.5 Professional SDK (ARMV4I)**
   - Output: `bin/Debug/HBXClient.exe`
   - Intermediate: `obj/Debug/`
   - Runtime Library: Multi-threaded Debug DLL (/MDd)
   - Optimization: Disabled
 
-- **Release|Windows Mobile 6 Professional SDK (ARMV4I)**
+- **Release|Windows Mobile 6.5 Professional SDK (ARMV4I)**
   - Output: `bin/Release/HBXClient.exe`
   - Intermediate: `obj/Release/`
   - Runtime Library: Multi-threaded DLL (/MD)
@@ -156,7 +156,7 @@ Required Libraries:
 ### For AI Assistants: Key Considerations
 
 1. **Platform Constraints**
-   - This is legacy Windows Mobile 6 code (not modern Windows)
+   - This is legacy Windows Mobile 6.5 code (not modern Windows)
    - Limited C++ standard library support (pre-C++11 era)
    - No STL exceptions in many cases
    - Memory-constrained embedded environment
@@ -345,7 +345,7 @@ The CAB installer (`HBXClientCab`) includes:
 - `docs/DEPLOYMENT.md`: Deployment procedures
 
 ### External Documentation
-- Windows Mobile 6 SDK Documentation
+- Windows Mobile 6.5 SDK Documentation
 - Zebra EMDK for C Documentation
 - Visual Studio 2008 Documentation
 - Windows CE API Reference
@@ -371,7 +371,7 @@ When working with this codebase:
 ## Version Information
 
 - **Visual Studio**: 2008 (Format Version 10.00)
-- **Platform SDK**: Windows Mobile 6 Professional SDK (ARMV4I)
+- **Platform SDK**: Windows Mobile 6.5 Professional SDK (ARMV4I)
 - **Application Version**: 1.0.0.0 (configurable in HBXClientCab.vcproj)
 - **Manufacturer**: Homestead
 - **Product Name**: HBXClient
@@ -379,4 +379,4 @@ When working with this codebase:
 ---
 
 **Last Updated**: 2025-11-15
-**Target Platform**: Motorola MC75, Windows Mobile 6 Professional
+**Target Platform**: Motorola MC75, Windows Mobile 6.5 Professional

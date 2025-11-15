@@ -7,7 +7,7 @@
 	TargetFrameworkVersion="0">
 
 	<Configurations>
-		<Configuration Name="Debug|Windows Mobile 6 Professional SDK (ARMV4I)" OutputDirectory="..\bin\Debug" IntermediateDirectory="..\obj\Debug">
+		<Configuration Name="Debug|Windows Mobile 6.5 Professional SDK (ARMV4I)" OutputDirectory="..\bin\Debug" IntermediateDirectory="..\obj\Debug">
 			<Tool Name="SmartDeviceCabBuildTool"
 				CabOutputFile="HBXClient_Debug.CAB"
 				Manufacturer="Homestead"
@@ -23,7 +23,7 @@
 			</DeploymentFiles>
 		</Configuration>
 
-		<Configuration Name="Release|Windows Mobile 6 Professional SDK (ARMV4I)" OutputDirectory="..\bin\Release" IntermediateDirectory="..\obj\Release">
+		<Configuration Name="Release|Windows Mobile 6.5 Professional SDK (ARMV4I)" OutputDirectory="..\bin\Release" IntermediateDirectory="..\obj\Release">
 			<Tool Name="SmartDeviceCabBuildTool"
 				CabOutputFile="HBXClient.CAB"
 				Manufacturer="Homestead"

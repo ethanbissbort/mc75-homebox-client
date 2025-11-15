@@ -1,1 +1,18 @@
-// placeholder
+#include <windows.h>
+#include "resource.h"
+
+// Application icon
+IDI_APPICON ICON "icons/app.ico"
+
+// Main menu
+IDM_MAINMENU MENU
+BEGIN
+    POPUP "&File"
+    BEGIN
+        MENUITEM "E&xit", IDM_FILE_EXIT
+    END
+    POPUP "&Help"
+    BEGIN
+        MENUITEM "&About", IDM_HELP_ABOUT
+    END
+END
