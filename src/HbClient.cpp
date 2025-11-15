@@ -1,4 +1,5 @@
 #include "../include/HbClient.hpp"
+#include "../include/Common.hpp"
 #include <string.h>
 #include <wchar.h>
 
@@ -9,6 +10,7 @@ HbClient::HbClient()
     , m_baseUrl(NULL)
     , m_authToken(NULL)
     , m_authenticated(false)
+    , m_lastError(API_ERROR_NONE)
 {
     m_httpClient = new HttpClient();
 }
@@ -382,7 +384,7 @@ bool HbClient::MakeApiRequest(const TCHAR* method, const TCHAR* endpoint, const 
     SetAuthHeaders();
 
     // Make HTTP request
-    HttpClient::HttpResponse httpResponse;
+    HttpResponse httpResponse;
     bool success = false;
 
     if (lstrcmp(method, TEXT("GET")) == 0) {
@@ -448,4 +450,23 @@ void HbClient::SetAuthHeaders()
     }
 }
 
+} // namespace HBX
+
+ApiError HbClient::GetLastError() const
+{
+    return m_lastError;
+}
+
+const TCHAR* HbClient::BuildFullUrl(const TCHAR* endpoint) const
+{
+    static TCHAR fullUrl[Common::MAX_URL_LENGTH];
+
+    if (m_baseUrl) {
+        wsprintf(fullUrl, TEXT("%s%s"), m_baseUrl, endpoint);
+    } else {
+        lstrcpy(fullUrl, endpoint);
+    }
+
+    return fullUrl;
+}
 } // namespace HBX

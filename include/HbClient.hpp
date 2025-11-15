@@ -3,6 +3,8 @@
 
 #include <windows.h>
 #include "HttpClient.hpp"
+#include "Common.hpp"
+#include "Errors.hpp"
 #include "Models/Item.hpp"
 #include "Models/Location.hpp"
 
@@ -11,6 +13,22 @@ namespace HBX {
 /**
  * HomeBox API client
  * High-level interface for communicating with HomeBox backend
+ *
+ * Modernized API with standardized error handling using ApiError codes.
+ *
+ * Usage:
+ *   HbClient client;
+ *   client.SetBaseUrl(TEXT("https://api.example.com"));
+ *
+ *   if (client.Authenticate(TEXT("DEVICE-001"), TEXT("api-key"))) {
+ *       Models::Item item;
+ *       if (client.GetItem(TEXT("1234567890"), &item)) {
+ *           // Process item
+ *       } else {
+ *           ApiError error = client.GetLastError();
+ *           // Handle error
+ *       }
+ *   }
  */
 class HbClient {
 public:
@@ -39,14 +57,18 @@ public:
     void SetBaseUrl(const TCHAR* baseUrl);
     const TCHAR* GetBaseUrl() const;
 
+    // Error handling
+    ApiError GetLastError() const;
+
 private:
     HttpClient* m_httpClient;
     TCHAR* m_baseUrl;
     TCHAR* m_authToken;
     bool m_authenticated;
+    ApiError m_lastError;
 
     // Helper methods
-    bool MakeApiRequest(const TCHAR* method, const TCHAR* endpoint, const TCHAR* body, TCHAR* response, DWORD maxResponseLen);
+    const TCHAR* BuildFullUrl(const TCHAR* endpoint) const;
     void SetAuthHeaders();
 };
 
