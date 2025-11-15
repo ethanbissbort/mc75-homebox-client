@@ -222,17 +222,21 @@ void JsonLite::BeginObject()
 
 void JsonLite::EndObject()
 {
-    // TODO: Implement
+    // Nothing to do - object is already complete
+    // This method exists for API symmetry
 }
 
 void JsonLite::BeginArray()
 {
-    // TODO: Implement
+    Clear();
+    m_root = CreateNode();
+    m_root->type = Node::TYPE_ARRAY;
 }
 
 void JsonLite::EndArray()
 {
-    // TODO: Implement
+    // Nothing to do - array is already complete
+    // This method exists for API symmetry
 }
 
 void JsonLite::AddString(const TCHAR* key, const TCHAR* value)
@@ -300,12 +304,67 @@ void JsonLite::AddInt(const TCHAR* key, int value)
 
 void JsonLite::AddBool(const TCHAR* key, bool value)
 {
-    // TODO: Implement
+    if (!m_root || !key) {
+        return;
+    }
+
+    Node* newNode = CreateNode();
+    newNode->type = Node::TYPE_BOOL;
+
+    // Set key
+    int keyLen = lstrlen(key) + 1;
+    newNode->key = new TCHAR[keyLen];
+    lstrcpy(newNode->key, key);
+
+    // Set value
+    newNode->value = new TCHAR[6];
+    lstrcpy(newNode->value, value ? TEXT("true") : TEXT("false"));
+
+    // Add to children list
+    if (!m_root->child) {
+        m_root->child = newNode;
+    } else {
+        Node* current = m_root->child;
+        while (current->next) {
+            current = current->next;
+        }
+        current->next = newNode;
+    }
 }
 
 void JsonLite::AddDouble(const TCHAR* key, double value)
 {
-    // TODO: Implement
+    if (!m_root || !key) {
+        return;
+    }
+
+    Node* newNode = CreateNode();
+    newNode->type = Node::TYPE_DOUBLE;
+
+    // Set key
+    int keyLen = lstrlen(key) + 1;
+    newNode->key = new TCHAR[keyLen];
+    lstrcpy(newNode->key, key);
+
+    // Set value (convert double to string)
+    newNode->value = new TCHAR[64];
+    // Simple double formatting (Windows Mobile doesn't have swprintf for doubles)
+    int intPart = (int)value;
+    double fracPart = value - intPart;
+    if (fracPart < 0) fracPart = -fracPart;
+    int fracDigits = (int)(fracPart * 1000000) % 1000000;
+    wsprintf(newNode->value, TEXT("%d.%06d"), intPart, fracDigits);
+
+    // Add to children list
+    if (!m_root->child) {
+        m_root->child = newNode;
+    } else {
+        Node* current = m_root->child;
+        while (current->next) {
+            current = current->next;
+        }
+        current->next = newNode;
+    }
 }
 
 TCHAR* JsonLite::ToString() const
