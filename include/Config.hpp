@@ -45,6 +45,9 @@ private:
     // Helper methods
     void InitDefaults();
     void Cleanup();
+    bool ExtractJsonString(const TCHAR* json, const TCHAR* key, TCHAR* value, int maxLen);
+    bool ExtractJsonInt(const TCHAR* json, const TCHAR* key, int* value);
+    bool ExtractJsonBool(const TCHAR* json, const TCHAR* key, bool* value);
 };
 
 } // namespace HBX
