@@ -2,7 +2,8 @@
 #define CONFIG_HPP
 
 #include <windows.h>
-#include <string>
+#include "Common.hpp"
+#include "Errors.hpp"
 
 namespace HBX {
 
@@ -35,12 +36,16 @@ public:
     void SetSyncIntervalSeconds(int seconds);
     void SetOfflineModeEnabled(bool enabled);
 
+    // Error handling
+    ConfigError GetLastError() const;
+
 private:
     TCHAR* m_apiBaseUrl;
     TCHAR* m_deviceId;
     TCHAR* m_authToken;
     int m_syncIntervalSeconds;
     bool m_offlineModeEnabled;
+    ConfigError m_lastError;
 
     // Helper methods
     void InitDefaults();

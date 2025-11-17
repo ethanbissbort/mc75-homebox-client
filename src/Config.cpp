@@ -1,4 +1,5 @@
 #include "../include/Config.hpp"
+#include "../include/Common.hpp"
 #include "../include/Models/JsonLite.hpp"
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +12,7 @@ Config::Config()
     , m_authToken(NULL)
     , m_syncIntervalSeconds(300) // Default 5 minutes
     , m_offlineModeEnabled(true)
+    , m_lastError(CONFIG_ERROR_NONE)
 {
     InitDefaults();
 }
@@ -32,22 +34,18 @@ void Config::InitDefaults()
 
 void Config::Cleanup()
 {
-    if (m_apiBaseUrl) {
-        delete[] m_apiBaseUrl;
-        m_apiBaseUrl = NULL;
-    }
-    if (m_deviceId) {
-        delete[] m_deviceId;
-        m_deviceId = NULL;
-    }
-    if (m_authToken) {
-        delete[] m_authToken;
-        m_authToken = NULL;
-    }
+    Common::StrFree(&m_apiBaseUrl);
+    Common::StrFree(&m_deviceId);
+    Common::StrFree(&m_authToken);
 }
 
 bool Config::Load(const TCHAR* configPath)
 {
+    if (!configPath) {
+        m_lastError = CONFIG_ERROR_INVALID_VALUE;
+        return false;
+    }
+
     // Try to open config file
     HANDLE hFile = CreateFile(
         configPath,
@@ -62,7 +60,8 @@ bool Config::Load(const TCHAR* configPath)
     if (hFile == INVALID_HANDLE_VALUE) {
         // File doesn't exist, use defaults
         InitDefaults();
-        return true;
+        m_lastError = CONFIG_ERROR_FILE_NOT_FOUND;
+        return true; // Not an error - use defaults
     }
 
     // Get file size
@@ -70,7 +69,8 @@ bool Config::Load(const TCHAR* configPath)
     if (fileSize == 0 || fileSize == INVALID_FILE_SIZE) {
         CloseHandle(hFile);
         InitDefaults();
-        return true;
+        m_lastError = CONFIG_ERROR_NONE;
+        return true; // Empty file - use defaults
     }
 
     // Read file content
@@ -82,6 +82,7 @@ bool Config::Load(const TCHAR* configPath)
     if (!success || bytesRead == 0) {
         delete[] buffer;
         InitDefaults();
+        m_lastError = CONFIG_ERROR_READ_FAILED;
         return false;
     }
 
@@ -89,9 +90,7 @@ bool Config::Load(const TCHAR* configPath)
 
     // Convert to TCHAR if needed
     TCHAR* jsonContent = new TCHAR[bytesRead + 1];
-    for (DWORD i = 0; i <= bytesRead; i++) {
-        jsonContent[i] = (TCHAR)buffer[i];
-    }
+    Common::CharToTChar(buffer, jsonContent, bytesRead + 1);
     delete[] buffer;
 
     // Parse simple JSON manually (lightweight for embedded)
@@ -126,6 +125,7 @@ bool Config::Load(const TCHAR* configPath)
     }
 
     delete[] jsonContent;
+    m_lastError = CONFIG_ERROR_NONE;
     return true;
 }
 
@@ -237,6 +237,11 @@ bool Config::ExtractJsonBool(const TCHAR* json, const TCHAR* key, bool* value)
 
 bool Config::Save(const TCHAR* configPath)
 {
+    if (!configPath) {
+        m_lastError = CONFIG_ERROR_INVALID_VALUE;
+        return false;
+    }
+
     // Build JSON string
     TCHAR jsonBuffer[2048];
     int pos = 0;
@@ -279,15 +284,13 @@ bool Config::Save(const TCHAR* configPath)
     );
 
     if (hFile == INVALID_HANDLE_VALUE) {
+        m_lastError = CONFIG_ERROR_WRITE_FAILED;
         return false;
     }
 
     // Convert TCHAR to char for file writing
     char* asciiBuffer = new char[pos + 1];
-    for (int i = 0; i < pos; i++) {
-        asciiBuffer[i] = (char)jsonBuffer[i];
-    }
-    asciiBuffer[pos] = '\0';
+    Common::TCharToChar(jsonBuffer, asciiBuffer, pos + 1);
 
     // Write to file
     DWORD bytesWritten = 0;
@@ -296,7 +299,13 @@ bool Config::Save(const TCHAR* configPath)
     delete[] asciiBuffer;
     CloseHandle(hFile);
 
-    return success && (bytesWritten == (DWORD)pos);
+    if (!success || bytesWritten != (DWORD)pos) {
+        m_lastError = CONFIG_ERROR_WRITE_FAILED;
+        return false;
+    }
+
+    m_lastError = CONFIG_ERROR_NONE;
+    return true;
 }
 
 const TCHAR* Config::GetApiBaseUrl() const
@@ -326,43 +335,25 @@ bool Config::IsOfflineModeEnabled() const
 
 void Config::SetApiBaseUrl(const TCHAR* url)
 {
-    if (m_apiBaseUrl) {
-        delete[] m_apiBaseUrl;
-    }
+    Common::StrFree(&m_apiBaseUrl);
     if (url) {
-        int len = lstrlen(url) + 1;
-        m_apiBaseUrl = new TCHAR[len];
-        lstrcpy(m_apiBaseUrl, url);
-    } else {
-        m_apiBaseUrl = NULL;
+        m_apiBaseUrl = Common::StrDuplicate(url);
     }
 }
 
 void Config::SetDeviceId(const TCHAR* deviceId)
 {
-    if (m_deviceId) {
-        delete[] m_deviceId;
-    }
+    Common::StrFree(&m_deviceId);
     if (deviceId) {
-        int len = lstrlen(deviceId) + 1;
-        m_deviceId = new TCHAR[len];
-        lstrcpy(m_deviceId, deviceId);
-    } else {
-        m_deviceId = NULL;
+        m_deviceId = Common::StrDuplicate(deviceId);
     }
 }
 
 void Config::SetAuthToken(const TCHAR* token)
 {
-    if (m_authToken) {
-        delete[] m_authToken;
-    }
+    Common::StrFree(&m_authToken);
     if (token) {
-        int len = lstrlen(token) + 1;
-        m_authToken = new TCHAR[len];
-        lstrcpy(m_authToken, token);
-    } else {
-        m_authToken = NULL;
+        m_authToken = Common::StrDuplicate(token);
     }
 }
 
@@ -374,6 +365,11 @@ void Config::SetSyncIntervalSeconds(int seconds)
 void Config::SetOfflineModeEnabled(bool enabled)
 {
     m_offlineModeEnabled = enabled;
+}
+
+ConfigError Config::GetLastError() const
+{
+    return m_lastError;
 }
 
 } // namespace HBX

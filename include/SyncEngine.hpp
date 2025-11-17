@@ -2,6 +2,8 @@
 #define SYNCENGINE_HPP
 
 #include <windows.h>
+#include "Common.hpp"
+#include "Errors.hpp"
 #include "HbClient.hpp"
 #include "Journal.hpp"
 
@@ -38,6 +40,9 @@ public:
     const TCHAR* GetLastSyncError() const;
     DWORD GetLastSyncTime() const;
 
+    // Error handling
+    SyncError GetLastError() const;
+
     // Configuration
     void SetAutoSyncEnabled(bool enabled);
     bool IsAutoSyncEnabled() const;
@@ -49,6 +54,7 @@ private:
     TCHAR* m_lastSyncError;
     DWORD m_lastSyncTime;
     bool m_autoSyncEnabled;
+    SyncError m_lastError;
 
     // Helper methods
     bool CheckConnectivity();

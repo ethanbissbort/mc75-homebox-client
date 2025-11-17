@@ -31,6 +31,7 @@ HbClient::~HbClient()
 bool HbClient::Authenticate(const TCHAR* deviceId, const TCHAR* apiKey)
 {
     if (!deviceId || !apiKey) {
+        m_lastError = API_ERROR_INVALID_REQUEST;
         return false;
     }
 
@@ -46,6 +47,7 @@ bool HbClient::Authenticate(const TCHAR* deviceId, const TCHAR* apiKey)
 
     if (!success) {
         m_authenticated = false;
+        m_lastError = API_ERROR_NOT_AUTHENTICATED;
         return false;
     }
 
@@ -54,6 +56,7 @@ bool HbClient::Authenticate(const TCHAR* deviceId, const TCHAR* apiKey)
     const TCHAR* tokenStart = wcsstr(response, TEXT("\"token\""));
     if (!tokenStart) {
         m_authenticated = false;
+        m_lastError = API_ERROR_INVALID_RESPONSE;
         return false;
     }
 
@@ -61,6 +64,7 @@ bool HbClient::Authenticate(const TCHAR* deviceId, const TCHAR* apiKey)
     tokenStart = wcsstr(tokenStart, TEXT(":"));
     if (!tokenStart) {
         m_authenticated = false;
+        m_lastError = API_ERROR_INVALID_RESPONSE;
         return false;
     }
 
@@ -77,6 +81,7 @@ bool HbClient::Authenticate(const TCHAR* deviceId, const TCHAR* apiKey)
     const TCHAR* tokenEnd = wcsstr(tokenStart, TEXT("\""));
     if (!tokenEnd) {
         m_authenticated = false;
+        m_lastError = API_ERROR_INVALID_RESPONSE;
         return false;
     }
 
@@ -92,6 +97,7 @@ bool HbClient::Authenticate(const TCHAR* deviceId, const TCHAR* apiKey)
     m_authToken[tokenLen] = '\0';
 
     m_authenticated = true;
+    m_lastError = API_ERROR_NONE;
     return true;
 }
 
@@ -112,10 +118,12 @@ void HbClient::Logout()
 bool HbClient::GetItem(const TCHAR* barcode, Models::Item* item)
 {
     if (!barcode || !item) {
+        m_lastError = API_ERROR_INVALID_REQUEST;
         return false;
     }
 
     if (!m_authenticated) {
+        m_lastError = API_ERROR_NOT_AUTHENTICATED;
         return false;
     }
 
@@ -128,20 +136,29 @@ bool HbClient::GetItem(const TCHAR* barcode, Models::Item* item)
     bool success = MakeApiRequest(TEXT("GET"), endpoint, NULL, response, sizeof(response) / sizeof(TCHAR));
 
     if (!success) {
+        // Error already set by MakeApiRequest
         return false;
     }
 
     // Parse JSON response into Item object
-    return item->FromJson(response);
+    if (!item->FromJson(response)) {
+        m_lastError = API_ERROR_PARSE_ERROR;
+        return false;
+    }
+
+    m_lastError = API_ERROR_NONE;
+    return true;
 }
 
 bool HbClient::UpdateItemLocation(const TCHAR* barcode, const TCHAR* locationId)
 {
     if (!barcode || !locationId) {
+        m_lastError = API_ERROR_INVALID_REQUEST;
         return false;
     }
 
     if (!m_authenticated) {
+        m_lastError = API_ERROR_NOT_AUTHENTICATED;
         return false;
     }
 
@@ -155,22 +172,32 @@ bool HbClient::UpdateItemLocation(const TCHAR* barcode, const TCHAR* locationId)
 
     // Make PATCH request (using PUT as fallback)
     TCHAR response[4096];
-    return MakeApiRequest(TEXT("PUT"), endpoint, requestBody, response, sizeof(response) / sizeof(TCHAR));
+    bool success = MakeApiRequest(TEXT("PUT"), endpoint, requestBody, response, sizeof(response) / sizeof(TCHAR));
+
+    if (success) {
+        m_lastError = API_ERROR_NONE;
+    }
+    // Error already set by MakeApiRequest if failed
+
+    return success;
 }
 
 bool HbClient::CreateItem(const Models::Item* item)
 {
     if (!item || !item->IsValid()) {
+        m_lastError = API_ERROR_INVALID_REQUEST;
         return false;
     }
 
     if (!m_authenticated) {
+        m_lastError = API_ERROR_NOT_AUTHENTICATED;
         return false;
     }
 
     // Serialize item to JSON
     TCHAR* requestBody = item->ToJson();
     if (!requestBody) {
+        m_lastError = API_ERROR_PARSE_ERROR;
         return false;
     }
 
@@ -181,16 +208,23 @@ bool HbClient::CreateItem(const Models::Item* item)
     // Cleanup
     delete[] requestBody;
 
+    if (success) {
+        m_lastError = API_ERROR_NONE;
+    }
+    // Error already set by MakeApiRequest if failed
+
     return success;
 }
 
 bool HbClient::UpdateItem(const Models::Item* item)
 {
     if (!item || !item->IsValid() || !item->GetId()) {
+        m_lastError = API_ERROR_INVALID_REQUEST;
         return false;
     }
 
     if (!m_authenticated) {
+        m_lastError = API_ERROR_NOT_AUTHENTICATED;
         return false;
     }
 
@@ -201,6 +235,7 @@ bool HbClient::UpdateItem(const Models::Item* item)
     // Serialize item to JSON
     TCHAR* requestBody = item->ToJson();
     if (!requestBody) {
+        m_lastError = API_ERROR_PARSE_ERROR;
         return false;
     }
 
@@ -211,16 +246,23 @@ bool HbClient::UpdateItem(const Models::Item* item)
     // Cleanup
     delete[] requestBody;
 
+    if (success) {
+        m_lastError = API_ERROR_NONE;
+    }
+    // Error already set by MakeApiRequest if failed
+
     return success;
 }
 
 bool HbClient::GetLocation(const TCHAR* locationId, Models::Location* location)
 {
     if (!locationId || !location) {
+        m_lastError = API_ERROR_INVALID_REQUEST;
         return false;
     }
 
     if (!m_authenticated) {
+        m_lastError = API_ERROR_NOT_AUTHENTICATED;
         return false;
     }
 
@@ -233,16 +275,24 @@ bool HbClient::GetLocation(const TCHAR* locationId, Models::Location* location)
     bool success = MakeApiRequest(TEXT("GET"), endpoint, NULL, response, sizeof(response) / sizeof(TCHAR));
 
     if (!success) {
+        // Error already set by MakeApiRequest
         return false;
     }
 
     // Parse JSON response into Location object
-    return location->FromJson(response);
+    if (!location->FromJson(response)) {
+        m_lastError = API_ERROR_PARSE_ERROR;
+        return false;
+    }
+
+    m_lastError = API_ERROR_NONE;
+    return true;
 }
 
 bool HbClient::GetAllLocations(Models::Location** locations, int* count)
 {
     if (!locations || !count) {
+        m_lastError = API_ERROR_INVALID_REQUEST;
         return false;
     }
 
@@ -250,6 +300,7 @@ bool HbClient::GetAllLocations(Models::Location** locations, int* count)
     *count = 0;
 
     if (!m_authenticated) {
+        m_lastError = API_ERROR_NOT_AUTHENTICATED;
         return false;
     }
 
@@ -258,6 +309,7 @@ bool HbClient::GetAllLocations(Models::Location** locations, int* count)
     bool success = MakeApiRequest(TEXT("GET"), TEXT("/api/v1/locations"), NULL, response, sizeof(response) / sizeof(TCHAR));
 
     if (!success) {
+        // Error already set by MakeApiRequest
         return false;
     }
 
@@ -278,6 +330,7 @@ bool HbClient::GetAllLocations(Models::Location** locations, int* count)
     }
 
     if (locationCount == 0) {
+        m_lastError = API_ERROR_NONE;
         return true; // Empty array is valid
     }
 
@@ -331,12 +384,14 @@ bool HbClient::GetAllLocations(Models::Location** locations, int* count)
     *locations = locArray;
     *count = currentLoc;
 
+    m_lastError = API_ERROR_NONE;
     return true;
 }
 
 bool HbClient::SyncPendingTransactions()
 {
     if (!m_authenticated) {
+        m_lastError = API_ERROR_NOT_AUTHENTICATED;
         return false;
     }
 
@@ -347,6 +402,11 @@ bool HbClient::SyncPendingTransactions()
 
     TCHAR response[8192];
     bool success = MakeApiRequest(TEXT("POST"), TEXT("/api/v1/sync"), requestBody, response, sizeof(response) / sizeof(TCHAR));
+
+    if (success) {
+        m_lastError = API_ERROR_NONE;
+    }
+    // Error already set by MakeApiRequest if failed
 
     return success;
 }
@@ -373,6 +433,7 @@ const TCHAR* HbClient::GetBaseUrl() const
 bool HbClient::MakeApiRequest(const TCHAR* method, const TCHAR* endpoint, const TCHAR* body, TCHAR* response, DWORD maxResponseLen)
 {
     if (!m_httpClient || !m_baseUrl || !method || !endpoint) {
+        m_lastError = API_ERROR_INVALID_REQUEST;
         return false;
     }
 
@@ -398,11 +459,34 @@ bool HbClient::MakeApiRequest(const TCHAR* method, const TCHAR* endpoint, const 
     }
 
     if (!success) {
+        // Map HttpError to ApiError
+        HttpError httpError = m_httpClient->GetLastError();
+        if (httpError == HTTP_ERROR_CONNECTION_FAILED ||
+            httpError == HTTP_ERROR_TIMEOUT ||
+            httpError == HTTP_ERROR_SEND_FAILED ||
+            httpError == HTTP_ERROR_RECEIVE_FAILED) {
+            m_lastError = API_ERROR_NETWORK_ERROR;
+        } else {
+            m_lastError = API_ERROR_SERVER_ERROR;
+        }
         return false;
     }
 
     // Check status code (200-299 is success)
     if (httpResponse.statusCode < 200 || httpResponse.statusCode >= 300) {
+        // Map HTTP status codes to ApiError codes
+        if (httpResponse.statusCode == 401) {
+            m_lastError = API_ERROR_NOT_AUTHENTICATED;
+        } else if (httpResponse.statusCode == 403) {
+            m_lastError = API_ERROR_TOKEN_EXPIRED;
+        } else if (httpResponse.statusCode == 404) {
+            m_lastError = API_ERROR_ITEM_NOT_FOUND;
+        } else if (httpResponse.statusCode >= 400 && httpResponse.statusCode < 500) {
+            m_lastError = API_ERROR_INVALID_REQUEST;
+        } else {
+            m_lastError = API_ERROR_SERVER_ERROR;
+        }
+
         if (httpResponse.body) {
             delete[] httpResponse.body;
         }
@@ -426,6 +510,7 @@ bool HbClient::MakeApiRequest(const TCHAR* method, const TCHAR* endpoint, const 
         delete[] httpResponse.body;
     }
 
+    m_lastError = API_ERROR_NONE;
     return true;
 }
 
@@ -450,8 +535,6 @@ void HbClient::SetAuthHeaders()
     }
 }
 
-} // namespace HBX
-
 ApiError HbClient::GetLastError() const
 {
     return m_lastError;
@@ -469,4 +552,5 @@ const TCHAR* HbClient::BuildFullUrl(const TCHAR* endpoint) const
 
     return fullUrl;
 }
+
 } // namespace HBX

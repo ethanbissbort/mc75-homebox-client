@@ -1,4 +1,5 @@
 #include "../include/SyncEngine.hpp"
+#include "../include/Common.hpp"
 
 namespace HBX {
 
@@ -9,6 +10,7 @@ SyncEngine::SyncEngine(HbClient* hbClient, Journal* journal)
     , m_lastSyncError(NULL)
     , m_lastSyncTime(0)
     , m_autoSyncEnabled(false)
+    , m_lastError(SYNC_ERROR_NONE)
 {
 }
 
@@ -22,6 +24,7 @@ SyncEngine::~SyncEngine()
 bool SyncEngine::QueueTransaction(const TCHAR* transactionType, const TCHAR* data)
 {
     if (!transactionType || !data) {
+        m_lastError = SYNC_ERROR_INVALID_TRANSACTION;
         return false;
     }
 
@@ -32,7 +35,13 @@ bool SyncEngine::QueueTransaction(const TCHAR* transactionType, const TCHAR* dat
     wsprintf(transactionEntry, TEXT("[%lu] %s: %s"), timestamp, transactionType, data);
 
     // Log to journal (which maintains the queue)
-    return m_journal->LogTransaction(transactionType, TEXT(""), transactionEntry);
+    if (!m_journal->LogTransaction(transactionType, TEXT(""), transactionEntry)) {
+        m_lastError = SYNC_ERROR_JOURNAL_ERROR;
+        return false;
+    }
+
+    m_lastError = SYNC_ERROR_NONE;
+    return true;
 }
 
 int SyncEngine::GetQueuedTransactionCount() const
@@ -58,6 +67,7 @@ bool SyncEngine::Sync()
     // Check if we're online
     if (!CheckConnectivity()) {
         m_syncStatus = SYNC_FAILED;
+        m_lastError = SYNC_ERROR_OFFLINE;
 
         m_lastSyncError = new TCHAR[64];
         lstrcpy(m_lastSyncError, TEXT("No network connectivity"));
@@ -71,6 +81,7 @@ bool SyncEngine::Sync()
 
     if (!m_journal->GetPendingTransactions(&transactions, &count)) {
         m_syncStatus = SYNC_FAILED;
+        m_lastError = SYNC_ERROR_JOURNAL_ERROR;
 
         m_lastSyncError = new TCHAR[64];
         lstrcpy(m_lastSyncError, TEXT("Failed to retrieve pending transactions"));
@@ -82,6 +93,7 @@ bool SyncEngine::Sync()
     if (count == 0) {
         m_syncStatus = SYNC_SUCCESS;
         m_lastSyncTime = GetTickCount();
+        m_lastError = SYNC_ERROR_NONE;
         return true;
     }
 
@@ -111,11 +123,13 @@ bool SyncEngine::Sync()
     if (failCount == 0) {
         m_syncStatus = SYNC_SUCCESS;
         m_lastSyncTime = GetTickCount();
+        m_lastError = SYNC_ERROR_NONE;
         return true;
     } else if (successCount > 0) {
         // Partial success
         m_syncStatus = SYNC_SUCCESS;
         m_lastSyncTime = GetTickCount();
+        m_lastError = SYNC_ERROR_PARTIAL_SYNC;
 
         TCHAR errorMsg[128];
         wsprintf(errorMsg, TEXT("Synced %d of %d transactions"), successCount, count);
@@ -125,6 +139,7 @@ bool SyncEngine::Sync()
         return true;
     } else {
         m_syncStatus = SYNC_FAILED;
+        m_lastError = SYNC_ERROR_API_ERROR;
 
         m_lastSyncError = new TCHAR[64];
         lstrcpy(m_lastSyncError, TEXT("All transactions failed to sync"));
@@ -136,11 +151,13 @@ bool SyncEngine::Sync()
 bool SyncEngine::SyncItem(const TCHAR* transactionId)
 {
     if (!transactionId || lstrlen(transactionId) == 0) {
+        m_lastError = SYNC_ERROR_INVALID_TRANSACTION;
         return false;
     }
 
     // Check connectivity
     if (!CheckConnectivity()) {
+        m_lastError = SYNC_ERROR_OFFLINE;
         return false;
     }
 
@@ -148,9 +165,11 @@ bool SyncEngine::SyncItem(const TCHAR* transactionId)
     if (ProcessQueuedTransaction(transactionId)) {
         // Mark as synced
         m_journal->MarkTransactionSynced(transactionId);
+        m_lastError = SYNC_ERROR_NONE;
         return true;
     }
 
+    m_lastError = SYNC_ERROR_API_ERROR;
     return false;
 }
 
@@ -182,6 +201,11 @@ void SyncEngine::SetAutoSyncEnabled(bool enabled)
 bool SyncEngine::IsAutoSyncEnabled() const
 {
     return m_autoSyncEnabled;
+}
+
+SyncError SyncEngine::GetLastError() const
+{
+    return m_lastError;
 }
 
 bool SyncEngine::CheckConnectivity() const
@@ -218,10 +242,7 @@ bool SyncEngine::CheckConnectivity() const
 
     // Try to resolve the host
     char asciiHost[256];
-    for (int j = 0; j < 255 && host[j] != '\0'; j++) {
-        asciiHost[j] = (char)host[j];
-    }
-    asciiHost[255] = '\0';
+    Common::TCharToChar(host, asciiHost, 256);
 
     // Initialize WinSock if needed
     WSADATA wsaData;

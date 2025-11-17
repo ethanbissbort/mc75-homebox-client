@@ -2,6 +2,8 @@
 #define JOURNAL_HPP
 
 #include <windows.h>
+#include "Common.hpp"
+#include "Errors.hpp"
 
 namespace HBX {
 
@@ -31,10 +33,14 @@ public:
     bool Compact();
     bool Clear();
 
+    // Error handling
+    ResultCode GetLastError() const;
+
 private:
     HANDLE m_fileHandle;
     TCHAR* m_journalPath;
     DWORD m_transactionCount;
+    ResultCode m_lastError;
 
     // Helper methods
     bool WriteEntry(const TCHAR* level, const TCHAR* message);

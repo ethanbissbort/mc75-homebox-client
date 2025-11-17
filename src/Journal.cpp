@@ -1,4 +1,5 @@
 #include "../include/Journal.hpp"
+#include "../include/Common.hpp"
 #include <stdio.h>
 
 namespace HBX {
@@ -7,6 +8,7 @@ Journal::Journal()
     : m_fileHandle(INVALID_HANDLE_VALUE)
     , m_journalPath(NULL)
     , m_transactionCount(0)
+    , m_lastError(RESULT_SUCCESS)
 {
 }
 
@@ -22,14 +24,21 @@ Journal::~Journal()
 
 bool Journal::Initialize(const TCHAR* journalPath)
 {
+    if (!journalPath) {
+        m_lastError = RESULT_INVALID_PARAM;
+        return false;
+    }
+
     if (m_journalPath) {
         delete[] m_journalPath;
     }
-    
-    int len = lstrlen(journalPath) + 1;
-    m_journalPath = new TCHAR[len];
-    lstrcpy(m_journalPath, journalPath);
-    
+
+    m_journalPath = Common::StrDuplicate(journalPath);
+    if (!m_journalPath) {
+        m_lastError = RESULT_OUT_OF_MEMORY;
+        return false;
+    }
+
     // Open or create journal file
     m_fileHandle = CreateFile(
         journalPath,
@@ -40,36 +49,82 @@ bool Journal::Initialize(const TCHAR* journalPath)
         FILE_ATTRIBUTE_NORMAL,
         NULL
     );
-    
-    return (m_fileHandle != INVALID_HANDLE_VALUE);
+
+    if (m_fileHandle == INVALID_HANDLE_VALUE) {
+        m_lastError = RESULT_FILE_IO_ERROR;
+        return false;
+    }
+
+    m_lastError = RESULT_SUCCESS;
+    return true;
 }
 
 bool Journal::LogTransaction(const TCHAR* transactionType, const TCHAR* itemId, const TCHAR* details)
 {
+    if (!details) {
+        m_lastError = RESULT_INVALID_PARAM;
+        return false;
+    }
+
+    if (!WriteEntry(TEXT("TRANS"), details)) {
+        m_lastError = RESULT_FILE_IO_ERROR;
+        return false;
+    }
+
     m_transactionCount++;
-    return WriteEntry(TEXT("TRANS"), details);
+    m_lastError = RESULT_SUCCESS;
+    return true;
 }
 
 bool Journal::LogError(const TCHAR* errorCode, const TCHAR* errorMessage)
 {
-    return WriteEntry(TEXT("ERROR"), errorMessage);
+    if (!errorMessage) {
+        m_lastError = RESULT_INVALID_PARAM;
+        return false;
+    }
+
+    if (!WriteEntry(TEXT("ERROR"), errorMessage)) {
+        m_lastError = RESULT_FILE_IO_ERROR;
+        return false;
+    }
+
+    m_lastError = RESULT_SUCCESS;
+    return true;
 }
 
 bool Journal::LogInfo(const TCHAR* message)
 {
-    return WriteEntry(TEXT("INFO"), message);
+    if (!message) {
+        m_lastError = RESULT_INVALID_PARAM;
+        return false;
+    }
+
+    if (!WriteEntry(TEXT("INFO"), message)) {
+        m_lastError = RESULT_FILE_IO_ERROR;
+        return false;
+    }
+
+    m_lastError = RESULT_SUCCESS;
+    return true;
 }
 
 bool Journal::GetPendingTransactions(TCHAR*** transactions, int* count)
 {
     if (!transactions || !count) {
+        m_lastError = RESULT_INVALID_PARAM;
         return false;
     }
 
     *transactions = NULL;
     *count = 0;
 
-    if (m_fileHandle == INVALID_HANDLE_VALUE || m_transactionCount == 0) {
+    if (m_fileHandle == INVALID_HANDLE_VALUE) {
+        m_lastError = RESULT_NOT_INITIALIZED;
+        return false;
+    }
+
+    if (m_transactionCount == 0) {
+        m_lastError = RESULT_SUCCESS;
         return true; // No transactions
     }
 
@@ -97,10 +152,7 @@ bool Journal::GetPendingTransactions(TCHAR*** transactions, int* count)
                         // Convert to TCHAR and store
                         int len = linePos + 1;
                         TCHAR* trans = new TCHAR[len];
-                        for (int j = 0; j < linePos; j++) {
-                            trans[j] = (TCHAR)line[j];
-                        }
-                        trans[linePos] = '\0';
+                        Common::CharToTChar(line, trans, len);
 
                         transArray[transCount++] = trans;
 
@@ -126,12 +178,19 @@ bool Journal::GetPendingTransactions(TCHAR*** transactions, int* count)
     *transactions = transArray;
     *count = transCount;
 
+    m_lastError = RESULT_SUCCESS;
     return true;
 }
 
 bool Journal::MarkTransactionSynced(const TCHAR* transactionId)
 {
-    if (!transactionId || m_fileHandle == INVALID_HANDLE_VALUE) {
+    if (!transactionId) {
+        m_lastError = RESULT_INVALID_PARAM;
+        return false;
+    }
+
+    if (m_fileHandle == INVALID_HANDLE_VALUE) {
+        m_lastError = RESULT_NOT_INITIALIZED;
         return false;
     }
 
@@ -140,16 +199,18 @@ bool Journal::MarkTransactionSynced(const TCHAR* transactionId)
     TCHAR syncEntry[512];
     wsprintf(syncEntry, TEXT("%s"), transactionId);
 
-    bool result = WriteEntry(TEXT("SYNCED"), syncEntry);
-
-    if (result) {
-        // Decrement transaction count since it's now synced
-        if (m_transactionCount > 0) {
-            m_transactionCount--;
-        }
+    if (!WriteEntry(TEXT("SYNCED"), syncEntry)) {
+        m_lastError = RESULT_FILE_IO_ERROR;
+        return false;
     }
 
-    return result;
+    // Decrement transaction count since it's now synced
+    if (m_transactionCount > 0) {
+        m_transactionCount--;
+    }
+
+    m_lastError = RESULT_SUCCESS;
+    return true;
 }
 
 int Journal::GetTransactionCount() const
@@ -160,6 +221,7 @@ int Journal::GetTransactionCount() const
 bool Journal::Compact()
 {
     if (m_fileHandle == INVALID_HANDLE_VALUE || !m_journalPath) {
+        m_lastError = RESULT_NOT_INITIALIZED;
         return false;
     }
 
@@ -170,6 +232,7 @@ bool Journal::Compact()
     DWORD fileSize = GetFileSize(m_fileHandle, NULL);
 
     if (fileSize == INVALID_FILE_SIZE || fileSize == 0) {
+        m_lastError = RESULT_FILE_IO_ERROR;
         return false;
     }
 
@@ -178,6 +241,7 @@ bool Journal::Compact()
 
     if (!ReadFile(m_fileHandle, fileContent, fileSize, &bytesRead, NULL)) {
         delete[] fileContent;
+        m_lastError = RESULT_FILE_IO_ERROR;
         return false;
     }
     fileContent[bytesRead] = '\0';
@@ -198,6 +262,7 @@ bool Journal::Compact()
 
     if (tempHandle == INVALID_HANDLE_VALUE) {
         delete[] fileContent;
+        m_lastError = RESULT_FILE_IO_ERROR;
         return false;
     }
 
@@ -258,12 +323,19 @@ bool Journal::Compact()
 
     m_transactionCount = newTransactionCount;
 
-    return (m_fileHandle != INVALID_HANDLE_VALUE);
+    if (m_fileHandle == INVALID_HANDLE_VALUE) {
+        m_lastError = RESULT_FILE_IO_ERROR;
+        return false;
+    }
+
+    m_lastError = RESULT_SUCCESS;
+    return true;
 }
 
 bool Journal::Clear()
 {
     if (m_fileHandle == INVALID_HANDLE_VALUE) {
+        m_lastError = RESULT_NOT_INITIALIZED;
         return false;
     }
 
@@ -282,7 +354,13 @@ bool Journal::Clear()
 
     m_transactionCount = 0;
 
-    return (m_fileHandle != INVALID_HANDLE_VALUE);
+    if (m_fileHandle == INVALID_HANDLE_VALUE) {
+        m_lastError = RESULT_FILE_IO_ERROR;
+        return false;
+    }
+
+    m_lastError = RESULT_SUCCESS;
+    return true;
 }
 
 bool Journal::WriteEntry(const TCHAR* level, const TCHAR* message)
@@ -301,10 +379,7 @@ bool Journal::WriteEntry(const TCHAR* level, const TCHAR* message)
 
     // Convert to ANSI for file writing (journal file is ANSI)
     char ansiEntry[2048];
-    for (int i = 0; i < lstrlen(entry) && i < 2047; i++) {
-        ansiEntry[i] = (char)entry[i];
-    }
-    ansiEntry[lstrlen(entry)] = '\0';
+    Common::TCharToChar(entry, ansiEntry, 2048);
 
     // Seek to end of file
     SetFilePointer(m_fileHandle, 0, NULL, FILE_END);
@@ -342,6 +417,11 @@ bool Journal::FlushToDisk()
         return true;
     }
     return false;
+}
+
+ResultCode Journal::GetLastError() const
+{
+    return m_lastError;
 }
 
 } // namespace HBX

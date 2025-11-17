@@ -68,6 +68,7 @@ private:
     ApiError m_lastError;
 
     // Helper methods
+    bool MakeApiRequest(const TCHAR* method, const TCHAR* endpoint, const TCHAR* body, TCHAR* response, DWORD maxResponseLen);
     const TCHAR* BuildFullUrl(const TCHAR* endpoint) const;
     void SetAuthHeaders();
 };
