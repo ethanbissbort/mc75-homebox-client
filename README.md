@@ -185,6 +185,9 @@ Comprehensive documentation is available in the `docs/` directory:
 |----------|-------------|------|
 | 🏗️ **DESIGN.md** | Architecture and design decisions | [View](docs/DESIGN.md) |
 | 🔨 **BUILD.md** | Detailed build instructions | [View](docs/BUILD.md) |
+| 🪟 **WINDOWS7_BUILD.md** | From-scratch Windows 7 + VS2008 build setup | [View](docs/WINDOWS7_BUILD.md) |
+| 📷 **SCANNING.md** | Real EMDK scanning, HTTPS, and UI features | [View](docs/SCANNING.md) |
+| 📱 **MC75_SETUP.md** | Reset & fully update an MC75 over USB, then deploy | [View](docs/MC75_SETUP.md) |
 | 🚀 **DEPLOYMENT.md** | Deployment procedures and CAB packaging | [View](docs/DEPLOYMENT.md) |
 | 🌐 **API_NOTES.md** | HomeBox API integration guide | [View](docs/API_NOTES.md) |
 | 🤖 **CLAUDE.md** | AI assistant development guide | [View](CLAUDE.md) |
