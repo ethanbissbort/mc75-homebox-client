@@ -2,6 +2,11 @@
 
 > **Complete build instructions for MC75 HomeBox Client**
 
+> 🆕 **Setting up a fresh Windows 7 machine from scratch?** See the step‑by‑step
+> [Windows 7 Build Guide](WINDOWS7_BUILD.md) — it walks through installing
+> Visual Studio 2008, the Windows Mobile 6/6.5 SDKs, and every dependency in the
+> correct order, and covers the project‑platform retargeting gotcha.
+
 ---
 
 ## 📋 Table of Contents
