@@ -62,6 +62,12 @@ private:
 
     // Internal request handling
     bool SendRequest(const TCHAR* method, const TCHAR* url, const TCHAR* body, HttpResponse* response);
+#ifdef HBX_USE_WININET
+    // WinInet-based transport providing real HTTP and HTTPS (TLS) support.
+    // Compiled only when HBX_USE_WININET is defined (the Windows Mobile device
+    // build). The WinSock SendRequest above remains the host-testable default.
+    bool SendRequestWinInet(const TCHAR* method, const TCHAR* url, const TCHAR* body, HttpResponse* response);
+#endif
     bool Connect(const TCHAR* host, int port);
     void Disconnect();
 

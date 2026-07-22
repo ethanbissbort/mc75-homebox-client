@@ -7,6 +7,9 @@
 #include "SyncEngine.hpp"
 #include "Journal.hpp"
 #include "ScannerHAL.hpp"
+#include "Views/ScanView.hpp"
+#include "Views/QueueView.hpp"
+#include "Views/ItemView.hpp"
 
 namespace HBX {
 
@@ -47,6 +50,7 @@ public:
     void OnScanReceived(const TCHAR* barcode);
     void OnSyncRequested();
     void OnConfigChanged();
+    void OnItemSave(const Models::Item* item);
 
 private:
     HINSTANCE m_hInstance;
@@ -60,13 +64,28 @@ private:
     Journal* m_journal;
     ScannerHAL* m_scanner;
 
+    // UI views (children of the main window)
+    Views::ScanView* m_scanView;
+    Views::QueueView* m_queueView;
+    Views::ItemView* m_itemView;
+    HWND m_menuBar;
+
     // UI management
     bool InitializeUI();
     void UpdateUI();
     bool CreateMainWindow();
+    bool CreateViews();
+    bool CreateMenuBar();
+    void ShowScanView();
+    void ShowQueueView();
 
     // Window procedure
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+
+    // Trampolines that forward view callbacks into the controller.
+    static void ScanCallbackThunk(const TCHAR* barcode, void* userData);
+    static void SyncCallbackThunk(void* userData);
+    static void ItemSaveThunk(const Models::Item* item, void* userData);
 };
 
 } // namespace HBX

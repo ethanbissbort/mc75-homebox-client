@@ -162,12 +162,19 @@ $(ZEBRAEMDK)\Lib\ARMV4I
 
 ```
 coredll.lib      // Windows CE core
-aygshell.lib     // Application shell
-commctrl.lib     // Common controls
+aygshell.lib     // Application shell (soft-key menu bar)
+commctrl.lib     // Common controls (list view)
 ole32.lib        // OLE support
 oleaut32.lib     // OLE automation
-winsock.lib      // Networking
+winsock.lib      // Networking (fallback HTTP transport)
+wininet.lib      // Real HTTP/HTTPS transport (HBX_USE_WININET; ships with the SDK)
+ScanAPIWM.lib    // Zebra Scanner C API for real scanning (HBX_USE_EMDK; from the EMDK for C)
 ```
+
+> Real scanning (`HBX_USE_EMDK`) and the WinInet HTTP/HTTPS transport
+> (`HBX_USE_WININET`) are enabled by default. `wininet.lib` is part of the SDK;
+> `ScanAPIWM.lib` comes from the **Zebra EMDK for C**. To build without a
+> scanner, remove `HBX_USE_EMDK` — see [SCANNING.md](SCANNING.md).
 
 ### Project: HBXClientCab
 
@@ -352,9 +359,10 @@ the subset of the Windows API the code uses onto the host:
 ./scripts/build_host_debug.sh
 
 # Or drive the Makefile directly:
-make -C tests/host check        # compile-all + run tests
-make -C tests/host run          # build + run tests only
-make -C tests/host compile-all  # syntax-check every source file
+make -C tests/host check          # compile-all + compile-device + run tests
+make -C tests/host run            # build + run tests only
+make -C tests/host compile-all    # syntax-check every source (host default paths)
+make -C tests/host compile-device # syntax-check the device paths (HBX_USE_EMDK + HBX_USE_WININET)
 make -C tests/host clean
 ```
 

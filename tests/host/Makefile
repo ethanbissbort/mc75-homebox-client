@@ -51,6 +51,11 @@ ALL_SRC := $(wildcard $(ROOT)/src/*.cpp $(ROOT)/src/Models/*.cpp $(ROOT)/src/Vie
 GATE_FLAGS := $(CXXFLAGS) -Wno-int-to-pointer-cast -Wno-missing-field-initializers \
               -Wno-write-strings -Wno-unused-value -fsyntax-only
 
+# The device build enables real Zebra EMDK scanning and the WinInet HTTP/HTTPS
+# transport. These paths are Windows-Mobile-only, but we syntax-check them here
+# against the shim headers so the device code cannot silently rot.
+DEVICE_GATE_FLAGS := $(GATE_FLAGS) -DHBX_USE_EMDK -DHBX_USE_WININET
+
 # Test sources + runner entry point.
 TEST_SRC := \
     $(ROOT)/tests/unit/test_json.cpp \
@@ -62,7 +67,7 @@ TEST_SRC := \
 
 SOURCES := $(CORE_SRC) $(TEST_SRC)
 
-.PHONY: all run compile-all check clean
+.PHONY: all run compile-all compile-device check clean
 
 all: $(BIN)
 
@@ -84,11 +89,25 @@ compile-all:
 	if [ $$rc -eq 0 ]; then echo "All sources compile cleanly."; else echo "One or more sources failed to compile."; fi ; \
 	exit $$rc
 
+# Same as compile-all, but with the device features (EMDK scanning + WinInet
+# HTTPS) turned on, so the Windows-Mobile-only code paths are compile-checked.
+compile-device:
+	@echo "Compile-checking device paths (HBX_USE_EMDK + HBX_USE_WININET)..."
+	@rc=0; for f in $(ALL_SRC); do \
+		if $(CXX) $(DEVICE_GATE_FLAGS) "$$f" ; then \
+			echo "  OK   $$f" ; \
+		else \
+			echo "  FAIL $$f" ; rc=1 ; \
+		fi ; \
+	done ; \
+	if [ $$rc -eq 0 ]; then echo "All device paths compile cleanly."; else echo "One or more device paths failed to compile."; fi ; \
+	exit $$rc
+
 run: $(BIN)
 	@$(BIN)
 
-# Recommended CI entry point: full compile gate + runnable core tests.
-check: compile-all run
+# Recommended CI entry point: host compile gate + device compile gate + tests.
+check: compile-all compile-device run
 
 clean:
 	@rm -rf $(BUILD)

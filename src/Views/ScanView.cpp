@@ -213,17 +213,19 @@ LRESULT CALLBACK ScanView::WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARA
 
 void ScanView::OnScanButtonClick()
 {
-    if (m_scanner) {
-        // Trigger software scan
-        SetStatus(TEXT("Scanning..."));
-        m_scanner->TriggerScan();
-
-        // In a real implementation, the scan would be asynchronous
-        // and we'd receive the result via the scanner callback
-        // For now, just simulate a scan completion
-        SetStatus(TEXT("Ready to scan"));
-    } else {
+    if (!m_scanner) {
         ShowError(TEXT("Scanner not initialized"));
+        return;
+    }
+
+    // Arm the scanner (soft trigger). The decoded barcode arrives
+    // asynchronously via the scanner callback wired in SetScanner
+    // (ScanThunk -> OnScanReceived), which updates the display and status, so
+    // we leave the status showing "Scanning..." until it does.
+    SetStatus(TEXT("Scanning..."));
+    if (!m_scanner->TriggerScan()) {
+        SetStatus(TEXT("Ready to scan"));
+        ShowError(TEXT("Failed to trigger scan"));
     }
 }
 

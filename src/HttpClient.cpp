@@ -1,6 +1,13 @@
 #include "../include/HttpClient.hpp"
 #include <string.h>
 
+#ifdef HBX_USE_WININET
+// Real HTTP/HTTPS transport via the Windows Internet (WinInet) API. This header
+// is only pulled in for the device build; the host build never defines the
+// macro and therefore keeps using the WinSock SendRequest path below.
+#include <wininet.h>
+#endif
+
 namespace HBX {
 
 HttpClient::HttpClient()
@@ -25,24 +32,33 @@ HttpClient::~HttpClient()
     WSACleanup();
 }
 
+// Each verb dispatches to the WinInet transport when HBX_USE_WININET is defined
+// (device build, real HTTP + HTTPS), otherwise to the WinSock SendRequest path
+// (host-testable default, HTTP only).
+#ifdef HBX_USE_WININET
+#define HBX_SEND_REQUEST(method, url, body, response) SendRequestWinInet((method), (url), (body), (response))
+#else
+#define HBX_SEND_REQUEST(method, url, body, response) SendRequest((method), (url), (body), (response))
+#endif
+
 bool HttpClient::Get(const TCHAR* url, HttpResponse* response)
 {
-    return SendRequest(TEXT("GET"), url, NULL, response);
+    return HBX_SEND_REQUEST(TEXT("GET"), url, NULL, response);
 }
 
 bool HttpClient::Post(const TCHAR* url, const TCHAR* body, HttpResponse* response)
 {
-    return SendRequest(TEXT("POST"), url, body, response);
+    return HBX_SEND_REQUEST(TEXT("POST"), url, body, response);
 }
 
 bool HttpClient::Put(const TCHAR* url, const TCHAR* body, HttpResponse* response)
 {
-    return SendRequest(TEXT("PUT"), url, body, response);
+    return HBX_SEND_REQUEST(TEXT("PUT"), url, body, response);
 }
 
 bool HttpClient::Delete(const TCHAR* url, HttpResponse* response)
 {
-    return SendRequest(TEXT("DELETE"), url, NULL, response);
+    return HBX_SEND_REQUEST(TEXT("DELETE"), url, NULL, response);
 }
 
 void HttpClient::SetTimeout(DWORD timeoutMs)
@@ -205,6 +221,167 @@ bool HttpClient::SendRequest(const TCHAR* method, const TCHAR* url, const TCHAR*
     // A response was received; the caller inspects response->statusCode.
     return true;
 }
+
+#ifdef HBX_USE_WININET
+// WinInet transport: performs a real HTTP or HTTPS request. HTTPS (TLS) is
+// selected transparently when the URL uses the https scheme (default port 443)
+// or explicitly names port 443. All handles are released on every return path.
+bool HttpClient::SendRequestWinInet(const TCHAR* method, const TCHAR* url, const TCHAR* body, HttpResponse* response)
+{
+    if (!response) {
+        return false;
+    }
+    response->statusCode = 0;
+    response->body = NULL;
+
+    // Parse URL into host / port / path.
+    TCHAR host[256];
+    TCHAR path[1024];
+    int port = 0;
+    if (!ParseUrl(url, host, &port, path)) {
+        return false;
+    }
+
+    // Use TLS for https URLs (default 443 or an explicit https:// scheme).
+    bool isHttps = (port == 443) || (wcsncmp(url, TEXT("https://"), 8) == 0);
+
+    // Open a WinInet session.
+    HINTERNET hInternet = InternetOpen(TEXT("HBXClient/1.0"),
+                                       INTERNET_OPEN_TYPE_DIRECT,
+                                       NULL, NULL, 0);
+    if (!hInternet) {
+        return false;
+    }
+
+    // Connect to the target host/port over the HTTP service.
+    HINTERNET hConnect = InternetConnect(hInternet, host, (INTERNET_PORT)port,
+                                         NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0);
+    if (!hConnect) {
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    // Build the request; enable TLS and bypass the cache.
+    DWORD requestFlags = INTERNET_FLAG_RELOAD;
+    if (isHttps) {
+        requestFlags |= INTERNET_FLAG_SECURE;
+    }
+
+    HINTERNET hRequest = HttpOpenRequest(hConnect, method, path,
+                                         NULL, NULL, NULL, requestFlags, 0);
+    if (!hRequest) {
+        InternetCloseHandle(hConnect);
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    // Add the accumulated custom headers as a single "Key: Value\r\n" block.
+    int headerTotal = 0;
+    for (HttpHeader* h = m_headers; h != NULL; h = h->next) {
+        // key + ": " + value + "\r\n"
+        headerTotal += lstrlen(h->key) + 2 + lstrlen(h->value) + 2;
+    }
+    if (headerTotal > 0) {
+        TCHAR* headerBuf = new TCHAR[headerTotal + 1];
+        headerBuf[0] = '\0';
+        for (HttpHeader* h = m_headers; h != NULL; h = h->next) {
+            lstrcat(headerBuf, h->key);
+            lstrcat(headerBuf, TEXT(": "));
+            lstrcat(headerBuf, h->value);
+            lstrcat(headerBuf, TEXT("\r\n"));
+        }
+        HttpAddRequestHeaders(hRequest, headerBuf,
+                              (DWORD)lstrlen(headerBuf), HTTP_ADDREQ_FLAG_ADD);
+        delete[] headerBuf;
+    }
+
+    // Convert the (Unicode) body to a narrow byte buffer for the wire.
+    char* bodyBytes = NULL;
+    DWORD bodyByteLen = 0;
+    if (body && lstrlen(body) > 0) {
+        int bl = lstrlen(body);
+        bodyBytes = new char[bl];
+        for (int i = 0; i < bl; i++) {
+            bodyBytes[i] = (char)body[i];
+        }
+        bodyByteLen = (DWORD)bl;
+    }
+
+    BOOL sent = HttpSendRequest(hRequest, NULL, 0, (LPVOID)bodyBytes, bodyByteLen);
+    if (bodyBytes) {
+        delete[] bodyBytes;
+        bodyBytes = NULL;
+    }
+
+    if (!sent) {
+        InternetCloseHandle(hRequest);
+        InternetCloseHandle(hConnect);
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    // Query the numeric HTTP status code.
+    DWORD statusCode = 0;
+    DWORD statusLen = sizeof(statusCode);
+    DWORD statusIndex = 0;
+    if (HttpQueryInfo(hRequest,
+                      HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
+                      &statusCode, &statusLen, &statusIndex)) {
+        m_lastStatusCode = (int)statusCode;
+    } else {
+        m_lastStatusCode = 0;
+    }
+    response->statusCode = m_lastStatusCode;
+
+    // Read the response body into a growable byte buffer.
+    char* data = NULL;
+    int dataLen = 0;
+    int dataCap = 0;
+    char readBuf[4096];
+    DWORD bytesRead = 0;
+    while (InternetReadFile(hRequest, readBuf, (DWORD)sizeof(readBuf), &bytesRead)) {
+        if (bytesRead == 0) {
+            break;
+        }
+        if (dataLen + (int)bytesRead > dataCap) {
+            int newCap = (dataCap == 0) ? 8192 : dataCap * 2;
+            while (newCap < dataLen + (int)bytesRead) {
+                newCap *= 2;
+            }
+            char* newData = new char[newCap];
+            for (int i = 0; i < dataLen; i++) {
+                newData[i] = data[i];
+            }
+            if (data) {
+                delete[] data;
+            }
+            data = newData;
+            dataCap = newCap;
+        }
+        for (DWORD i = 0; i < bytesRead; i++) {
+            data[dataLen + (int)i] = readBuf[i];
+        }
+        dataLen += (int)bytesRead;
+    }
+
+    // Hand the caller a heap TCHAR body (ASCII widen), owned by the caller.
+    response->body = new TCHAR[dataLen + 1];
+    for (int i = 0; i < dataLen; i++) {
+        response->body[i] = (TCHAR)data[i];
+    }
+    response->body[dataLen] = '\0';
+    if (data) {
+        delete[] data;
+    }
+
+    // Close all handles (no leaks) and report that a response was received.
+    InternetCloseHandle(hRequest);
+    InternetCloseHandle(hConnect);
+    InternetCloseHandle(hInternet);
+
+    return true;
+}
+#endif // HBX_USE_WININET
 
 bool HttpClient::Connect(const TCHAR* host, int port)
 {

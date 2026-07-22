@@ -356,19 +356,60 @@ bool HbClient::GetAllLocations(Models::Location** locations, int* count)
 
 bool HbClient::SyncPendingTransactions()
 {
+    // Empty batch (a device heartbeat / "nothing pending" sync).
+    return SyncPendingTransactions(NULL, 0);
+}
+
+bool HbClient::SyncPendingTransactions(const TCHAR* const* transactions, int count)
+{
     if (!m_authenticated) {
         return false;
     }
+    if (count < 0) {
+        count = 0;
+    }
 
-    // Make POST request to sync endpoint
-    // The backend will expect a batch of transactions
-    TCHAR requestBody[4096];
-    wsprintf(requestBody, TEXT("{\"deviceId\":\"%s\"}"),
+    // Build the batch body:
+    //   {"deviceId":"<id>","transactions":["<t0>","<t1>",...]}
+    // Size the buffer for the worst case where every character needs escaping.
+    int capacity = 128 + (m_deviceId ? lstrlen(m_deviceId) : 0);
+    for (int i = 0; i < count; i++) {
+        if (transactions && transactions[i]) {
+            capacity += lstrlen(transactions[i]) * 2 + 8;
+        } else {
+            capacity += 8;
+        }
+    }
+
+    TCHAR* body = new TCHAR[capacity];
+    int pos = 0;
+    pos += wsprintf(body + pos, TEXT("{\"deviceId\":\"%s\",\"transactions\":["),
         m_deviceId ? m_deviceId : TEXT(""));
 
-    TCHAR response[8192];
-    bool success = MakeApiRequest(TEXT("POST"), TEXT("/api/v1/sync"), requestBody, response, sizeof(response) / sizeof(TCHAR));
+    for (int i = 0; i < count; i++) {
+        if (i > 0) {
+            body[pos++] = ',';
+        }
+        body[pos++] = '"';
+        const TCHAR* t = (transactions && transactions[i]) ? transactions[i] : TEXT("");
+        for (int j = 0; t[j] != '\0'; j++) {
+            TCHAR c = t[j];
+            if (c == '"' || c == '\\') {
+                body[pos++] = '\\';   // JSON-escape quotes and backslashes
+            }
+            body[pos++] = c;
+        }
+        body[pos++] = '"';
+    }
+    body[pos++] = ']';
+    body[pos++] = '}';
+    body[pos] = '\0';
 
+    TCHAR response[8192];
+    bool success = MakeApiRequest(TEXT("POST"), TEXT("/api/v1/sync"), body, response,
+        sizeof(response) / sizeof(TCHAR));
+
+    delete[] body;
     return success;
 }
 

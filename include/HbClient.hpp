@@ -34,6 +34,8 @@ public:
 
     // Sync operations
     bool SyncPendingTransactions();
+    // Post a batch of queued transaction strings to the sync endpoint.
+    bool SyncPendingTransactions(const TCHAR* const* transactions, int count);
 
     // Configuration
     void SetBaseUrl(const TCHAR* baseUrl);

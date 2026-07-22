@@ -38,6 +38,26 @@ Fixed in this pass:
   truly removed; the sync `deviceId` placeholder now uses the real device id.
 - **Tests** — the five empty placeholder test files are now real, passing tests.
 
+### Real device features (follow-up)
+
+The simulated/stubbed subsystems were then implemented for real (host build
+keeps compiling via macro-gated fallbacks; the host harness compile-checks both
+paths with `make -C tests/host check`):
+
+- **Real barcode scanning** — `ScannerHAL` drives the Zebra/Symbol Scanner C API
+  (`SCAN_Open`/`GetParameters`/`AllocateBuffer`/`Enable`/`SetSoftTrigger`/
+  `ReadLabelWait`/`Close`) under `HBX_USE_EMDK`.
+- **Real HTTP + HTTPS** — a WinInet transport (`HBX_USE_WININET`) replaces the
+  plaintext-only WinSock path on-device.
+- **Wired-up UI** — `Controller` now creates and connects `ScanView`/`QueueView`/
+  `ItemView`, adds a soft-key menu bar, and routes scan/sync/save events;
+  `QueueView` lists real pending transactions; `SyncEngine::ProcessQueuedTransaction`
+  handles `ITEM_SCAN`/`ITEM_UPDATE` for real.
+- **Resource fixes** — added the missing `IDM_MAINMENU` id and a real `app.ico`
+  so the resource script compiles on-device.
+
+See [SCANNING.md](SCANNING.md) for details and the per-EMDK-version knobs.
+
 ---
 
 ## Executive Summary

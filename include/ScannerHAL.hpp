@@ -3,6 +3,12 @@
 
 #include <windows.h>
 
+#ifdef HBX_USE_EMDK
+// Real Symbol / Zebra EMDK "Scanner C API" header (device build).
+// On the host test build this resolves to tests/host/shim/ScanCAPI.h.
+#include <ScanCAPI.h>
+#endif
+
 namespace HBX {
 
 /**
@@ -51,6 +57,12 @@ private:
     static DWORD WINAPI ScanThread(LPVOID param);
     HANDLE m_scanThread;
     bool m_scanThreadRunning;
+
+#ifdef HBX_USE_EMDK
+    // Reusable decode buffer, allocated by SCAN_AllocateBuffer in OpenScanner
+    // and released by SCAN_DeallocateBuffer in CloseScanner (device build only).
+    LPSCAN_BUFFER m_scanBuffer;
+#endif
 };
 
 } // namespace HBX

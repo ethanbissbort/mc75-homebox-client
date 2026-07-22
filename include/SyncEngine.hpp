@@ -19,6 +19,10 @@ public:
     // Queue management
     bool QueueTransaction(const TCHAR* transactionType, const TCHAR* data);
     int GetQueuedTransactionCount() const;
+    // Returns the pending (unsynced) transaction strings. On success *transactions
+    // is a heap TCHAR*[] of *count heap TCHAR* entries; the caller must delete[]
+    // each entry and then delete[] the array. Returns true (with count 0) when empty.
+    bool GetQueuedTransactions(TCHAR*** transactions, int* count) const;
     bool ClearQueue();
 
     // Sync operations

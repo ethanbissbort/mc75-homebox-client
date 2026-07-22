@@ -40,6 +40,29 @@ int SyncEngine::GetQueuedTransactionCount() const
     return m_journal->GetTransactionCount();
 }
 
+bool SyncEngine::GetQueuedTransactions(TCHAR*** transactions, int* count) const
+{
+    if (!transactions || !count) {
+        return false;
+    }
+
+    // Default to an empty result so callers can safely inspect the outputs
+    // even on early failure.
+    *transactions = NULL;
+    *count = 0;
+
+    if (!m_journal) {
+        return false;
+    }
+
+    // Delegate to the journal, which owns the persisted queue. Note that
+    // GetPendingTransactions is non-const, but m_journal is a plain pointer
+    // (Journal* const inside this const method), so calling a non-const method
+    // through it is well-formed. The journal allocates the TCHAR*[] and each
+    // TCHAR* entry; ownership passes to the caller as documented in the header.
+    return m_journal->GetPendingTransactions(transactions, count);
+}
+
 bool SyncEngine::ClearQueue()
 {
     return m_journal->Clear();
@@ -240,47 +263,151 @@ bool SyncEngine::ProcessQueuedTransaction(const TCHAR* transaction)
         return false;
     }
 
-    // Parse transaction format: "[timestamp] TYPE: DATA"
-    // Example: "[12345] ITEM_SCAN: SCAN:123456789"
+    // A queued entry has the shape "[timestamp] TYPE: DATA" as built by
+    // QueueTransaction, but the Journal wraps that a second time when it
+    // persists the line, so what we usually receive here is:
+    //
+    //   "[2026-07-22 12:00:00] TRANS: [12345] ITEM_SCAN: SCAN:123456789"
+    //    \___ journal timestamp _/ \__/  \___ inner payload built here ___/
+    //                             wrapper label
+    //
+    // Parse defensively by drilling through each "[...] LABEL: REST" layer.
+    // A layer whose REST starts with '[' is a wrapper, so we descend into it;
+    // otherwise REST is the real DATA and LABEL is the real transaction TYPE.
+    // This also handles the un-wrapped single-layer form gracefully.
+    TCHAR transactionType[64];
+    transactionType[0] = '\0';
+    const TCHAR* dataStart = NULL;
 
-    // Find the type separator
-    const TCHAR* typeStart = wcschr(transaction, ']');
-    if (!typeStart) {
-        return false;
+    const TCHAR* cursor = transaction;
+    for (int guard = 0; guard < 8; guard++) {
+        // Locate the "] " that closes this layer's bracketed prefix.
+        const TCHAR* bracketEnd = wcschr(cursor, ']');
+        if (!bracketEnd) {
+            break;
+        }
+
+        const TCHAR* labelStart = bracketEnd + 1;
+        while (*labelStart == ' ') {
+            labelStart++;
+        }
+
+        // Locate the ':' that separates the label from the remainder.
+        const TCHAR* colon = wcschr(labelStart, ':');
+        if (!colon) {
+            break;
+        }
+
+        // Copy out the label as the (current best guess of the) type.
+        int typeLen = (int)(colon - labelStart);
+        if (typeLen < 0) {
+            typeLen = 0;
+        }
+        if (typeLen > 63) {
+            typeLen = 63;
+        }
+        for (int i = 0; i < typeLen; i++) {
+            transactionType[i] = labelStart[i];
+        }
+        transactionType[typeLen] = '\0';
+
+        const TCHAR* rest = colon + 1;
+        while (*rest == ' ') {
+            rest++;
+        }
+
+        if (*rest == '[') {
+            // Another wrapper layer; drill deeper.
+            cursor = rest;
+            continue;
+        }
+
+        // Innermost layer reached: rest is the real DATA.
+        dataStart = rest;
+        break;
     }
-    typeStart += 2; // Skip "] "
 
-    const TCHAR* dataStart = wcschr(typeStart, ':');
     if (!dataStart) {
         return false;
     }
-    dataStart += 2; // Skip ": "
-
-    // Extract transaction type
-    int typeLen = (int)(dataStart - typeStart - 2);
-    TCHAR transactionType[64];
-    if (typeLen >= 64) typeLen = 63;
-    wcsncpy(transactionType, typeStart, typeLen);
-    transactionType[typeLen] = '\0';
 
     // Process based on transaction type
     if (wcscmp(transactionType, TEXT("ITEM_SCAN")) == 0) {
-        // Parse SCAN:barcode format
-        if (wcsncmp(dataStart, TEXT("SCAN:"), 5) == 0) {
-            const TCHAR* barcode = dataStart + 5;
+        // DATA format: "SCAN:<barcode>" or "SCAN:<barcode>@<locationId>".
+        if (wcsncmp(dataStart, TEXT("SCAN:"), 5) != 0) {
+            return false;
+        }
 
-            // Try to sync this scan with the server
-            // For now, we'll just attempt to get the item to verify connectivity
-            Models::Item item;
-            if (m_hbClient->GetItem(barcode, &item)) {
-                // Successfully contacted server and retrieved item
-                return true;
+        const TCHAR* payload = dataStart + 5;
+
+        // Split the payload into <barcode> and optional <locationId> at '@'.
+        const TCHAR* at = wcschr(payload, '@');
+        int barcodeLen = at ? (int)(at - payload) : lstrlen(payload);
+        if (barcodeLen <= 0) {
+            return false; // no barcode -> nothing to sync
+        }
+        if (barcodeLen > 255) {
+            barcodeLen = 255;
+        }
+
+        TCHAR barcode[256];
+        for (int i = 0; i < barcodeLen; i++) {
+            barcode[i] = payload[i];
+        }
+        barcode[barcodeLen] = '\0';
+
+        TCHAR locationId[256];
+        locationId[0] = '\0';
+        if (at) {
+            const TCHAR* loc = at + 1;
+            int locLen = lstrlen(loc);
+            if (locLen > 255) {
+                locLen = 255;
+            }
+            for (int i = 0; i < locLen; i++) {
+                locationId[i] = loc[i];
+            }
+            locationId[locLen] = '\0';
+        }
+
+        // Look the item up on the server. Only a real success clears the entry
+        // from the queue; any failure returns false so it stays queued and is
+        // retried on the next Sync().
+        Models::Item item;
+        if (!m_hbClient->GetItem(barcode, &item)) {
+            return false;
+        }
+
+        // If a location was supplied with the scan, push the move too.
+        if (locationId[0] != '\0') {
+            if (!m_hbClient->UpdateItemLocation(barcode, locationId)) {
+                return false;
             }
         }
-    } else if (wcscmp(transactionType, TEXT("ITEM_UPDATE")) == 0) {
-        // Future: Handle item updates
-        // For now, just return true to clear from queue
+
         return true;
+    } else if (wcscmp(transactionType, TEXT("ITEM_UPDATE")) == 0) {
+        // DATA format: "UPDATE:<json>" where <json> is a complete Item JSON
+        // object, e.g.
+        //   UPDATE:{"id":"42","barcode":"123","name":"Widget","quantity":3}
+        // The JSON is parsed with Models::Item::FromJson and pushed with
+        // HbClient::UpdateItem; its result is returned so a failed update stays
+        // queued for retry.
+        if (wcsncmp(dataStart, TEXT("UPDATE:"), 7) != 0) {
+            return false;
+        }
+
+        const TCHAR* json = dataStart + 7;
+        if (*json == '\0') {
+            return false;
+        }
+
+        Models::Item item;
+        if (!item.FromJson(json)) {
+            return false;
+        }
+
+        return m_hbClient->UpdateItem(&item);
     }
 
     // Unknown or unsupported transaction type

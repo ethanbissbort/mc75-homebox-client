@@ -152,12 +152,23 @@ void QueueView::RefreshQueue()
     ListView_DeleteAllItems(m_listView);
     m_selectedIndex = -1;
 
-    // Reflect the real number of pending transactions held by the sync engine
-    // (backed by the journal). Per-row enumeration would require a public
-    // transaction-listing API on SyncEngine; until that exists we at least
-    // report the accurate pending count instead of a hard-coded zero.
-    int pending = m_syncEngine->GetQueuedTransactionCount();
-    SetItemCount(pending);
+    // Pull the actual pending (unsynced) transactions from the sync engine and
+    // list each one. GetQueuedTransactions hands back a heap TCHAR*[] of heap
+    // strings that we own and must free.
+    TCHAR** transactions = NULL;
+    int count = 0;
+    if (m_syncEngine->GetQueuedTransactions(&transactions, &count) && transactions) {
+        for (int i = 0; i < count; i++) {
+            if (transactions[i]) {
+                AddQueuedItem(transactions[i]);   // ListView copies the text
+                delete[] transactions[i];
+            }
+        }
+        delete[] transactions;
+    }
+
+    // Keep the count label in sync with the engine's authoritative count.
+    SetItemCount(m_syncEngine->GetQueuedTransactionCount());
 }
 
 void QueueView::SetSyncEngine(SyncEngine* syncEngine)
