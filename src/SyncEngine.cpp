@@ -57,7 +57,7 @@ bool SyncEngine::Sync()
 
     // Check if we're online
     if (!CheckConnectivity()) {
-        m_syncStatus = SYNC_FAILED;
+        m_syncStatus = SYNC_OFFLINE;
 
         m_lastSyncError = new TCHAR[64];
         lstrcpy(m_lastSyncError, TEXT("No network connectivity"));
@@ -114,7 +114,7 @@ bool SyncEngine::Sync()
         return true;
     } else if (successCount > 0) {
         // Partial success
-        m_syncStatus = SYNC_SUCCESS;
+        m_syncStatus = SYNC_PARTIAL;
         m_lastSyncTime = GetTickCount();
 
         TCHAR errorMsg[128];

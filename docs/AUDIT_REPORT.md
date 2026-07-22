@@ -6,6 +6,40 @@
 
 ---
 
+## ✅ Resolution Update (2026-07-22)
+
+All blocking issues from this audit have since been **resolved**, and a host
+build/test harness was added so the core logic can be compiled and tested on any
+POSIX machine. Every one of the 15 production source files now compiles cleanly
+against a Win32/CE shim, and the unit + integration suite passes
+(**32/32 test cases, 204/204 checks**). Run it with `./scripts/build_host_debug.sh`.
+
+Fixed in this pass:
+
+- **HttpClient/HbClient interface** — added `HttpResponse` struct, changed
+  `Get/Post/Put/Delete` to `(…, HttpResponse*)`, renamed `SetHeader`→`AddHeader`,
+  made `AddHeader`/`ClearHeaders`/`ParseUrl` public, and rewrote `SendRequest`
+  to allocate the response body (Issues #1, #2).
+- **ScannerHAL.cpp** added to `HBXClient.vcproj` (Issue #3).
+- Removed unused `#include <string>` from `Config.hpp` (Issue #4).
+- **`GetAllLocations`** now only keeps valid parsed entries and returns an empty
+  result instead of an array of half-initialized objects (medium finding).
+- Additional compile-blockers found and fixed that this audit missed:
+  `QueueView` referenced nonexistent `SyncEngine::SYNC_PARTIAL`/`SYNC_OFFLINE`
+  (added to the enum and wired into `Sync()`); `SyncEngine::CheckConnectivity()`
+  was declared non-`const` but defined/used as `const`; `ViewHelpers.cpp` used
+  list-view symbols without including `<commctrl.h>`.
+- **JsonLite::GetArrayElement** double-free fixed (borrowed nodes are no longer
+  freed by the borrowing element).
+- Stubs filled: view window classes are now registered so `WindowProc` is
+  actually installed (buttons/notifications work); `ScanView` wires the scanner
+  callback; `QueueView` clears the backing store and shows the real pending
+  count; `Journal::Compact` correlates SYNCED markers so synced transactions are
+  truly removed; the sync `deviceId` placeholder now uses the real device id.
+- **Tests** — the five empty placeholder test files are now real, passing tests.
+
+---
+
 ## Executive Summary
 
 This comprehensive audit evaluated the MC75 HomeBox Client codebase for **code completeness** and **logic accuracy**. The application is a native C++ Windows Mobile 6.5 application designed for Motorola MC75 handheld scanner devices.

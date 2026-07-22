@@ -31,7 +31,9 @@ public:
         SYNC_IDLE,
         SYNC_IN_PROGRESS,
         SYNC_SUCCESS,
-        SYNC_FAILED
+        SYNC_PARTIAL,   // some queued transactions synced, some failed
+        SYNC_FAILED,
+        SYNC_OFFLINE    // no network connectivity
     };
 
     SyncStatus GetSyncStatus() const;
@@ -51,7 +53,7 @@ private:
     bool m_autoSyncEnabled;
 
     // Helper methods
-    bool CheckConnectivity();
+    bool CheckConnectivity() const;
     bool ProcessQueuedTransaction(const TCHAR* transaction);
 };
 

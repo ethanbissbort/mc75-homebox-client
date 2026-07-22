@@ -98,6 +98,7 @@
 		<File RelativePath="..\src\Journal.cpp"/>
 		<File RelativePath="..\src\SyncEngine.cpp"/>
 		<File RelativePath="..\src\Config.cpp"/>
+		<File RelativePath="..\src\ScannerHAL.cpp"/>
 		<Filter Name="Views">
 			<File RelativePath="..\src\Views\ScanView.cpp"/>
 			<File RelativePath="..\src\Views\ItemView.cpp"/>

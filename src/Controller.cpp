@@ -23,10 +23,13 @@ bool Controller::Initialize(HINSTANCE hInstance)
 {
     m_hInstance = hInstance;
 
-    // Initialize common controls
+    // Initialize common controls. ICC_LISTVIEW_CLASSES is required so the
+    // WC_LISTVIEW window class used by QueueView / ViewHelpers is registered;
+    // without it CreateWindow(WC_LISTVIEW, ...) can fail and the queue list
+    // never appears.
     INITCOMMONCONTROLSEX icex;
     icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
-    icex.dwICC = ICC_BAR_CLASSES;
+    icex.dwICC = ICC_BAR_CLASSES | ICC_LISTVIEW_CLASSES;
     InitCommonControlsEx(&icex);
 
     // Create core components

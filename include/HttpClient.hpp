@@ -15,15 +15,32 @@ public:
     HttpClient();
     ~HttpClient();
 
-    // HTTP methods
-    bool Get(const TCHAR* url, TCHAR* response, DWORD maxResponseLen);
-    bool Post(const TCHAR* url, const TCHAR* body, TCHAR* response, DWORD maxResponseLen);
-    bool Put(const TCHAR* url, const TCHAR* body, TCHAR* response, DWORD maxResponseLen);
-    bool Delete(const TCHAR* url, TCHAR* response, DWORD maxResponseLen);
+    /**
+     * Result of an HTTP request.
+     * On success, body is heap-allocated with new TCHAR[] and ownership is
+     * transferred to the caller, who must release it with delete[].
+     */
+    struct HttpResponse {
+        int statusCode;
+        TCHAR* body;
+
+        HttpResponse() : statusCode(0), body(NULL) {}
+    };
+
+    // HTTP methods. Return true when a response was received (inspect
+    // response->statusCode for the HTTP status); false on network failure.
+    bool Get(const TCHAR* url, HttpResponse* response);
+    bool Post(const TCHAR* url, const TCHAR* body, HttpResponse* response);
+    bool Put(const TCHAR* url, const TCHAR* body, HttpResponse* response);
+    bool Delete(const TCHAR* url, HttpResponse* response);
 
     // Configuration
     void SetTimeout(DWORD timeoutMs);
-    void SetHeader(const TCHAR* key, const TCHAR* value);
+    void AddHeader(const TCHAR* key, const TCHAR* value);
+    void ClearHeaders();
+
+    // URL parsing (exposed for unit testing; pure helper with no side effects)
+    bool ParseUrl(const TCHAR* url, TCHAR* host, int* port, TCHAR* path);
 
     // Status
     int GetLastHttpStatusCode() const;
@@ -44,13 +61,11 @@ private:
     HttpHeader* m_headers;
 
     // Internal request handling
-    bool SendRequest(const TCHAR* method, const TCHAR* url, const TCHAR* body, TCHAR* response, DWORD maxResponseLen);
+    bool SendRequest(const TCHAR* method, const TCHAR* url, const TCHAR* body, HttpResponse* response);
     bool Connect(const TCHAR* host, int port);
     void Disconnect();
-    bool ParseUrl(const TCHAR* url, TCHAR* host, int* port, TCHAR* path);
 
     // Header management
-    void ClearHeaders();
     void BuildHeaderString(char* buffer, int maxLen);
 };
 

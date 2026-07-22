@@ -43,6 +43,7 @@ private:
     HttpClient* m_httpClient;
     TCHAR* m_baseUrl;
     TCHAR* m_authToken;
+    TCHAR* m_deviceId;
     bool m_authenticated;
 
     // Helper methods

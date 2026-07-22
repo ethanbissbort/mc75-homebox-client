@@ -7,6 +7,7 @@ namespace Models {
 JsonLite::JsonLite()
     : m_root(NULL)
     , m_parseBuffer(NULL)
+    , m_borrowedRoot(false)
 {
 }
 
@@ -209,6 +210,9 @@ bool JsonLite::GetArrayElement(int index, JsonLite* element) const
     // In a full implementation, we'd clone the node
     element->Clear();
     element->m_root = current;
+    // The node is owned by this parser's tree; the element only borrows it and
+    // must not free it in its destructor (that would double-free).
+    element->m_borrowedRoot = true;
 
     return true;
 }
@@ -385,9 +389,12 @@ TCHAR* JsonLite::ToString() const
 void JsonLite::Clear()
 {
     if (m_root) {
-        FreeNode(m_root);
+        if (!m_borrowedRoot) {
+            FreeNode(m_root);
+        }
         m_root = NULL;
     }
+    m_borrowedRoot = false;
     if (m_parseBuffer) {
         delete[] m_parseBuffer;
         m_parseBuffer = NULL;

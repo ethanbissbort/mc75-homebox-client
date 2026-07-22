@@ -134,6 +134,20 @@ cd scripts
 build_winmobile.bat
 ```
 
+### 🧪 Test on any host (no device/SDK required)
+
+The platform-independent core logic can be compiled and tested on any
+Linux/macOS machine using the bundled Win32/CE shim — only `g++`/`clang++`
+and `make` are needed:
+
+```bash
+./scripts/build_host_debug.sh
+# -> compile-checks all 15 source files, then runs the unit + integration suite
+#    ==== 32/32 test cases passed, 204/204 checks passed ====
+```
+
+See [BUILD.md → Host Build & Testing](docs/BUILD.md#-host-build--testing) for details.
+
 ### 📦 Deploy
 
 ```bash

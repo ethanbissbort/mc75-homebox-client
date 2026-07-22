@@ -25,16 +25,28 @@ bool ScanView::Create(HWND parentWnd, HINSTANCE hInstance)
 {
     m_hInstance = hInstance;
 
-    // Create main window
+    // Register a window class that installs ScanView::WindowProc. The built-in
+    // STATIC class would never call our WindowProc, so button clicks / resize
+    // messages would be dropped and the view would be inert.
+    static const TCHAR* kClassName = TEXT("HBXScanView");
+    WNDCLASS wc = {0};
+    wc.lpfnWndProc   = ScanView::WindowProc;
+    wc.hInstance     = hInstance;
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.lpszClassName = kClassName;
+    RegisterClass(&wc); // harmless if already registered by a prior Create()
+
+    // Create main window using our class; pass 'this' as the creation param so
+    // WM_CREATE can stash the instance pointer (see WindowProc).
     m_hwnd = CreateWindow(
-        TEXT("STATIC"),
+        kClassName,
         TEXT("Scan View"),
         WS_CHILD | WS_VISIBLE,
         0, 0, 240, 320,
         parentWnd,
         NULL,
         hInstance,
-        NULL
+        (LPVOID)this
     );
 
     if (!m_hwnd) {
@@ -131,6 +143,21 @@ void ScanView::ClearDisplay()
 void ScanView::SetScanner(ScannerHAL* scanner)
 {
     m_scanner = scanner;
+
+    // Route hardware scan events into this view so a real barcode read reaches
+    // OnScanReceived (and from there the view's own scan callback).
+    if (m_scanner) {
+        m_scanner->SetScanCallback(&ScanView::ScanThunk, this);
+    }
+}
+
+// static
+void ScanView::ScanThunk(const TCHAR* barcode, void* userData)
+{
+    ScanView* self = (ScanView*)userData;
+    if (self) {
+        self->OnScanReceived(barcode);
+    }
 }
 
 void ScanView::EnableScanButton(bool enabled)
@@ -202,6 +229,14 @@ void ScanView::OnScanButtonClick()
 
 void ScanView::OnScanReceived(const TCHAR* barcode)
 {
+    if (!barcode) {
+        return;
+    }
+
+    // Show the scanned value and notify whoever registered for scan events.
+    DisplayBarcode(barcode);
+    SetStatus(TEXT("Scan received"));
+
     if (m_callback) {
         m_callback(barcode, m_callbackUserData);
     }

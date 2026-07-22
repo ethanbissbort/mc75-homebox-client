@@ -25,24 +25,24 @@ HttpClient::~HttpClient()
     WSACleanup();
 }
 
-bool HttpClient::Get(const TCHAR* url, TCHAR* response, DWORD maxResponseLen)
+bool HttpClient::Get(const TCHAR* url, HttpResponse* response)
 {
-    return SendRequest(TEXT("GET"), url, NULL, response, maxResponseLen);
+    return SendRequest(TEXT("GET"), url, NULL, response);
 }
 
-bool HttpClient::Post(const TCHAR* url, const TCHAR* body, TCHAR* response, DWORD maxResponseLen)
+bool HttpClient::Post(const TCHAR* url, const TCHAR* body, HttpResponse* response)
 {
-    return SendRequest(TEXT("POST"), url, body, response, maxResponseLen);
+    return SendRequest(TEXT("POST"), url, body, response);
 }
 
-bool HttpClient::Put(const TCHAR* url, const TCHAR* body, TCHAR* response, DWORD maxResponseLen)
+bool HttpClient::Put(const TCHAR* url, const TCHAR* body, HttpResponse* response)
 {
-    return SendRequest(TEXT("PUT"), url, body, response, maxResponseLen);
+    return SendRequest(TEXT("PUT"), url, body, response);
 }
 
-bool HttpClient::Delete(const TCHAR* url, TCHAR* response, DWORD maxResponseLen)
+bool HttpClient::Delete(const TCHAR* url, HttpResponse* response)
 {
-    return SendRequest(TEXT("DELETE"), url, NULL, response, maxResponseLen);
+    return SendRequest(TEXT("DELETE"), url, NULL, response);
 }
 
 void HttpClient::SetTimeout(DWORD timeoutMs)
@@ -50,7 +50,7 @@ void HttpClient::SetTimeout(DWORD timeoutMs)
     m_timeoutMs = timeoutMs;
 }
 
-void HttpClient::SetHeader(const TCHAR* key, const TCHAR* value)
+void HttpClient::AddHeader(const TCHAR* key, const TCHAR* value)
 {
     if (!key || !value) {
         return;
@@ -82,8 +82,14 @@ const TCHAR* HttpClient::GetLastError() const
     return m_lastError;
 }
 
-bool HttpClient::SendRequest(const TCHAR* method, const TCHAR* url, const TCHAR* body, TCHAR* response, DWORD maxResponseLen)
+bool HttpClient::SendRequest(const TCHAR* method, const TCHAR* url, const TCHAR* body, HttpResponse* response)
 {
+    if (!response) {
+        return false;
+    }
+    response->statusCode = 0;
+    response->body = NULL;
+
     // Parse URL
     TCHAR host[256];
     TCHAR path[1024];
@@ -172,27 +178,32 @@ bool HttpClient::SendRequest(const TCHAR* method, const TCHAR* url, const TCHAR*
     recvBuffer[totalReceived] = '\0';
     Disconnect();
 
+    // No bytes received means the request effectively failed.
+    if (totalReceived == 0) {
+        return false;
+    }
+
     // Parse status code
+    m_lastStatusCode = 0;
     if (strncmp(recvBuffer, "HTTP/1.", 7) == 0) {
         m_lastStatusCode = atoi(recvBuffer + 9);
     }
+    response->statusCode = m_lastStatusCode;
 
-    // Find response body (after headers)
-    char* bodyStart = strstr(recvBuffer, "\r\n\r\n");
-    if (bodyStart) {
-        bodyStart += 4;
+    // Find response body (after end-of-headers marker)
+    const char* bodyStart = strstr(recvBuffer, "\r\n\r\n");
+    bodyStart = bodyStart ? (bodyStart + 4) : "";
 
-        // Convert response to TCHAR
-        if (response && maxResponseLen > 0) {
-            DWORD len = 0;
-            while (*bodyStart && len < maxResponseLen - 1) {
-                response[len++] = (TCHAR)*bodyStart++;
-            }
-            response[len] = '\0';
-        }
+    // Copy body into a heap buffer owned by the caller (converts ASCII -> TCHAR).
+    int bodyLen = (int)strlen(bodyStart);
+    response->body = new TCHAR[bodyLen + 1];
+    for (int i = 0; i < bodyLen; i++) {
+        response->body[i] = (TCHAR)bodyStart[i];
     }
+    response->body[bodyLen] = '\0';
 
-    return (m_lastStatusCode >= 200 && m_lastStatusCode < 300);
+    // A response was received; the caller inspects response->statusCode.
+    return true;
 }
 
 bool HttpClient::Connect(const TCHAR* host, int port)

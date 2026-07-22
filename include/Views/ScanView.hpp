@@ -49,6 +49,9 @@ private:
     // Window procedure
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
+    // Trampoline that forwards ScannerHAL scan-callbacks to OnScanReceived.
+    static void ScanThunk(const TCHAR* barcode, void* userData);
+
     // Event handlers
     void OnScanButtonClick();
     void OnScanReceived(const TCHAR* barcode);

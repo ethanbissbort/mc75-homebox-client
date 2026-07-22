@@ -2,7 +2,6 @@
 #define CONFIG_HPP
 
 #include <windows.h>
-#include <string>
 
 namespace HBX {
 
