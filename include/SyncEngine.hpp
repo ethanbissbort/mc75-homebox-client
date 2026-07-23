@@ -19,6 +19,10 @@ public:
     // Queue management
     bool QueueTransaction(const TCHAR* transactionType, const TCHAR* data);
     int GetQueuedTransactionCount() const;
+    // Returns the pending (unsynced) transaction strings. On success *transactions
+    // is a heap TCHAR*[] of *count heap TCHAR* entries; the caller must delete[]
+    // each entry and then delete[] the array. Returns true (with count 0) when empty.
+    bool GetQueuedTransactions(TCHAR*** transactions, int* count) const;
     bool ClearQueue();
 
     // Sync operations
@@ -31,7 +35,9 @@ public:
         SYNC_IDLE,
         SYNC_IN_PROGRESS,
         SYNC_SUCCESS,
-        SYNC_FAILED
+        SYNC_PARTIAL,   // some queued transactions synced, some failed
+        SYNC_FAILED,
+        SYNC_OFFLINE    // no network connectivity
     };
 
     SyncStatus GetSyncStatus() const;
@@ -51,7 +57,7 @@ private:
     bool m_autoSyncEnabled;
 
     // Helper methods
-    bool CheckConnectivity();
+    bool CheckConnectivity() const;
     bool ProcessQueuedTransaction(const TCHAR* transaction);
 };
 

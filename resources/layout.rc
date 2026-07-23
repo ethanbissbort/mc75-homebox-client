@@ -1,18 +1,31 @@
 #include <windows.h>
+#include <commctrl.h>
+#include <aygshell.h>
 #include "resource.h"
 
 // Application icon
 IDI_APPICON ICON "icons/app.ico"
 
-// Main menu
+// Popup menu presented from the Windows Mobile soft-key menu bar.
 IDM_MAINMENU MENU
 BEGIN
-    POPUP "&File"
+    POPUP "&Menu"
     BEGIN
-        MENUITEM "E&xit", IDM_FILE_EXIT
+        MENUITEM "&Scan",       IDM_VIEW_SCAN
+        MENUITEM "&Queue",      IDM_VIEW_QUEUE
+        MENUITEM "S&ync now",   IDM_ACTION_SYNC
+        MENUITEM SEPARATOR
+        MENUITEM "&About",      IDM_HELP_ABOUT
+        MENUITEM "E&xit",       IDM_FILE_EXIT
     END
-    POPUP "&Help"
-    BEGIN
-        MENUITEM "&About", IDM_HELP_ABOUT
-    END
+END
+
+// Windows Mobile soft-key menu bar (created at runtime with SHCreateMenuBar).
+// This is the canonical SHMENUBAR template; tweak on-device if the soft-key
+// layout needs adjusting.
+IDR_MENUBAR SHMENUBAR MOVEABLE PURE
+BEGIN
+    IDR_MENUBAR, 1,
+    I_IMAGENONE, IDM_MAINMENU, TBSTATE_ENABLED,
+        TBSTYLE_DROPDOWN | TBSTYLE_AUTOSIZE, IDS_MENU, 0, 0
 END

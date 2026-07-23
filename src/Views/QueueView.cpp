@@ -15,6 +15,7 @@ QueueView::QueueView()
     , m_syncEngine(NULL)
     , m_syncCallback(NULL)
     , m_callbackUserData(NULL)
+    , m_selectedIndex(-1)
 {
 }
 
@@ -27,16 +28,28 @@ bool QueueView::Create(HWND parentWnd, HINSTANCE hInstance)
 {
     m_hInstance = hInstance;
 
-    // Create main window
+    // Register a window class that installs QueueView::WindowProc so the Sync /
+    // Clear buttons and list-view selection notifications reach this instance
+    // (the built-in STATIC class would drop them).
+    static const TCHAR* kClassName = TEXT("HBXQueueView");
+    WNDCLASS wc = {0};
+    wc.lpfnWndProc   = QueueView::WindowProc;
+    wc.hInstance     = hInstance;
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.lpszClassName = kClassName;
+    RegisterClass(&wc); // harmless if already registered by a prior Create()
+
+    // Create main window using our class; pass 'this' so WM_CREATE can stash
+    // the instance pointer (see WindowProc).
     m_hwnd = CreateWindow(
-        TEXT("STATIC"),
+        kClassName,
         TEXT("Queue View"),
         WS_CHILD | WS_VISIBLE,
         0, 0, 240, 320,
         parentWnd,
         NULL,
         hInstance,
-        NULL
+        (LPVOID)this
     );
 
     if (!m_hwnd) {
@@ -137,11 +150,25 @@ void QueueView::RefreshQueue()
 
     // Clear current list
     ListView_DeleteAllItems(m_listView);
+    m_selectedIndex = -1;
 
-    // Get pending transactions from sync engine's journal
-    // In a real implementation, we'd query the sync engine
-    // For now, just update the count
-    SetItemCount(0);
+    // Pull the actual pending (unsynced) transactions from the sync engine and
+    // list each one. GetQueuedTransactions hands back a heap TCHAR*[] of heap
+    // strings that we own and must free.
+    TCHAR** transactions = NULL;
+    int count = 0;
+    if (m_syncEngine->GetQueuedTransactions(&transactions, &count) && transactions) {
+        for (int i = 0; i < count; i++) {
+            if (transactions[i]) {
+                AddQueuedItem(transactions[i]);   // ListView copies the text
+                delete[] transactions[i];
+            }
+        }
+        delete[] transactions;
+    }
+
+    // Keep the count label in sync with the engine's authoritative count.
+    SetItemCount(m_syncEngine->GetQueuedTransactionCount());
 }
 
 void QueueView::SetSyncEngine(SyncEngine* syncEngine)
@@ -189,7 +216,7 @@ void QueueView::AddQueuedItem(const TCHAR* description)
         return;
     }
 
-    LVITEM item;
+    LVITEM item = {0};
     item.mask = LVIF_TEXT;
     item.iItem = ListView_GetItemCount(m_listView);
     item.iSubItem = 0;
@@ -313,18 +340,29 @@ void QueueView::OnClearClick()
     if (result == IDYES) {
         ClearQueue();
 
-        // In a real implementation, also clear from the sync engine/journal
+        // Also clear the backing store (journal) so the transactions are truly
+        // removed, not just hidden from the list view.
         if (m_syncEngine) {
-            // m_syncEngine->ClearQueue();
+            if (!m_syncEngine->ClearQueue()) {
+                MessageBox(m_hwnd,
+                    TEXT("Failed to clear the queued transactions from storage."),
+                    TEXT("Error"),
+                    MB_OK | MB_ICONERROR);
+            }
         }
     }
 }
 
 void QueueView::OnItemSelected(int index)
 {
-    // Item selected in list view
-    // Could be used to show item details or enable/disable buttons
-    // For now, just a placeholder
+    // Remember which queued transaction the user picked so actions (e.g. a
+    // future per-row retry/remove) can operate on it. A negative index means
+    // "no selection".
+    if (index < 0) {
+        m_selectedIndex = -1;
+        return;
+    }
+    m_selectedIndex = index;
 }
 
 void QueueView::LayoutControls()
@@ -380,7 +418,7 @@ void QueueView::InitializeListView()
     ListView_SetExtendedListViewStyle(m_listView, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
 
     // Add columns
-    LVCOLUMN column;
+    LVCOLUMN column = {0};
     column.mask = LVCF_TEXT | LVCF_WIDTH;
 
     // Transaction column

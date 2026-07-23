@@ -2,6 +2,11 @@
 
 > **Complete build instructions for MC75 HomeBox Client**
 
+> 🆕 **Setting up a fresh Windows 7 machine from scratch?** See the step‑by‑step
+> [Windows 7 Build Guide](WINDOWS7_BUILD.md) — it walks through installing
+> Visual Studio 2008, the Windows Mobile 6/6.5 SDKs, and every dependency in the
+> correct order, and covers the project‑platform retargeting gotcha.
+
 ---
 
 ## 📋 Table of Contents
@@ -157,12 +162,19 @@ $(ZEBRAEMDK)\Lib\ARMV4I
 
 ```
 coredll.lib      // Windows CE core
-aygshell.lib     // Application shell
-commctrl.lib     // Common controls
+aygshell.lib     // Application shell (soft-key menu bar)
+commctrl.lib     // Common controls (list view)
 ole32.lib        // OLE support
 oleaut32.lib     // OLE automation
-winsock.lib      // Networking
+winsock.lib      // Networking (fallback HTTP transport)
+wininet.lib      // Real HTTP/HTTPS transport (HBX_USE_WININET; ships with the SDK)
+ScanAPIWM.lib    // Zebra Scanner C API for real scanning (HBX_USE_EMDK; from the EMDK for C)
 ```
+
+> Real scanning (`HBX_USE_EMDK`) and the WinInet HTTP/HTTPS transport
+> (`HBX_USE_WININET`) are enabled by default. `wininet.lib` is part of the SDK;
+> `ScanAPIWM.lib` comes from the **Zebra EMDK for C**. To build without a
+> scanner, remove `HBX_USE_EMDK` — see [SCANNING.md](SCANNING.md).
 
 ### Project: HBXClientCab
 
@@ -302,15 +314,79 @@ build_winmobile.bat [Debug|Release]
 
 ### `build_host_debug.sh`
 
-**Purpose**: Host machine debug build (for testing without device)
+**Purpose**: Compile-check the entire codebase and run the unit + integration
+tests on a POSIX host (Linux/macOS) **without** the Windows Mobile SDK, VS2008,
+or a device. Ideal for CI and quick local validation of the core logic.
 
 **Usage**:
 ```bash
-cd scripts
-./build_host_debug.sh
+./scripts/build_host_debug.sh
 ```
 
-**Note**: Requires MinGW or similar for cross-compilation simulation
+**Requirements**: only a C++ compiler (`g++` or `clang++`) and `make`.
+
+See [Host Build & Testing](#-host-build--testing) below for how it works.
+
+---
+
+## 🧪 Host Build & Testing
+
+The production app targets Windows Mobile 6.5 (ARMV4I) and can only be linked
+with the VS2008 toolchain on Windows. To make the code testable anywhere, the
+repository ships a small **Win32/CE shim** under `tests/host/shim/` that maps
+the subset of the Windows API the code uses onto the host:
+
+- `TCHAR` becomes `char` and `TEXT("x")` a narrow literal, so `wsprintf`'s
+  `%s` semantics match `wsprintfW`.
+- The `lstr*` / `wcs*` string helpers become inline wrappers over `<cstring>`.
+- File I/O (`CreateFile`/`ReadFile`/`WriteFile`/`SetFilePointer`/…) is mapped to
+  POSIX `open`/`read`/`write`/`lseek`, so `Journal` and `Config` exercise real
+  files.
+- `<winsock.h>` maps to BSD sockets; the GUI surface (`<commctrl.h>`, window
+  APIs) is provided as inert stubs so the UI translation units compile.
+
+### What runs where
+
+| Layer | Host build |
+|-------|-----------|
+| `JsonLite`, `Item`, `Location`, `Journal`, `Config`, `HttpClient` URL parsing, `HbClient` request gating | **compiled + unit/integration tested** |
+| GUI views, `Controller`, `main`, `ScannerHAL` | **compile-checked** (need a real device to run) |
+
+### Running
+
+```bash
+# Full gate: compile every source file + run the test suite
+./scripts/build_host_debug.sh
+
+# Or drive the Makefile directly:
+make -C tests/host check          # compile-all + compile-device + run tests
+make -C tests/host run            # build + run tests only
+make -C tests/host compile-all    # syntax-check every source (host default paths)
+make -C tests/host compile-device # syntax-check the device paths (HBX_USE_EMDK + HBX_USE_WININET)
+make -C tests/host clean
+```
+
+Expected tail of a successful run:
+
+```
+==== 32/32 test cases passed, 204/204 checks passed ====
+Host debug build & tests completed successfully.
+```
+
+### Layout
+
+```
+tests/host/
+├── shim/                 # Win32/CE shim headers (windows.h, winsock.h, wchar.h, commctrl.h)
+├── test_framework.hpp    # tiny zero-dependency assertion framework (TEST_CASE / CHECK*)
+├── test_main.cpp         # runner entry point
+└── Makefile              # build gate + test runner
+tests/unit/               # test_json.cpp, test_journal.cpp, test_http.cpp
+tests/integration/        # test_api_endpoints.cpp, test_offline_sync.cpp
+```
+
+> The shim is **host-only** — it lives on the test include path and is never
+> seen by the real Windows Mobile build.
 
 ---
 

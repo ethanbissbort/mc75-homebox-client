@@ -8,6 +8,7 @@ HbClient::HbClient()
     : m_httpClient(NULL)
     , m_baseUrl(NULL)
     , m_authToken(NULL)
+    , m_deviceId(NULL)
     , m_authenticated(false)
 {
     m_httpClient = new HttpClient();
@@ -24,6 +25,9 @@ HbClient::~HbClient()
     if (m_authToken) {
         delete[] m_authToken;
     }
+    if (m_deviceId) {
+        delete[] m_deviceId;
+    }
 }
 
 bool HbClient::Authenticate(const TCHAR* deviceId, const TCHAR* apiKey)
@@ -31,6 +35,13 @@ bool HbClient::Authenticate(const TCHAR* deviceId, const TCHAR* apiKey)
     if (!deviceId || !apiKey) {
         return false;
     }
+
+    // Remember the device id so later requests (e.g. sync) can identify us.
+    if (m_deviceId) {
+        delete[] m_deviceId;
+    }
+    m_deviceId = new TCHAR[lstrlen(deviceId) + 1];
+    lstrcpy(m_deviceId, deviceId);
 
     // Build authentication request body
     TCHAR requestBody[1024];
@@ -314,16 +325,27 @@ bool HbClient::GetAllLocations(Models::Location** locations, int* count)
                 }
                 objJson[objLen] = '\0';
 
-                // Parse into location object
-                locArray[currentLoc].FromJson(objJson);
+                // Parse into location object; only keep it if it is valid so
+                // callers never receive half-parsed / empty Location entries.
+                if (locArray[currentLoc].FromJson(objJson)) {
+                    currentLoc++;
+                }
                 delete[] objJson;
 
-                currentLoc++;
                 ptr = objEnd + 1;
             } else {
                 break;
             }
         }
+    }
+
+    // If nothing valid was parsed, hand back an empty result rather than an
+    // array of default-constructed (invalid) Location objects.
+    if (currentLoc == 0) {
+        delete[] locArray;
+        *locations = NULL;
+        *count = 0;
+        return true;
     }
 
     *locations = locArray;
@@ -334,18 +356,60 @@ bool HbClient::GetAllLocations(Models::Location** locations, int* count)
 
 bool HbClient::SyncPendingTransactions()
 {
+    // Empty batch (a device heartbeat / "nothing pending" sync).
+    return SyncPendingTransactions(NULL, 0);
+}
+
+bool HbClient::SyncPendingTransactions(const TCHAR* const* transactions, int count)
+{
     if (!m_authenticated) {
         return false;
     }
+    if (count < 0) {
+        count = 0;
+    }
 
-    // Make POST request to sync endpoint
-    // The backend will expect a batch of transactions
-    TCHAR requestBody[4096];
-    wsprintf(requestBody, TEXT("{\"deviceId\":\"%s\"}"), TEXT("DEVICE_ID")); // Placeholder
+    // Build the batch body:
+    //   {"deviceId":"<id>","transactions":["<t0>","<t1>",...]}
+    // Size the buffer for the worst case where every character needs escaping.
+    int capacity = 128 + (m_deviceId ? lstrlen(m_deviceId) : 0);
+    for (int i = 0; i < count; i++) {
+        if (transactions && transactions[i]) {
+            capacity += lstrlen(transactions[i]) * 2 + 8;
+        } else {
+            capacity += 8;
+        }
+    }
+
+    TCHAR* body = new TCHAR[capacity];
+    int pos = 0;
+    pos += wsprintf(body + pos, TEXT("{\"deviceId\":\"%s\",\"transactions\":["),
+        m_deviceId ? m_deviceId : TEXT(""));
+
+    for (int i = 0; i < count; i++) {
+        if (i > 0) {
+            body[pos++] = ',';
+        }
+        body[pos++] = '"';
+        const TCHAR* t = (transactions && transactions[i]) ? transactions[i] : TEXT("");
+        for (int j = 0; t[j] != '\0'; j++) {
+            TCHAR c = t[j];
+            if (c == '"' || c == '\\') {
+                body[pos++] = '\\';   // JSON-escape quotes and backslashes
+            }
+            body[pos++] = c;
+        }
+        body[pos++] = '"';
+    }
+    body[pos++] = ']';
+    body[pos++] = '}';
+    body[pos] = '\0';
 
     TCHAR response[8192];
-    bool success = MakeApiRequest(TEXT("POST"), TEXT("/api/v1/sync"), requestBody, response, sizeof(response) / sizeof(TCHAR));
+    bool success = MakeApiRequest(TEXT("POST"), TEXT("/api/v1/sync"), body, response,
+        sizeof(response) / sizeof(TCHAR));
 
+    delete[] body;
     return success;
 }
 

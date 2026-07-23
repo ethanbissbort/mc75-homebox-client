@@ -182,6 +182,23 @@ bool Journal::Compact()
     }
     fileContent[bytesRead] = '\0';
 
+    // Split the content into NUL-terminated lines in place. Blank lines are
+    // skipped. This lets us correlate SYNCED markers with the transactions
+    // they refer to (a SYNCED entry embeds the full text of the original
+    // transaction line - see MarkTransactionSynced / SyncEngine::Sync).
+    char** lines = new char*[bytesRead + 1];
+    int lineCount = 0;
+    char* lineStart = fileContent;
+    for (DWORD i = 0; i <= bytesRead; i++) {
+        if (fileContent[i] == '\n' || fileContent[i] == '\r' || fileContent[i] == '\0') {
+            fileContent[i] = '\0';
+            if (lineStart[0] != '\0') {
+                lines[lineCount++] = lineStart;
+            }
+            lineStart = &fileContent[i + 1];
+        }
+    }
+
     // Create temporary file for compacted journal
     TCHAR tempPath[MAX_PATH];
     wsprintf(tempPath, TEXT("%s.tmp"), m_journalPath);
@@ -197,47 +214,57 @@ bool Journal::Compact()
     );
 
     if (tempHandle == INVALID_HANDLE_VALUE) {
+        delete[] lines;
         delete[] fileContent;
         return false;
     }
 
-    // Write only unsynced transactions and recent INFO/ERROR entries
-    char line[2048];
-    int linePos = 0;
+    // Write only unsynced transactions and error entries.
     int newTransactionCount = 0;
 
-    for (DWORD i = 0; i < bytesRead; i++) {
-        if (fileContent[i] == '\n' || fileContent[i] == '\r') {
-            if (linePos > 0) {
-                line[linePos] = '\0';
+    for (int i = 0; i < lineCount; i++) {
+        char* line = lines[i];
 
-                // Keep unsynced transactions
-                bool keepLine = false;
-                if (strstr(line, "TRANS") && !strstr(line, "SYNCED")) {
-                    keepLine = true;
-                    newTransactionCount++;
-                }
-                // Keep recent errors (for debugging)
-                else if (strstr(line, "ERROR")) {
-                    keepLine = true;
-                }
+        bool isTransaction = (strstr(line, "TRANS") != NULL) && (strstr(line, "SYNCED") == NULL);
+        bool isError = (strstr(line, "ERROR") != NULL);
 
-                if (keepLine) {
-                    DWORD written;
-                    WriteFile(tempHandle, line, linePos, &written, NULL);
-                    WriteFile(tempHandle, "\r\n", 2, &written, NULL);
+        bool keepLine = false;
+        if (isTransaction) {
+            // Drop this transaction if a SYNCED marker references it. A SYNCED
+            // entry has the form "[ts] SYNCED: <original transaction line>", so
+            // the marker's payload equals this line's full text when synced.
+            bool synced = false;
+            for (int j = 0; j < lineCount && !synced; j++) {
+                if (j == i) {
+                    continue;
                 }
-
-                linePos = 0;
+                const char* marker = strstr(lines[j], "SYNCED: ");
+                if (marker) {
+                    const char* payload = marker + 8; // past "SYNCED: "
+                    if (strcmp(payload, line) == 0) {
+                        synced = true;
+                    }
+                }
             }
-        } else {
-            if (linePos < sizeof(line) - 1) {
-                line[linePos++] = fileContent[i];
+
+            if (!synced) {
+                keepLine = true;
+                newTransactionCount++;
             }
+        } else if (isError) {
+            // Keep recent errors (for debugging)
+            keepLine = true;
+        }
+
+        if (keepLine) {
+            DWORD written;
+            WriteFile(tempHandle, line, (DWORD)strlen(line), &written, NULL);
+            WriteFile(tempHandle, "\r\n", 2, &written, NULL);
         }
     }
 
     CloseHandle(tempHandle);
+    delete[] lines;
     delete[] fileContent;
 
     // Replace original file with compacted version

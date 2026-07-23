@@ -30,16 +30,28 @@ bool ItemView::Create(HWND parentWnd, HINSTANCE hInstance)
 {
     m_hInstance = hInstance;
 
-    // Create main window
+    // Register a window class that installs ItemView::WindowProc so Save/Cancel
+    // clicks and edit-change notifications reach this instance (the built-in
+    // STATIC class would drop them).
+    static const TCHAR* kClassName = TEXT("HBXItemView");
+    WNDCLASS wc = {0};
+    wc.lpfnWndProc   = ItemView::WindowProc;
+    wc.hInstance     = hInstance;
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.lpszClassName = kClassName;
+    RegisterClass(&wc); // harmless if already registered by a prior Create()
+
+    // Create main window using our class; pass 'this' so WM_CREATE can stash
+    // the instance pointer (see WindowProc).
     m_hwnd = CreateWindow(
-        TEXT("STATIC"),
+        kClassName,
         TEXT("Item View"),
         WS_CHILD | WS_VISIBLE,
         0, 0, 240, 320,
         parentWnd,
         NULL,
         hInstance,
-        NULL
+        (LPVOID)this
     );
 
     if (!m_hwnd) {
@@ -328,20 +340,10 @@ void ItemView::OnTextChanged()
 
 void ItemView::LayoutControls()
 {
-    if (!m_hwnd) {
-        return;
-    }
-
-    RECT clientRect;
-    GetClientRect(m_hwnd, &clientRect);
-
-    int width = clientRect.right - clientRect.left;
-    int margin = 10;
-    int labelWidth = 80;
-    int editWidth = width - labelWidth - (3 * margin);
-
-    // The controls are already positioned during creation
-    // This function could be used to handle dynamic resizing if needed
+    // Controls are positioned with fixed coordinates at creation time. This
+    // hook exists for symmetry with the other views and as the place to add
+    // dynamic reflow (MoveWindow per row on WM_SIZE) if the form ever needs to
+    // adapt to orientation changes; today it intentionally does nothing.
 }
 
 void ItemView::EnableControls(bool enabled)

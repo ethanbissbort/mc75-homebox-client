@@ -34,6 +34,8 @@ public:
 
     // Sync operations
     bool SyncPendingTransactions();
+    // Post a batch of queued transaction strings to the sync endpoint.
+    bool SyncPendingTransactions(const TCHAR* const* transactions, int count);
 
     // Configuration
     void SetBaseUrl(const TCHAR* baseUrl);
@@ -43,6 +45,7 @@ private:
     HttpClient* m_httpClient;
     TCHAR* m_baseUrl;
     TCHAR* m_authToken;
+    TCHAR* m_deviceId;
     bool m_authenticated;
 
     // Helper methods

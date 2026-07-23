@@ -56,6 +56,9 @@ private:
 
     Node* m_root;
     TCHAR* m_parseBuffer;
+    // When true, m_root points into another JsonLite's tree (see
+    // GetArrayElement) and must not be freed by this instance.
+    bool m_borrowedRoot;
 
     // Helper methods
     Node* CreateNode();

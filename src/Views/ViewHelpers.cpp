@@ -1,4 +1,5 @@
 #include "../../include/Views/ViewHelpers.hpp"
+#include <commctrl.h>  // WC_LISTVIEW, LVS_REPORT used by CreateListView
 
 namespace HBX {
 namespace Views {

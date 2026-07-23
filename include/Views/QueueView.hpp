@@ -48,6 +48,7 @@ private:
     SyncEngine* m_syncEngine;
     SyncCallback m_syncCallback;
     void* m_callbackUserData;
+    int m_selectedIndex;   // index of the currently selected queue row, or -1
 
     // Window procedure
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);

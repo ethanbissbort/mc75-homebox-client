@@ -1,5 +1,7 @@
 #include "../include/Controller.hpp"
 #include <commctrl.h>
+#include <aygshell.h>
+#include "../resources/resource.h"
 
 namespace HBX {
 
@@ -12,6 +14,10 @@ Controller::Controller()
     , m_syncEngine(NULL)
     , m_journal(NULL)
     , m_scanner(NULL)
+    , m_scanView(NULL)
+    , m_queueView(NULL)
+    , m_itemView(NULL)
+    , m_menuBar(NULL)
 {
 }
 
@@ -23,10 +29,13 @@ bool Controller::Initialize(HINSTANCE hInstance)
 {
     m_hInstance = hInstance;
 
-    // Initialize common controls
+    // Initialize common controls. ICC_LISTVIEW_CLASSES is required so the
+    // WC_LISTVIEW window class used by QueueView / ViewHelpers is registered;
+    // without it CreateWindow(WC_LISTVIEW, ...) can fail and the queue list
+    // never appears.
     INITCOMMONCONTROLSEX icex;
     icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
-    icex.dwICC = ICC_BAR_CLASSES;
+    icex.dwICC = ICC_BAR_CLASSES | ICC_LISTVIEW_CLASSES;
     InitCommonControlsEx(&icex);
 
     // Create core components
@@ -90,6 +99,21 @@ int Controller::Run()
 
 void Controller::Shutdown()
 {
+    // Tear down the UI views first (they hold non-owning references to the
+    // scanner / sync engine, so they must go before those are deleted).
+    if (m_scanView) {
+        delete m_scanView;
+        m_scanView = NULL;
+    }
+    if (m_queueView) {
+        delete m_queueView;
+        m_queueView = NULL;
+    }
+    if (m_itemView) {
+        delete m_itemView;
+        m_itemView = NULL;
+    }
+
     // Shutdown scanner
     if (m_scanner) {
         m_scanner->Shutdown();
@@ -246,7 +270,148 @@ void Controller::OnConfigChanged()
 
 bool Controller::InitializeUI()
 {
-    return CreateMainWindow();
+    if (!CreateMainWindow()) {
+        return false;
+    }
+
+    // Create the child views that make up the UI and wire their callbacks.
+    if (!CreateViews()) {
+        return false;
+    }
+
+    // The soft-key menu bar is a nicety; failure to create it is not fatal.
+    CreateMenuBar();
+
+    // Start on the scan screen.
+    ShowScanView();
+    return true;
+}
+
+bool Controller::CreateViews()
+{
+    m_scanView = new Views::ScanView();
+    m_queueView = new Views::QueueView();
+    m_itemView = new Views::ItemView();
+
+    if (!m_scanView->Create(m_mainWindow, m_hInstance)) {
+        return false;
+    }
+    if (!m_queueView->Create(m_mainWindow, m_hInstance)) {
+        return false;
+    }
+    if (!m_itemView->Create(m_mainWindow, m_hInstance)) {
+        return false;
+    }
+
+    // Scan pipeline: the hardware scanner and the on-screen Scan button both
+    // deliver a barcode to the ScanView, which forwards it here via this thunk.
+    m_scanView->SetScanner(m_scanner);
+    m_scanView->SetScanCallback(&Controller::ScanCallbackThunk, this);
+
+    // Queue view drives synchronization through the controller.
+    m_queueView->SetSyncEngine(m_syncEngine);
+    m_queueView->SetSyncCallback(&Controller::SyncCallbackThunk, this);
+
+    // Item editor saves flow back through the controller to the API client.
+    m_itemView->SetSaveCallback(&Controller::ItemSaveThunk, this);
+
+    // Only the scan view is visible initially.
+    m_queueView->Show(false);
+    m_itemView->Show(false);
+    return true;
+}
+
+bool Controller::CreateMenuBar()
+{
+    // Create the Windows Mobile soft-key menu bar from the SHMENUBAR resource
+    // (see resources/layout.rc). Menu selections arrive as WM_COMMAND on the
+    // main window.
+    SHMENUBARINFO mbi = {0};
+    mbi.cbSize = sizeof(mbi);
+    mbi.hwndParent = m_mainWindow;
+    mbi.nToolBarId = IDR_MENUBAR;
+    mbi.hInstRes = m_hInstance;
+    mbi.dwFlags = SHCMBF_HIDESIPBUTTON;
+
+    if (SHCreateMenuBar(&mbi)) {
+        m_menuBar = mbi.hwndMB;
+        return true;
+    }
+    return false;
+}
+
+void Controller::ShowScanView()
+{
+    if (m_scanView) m_scanView->Show(true);
+    if (m_queueView) m_queueView->Show(false);
+    if (m_itemView) m_itemView->Show(false);
+}
+
+void Controller::ShowQueueView()
+{
+    if (m_queueView) {
+        m_queueView->RefreshQueue();   // pull the latest pending transactions
+        m_queueView->Show(true);
+    }
+    if (m_scanView) m_scanView->Show(false);
+    if (m_itemView) m_itemView->Show(false);
+}
+
+// static
+void Controller::ScanCallbackThunk(const TCHAR* barcode, void* userData)
+{
+    Controller* self = (Controller*)userData;
+    if (self) {
+        self->OnScanReceived(barcode);
+    }
+}
+
+// static
+void Controller::SyncCallbackThunk(void* userData)
+{
+    Controller* self = (Controller*)userData;
+    if (self) {
+        self->OnSyncRequested();
+    }
+}
+
+// static
+void Controller::ItemSaveThunk(const Models::Item* item, void* userData)
+{
+    Controller* self = (Controller*)userData;
+    if (self) {
+        self->OnItemSave(item);
+    }
+}
+
+void Controller::OnItemSave(const Models::Item* item)
+{
+    if (!item || !m_hbClient) {
+        return;
+    }
+
+    // Existing item (has an id) -> update; otherwise create.
+    bool hasId = (item->GetId() != NULL && lstrlen(item->GetId()) > 0);
+    bool ok = hasId ? m_hbClient->UpdateItem(item) : m_hbClient->CreateItem(item);
+
+    if (ok) {
+        m_journal->LogInfo(TEXT("Item saved to server"));
+        MessageBox(m_mainWindow, TEXT("Item saved."), TEXT("Saved"), MB_OK | MB_ICONINFORMATION);
+    } else if (m_syncEngine && !m_syncEngine->IsOnline()) {
+        // Offline: queue the update as an ITEM_UPDATE transaction for later sync.
+        TCHAR* json = item->ToJson();
+        if (json) {
+            TCHAR data[2100];
+            wsprintf(data, TEXT("UPDATE:%s"), json);
+            m_syncEngine->QueueTransaction(TEXT("ITEM_UPDATE"), data);
+            delete[] json;
+        }
+        MessageBox(m_mainWindow, TEXT("Offline - item queued for sync."),
+                   TEXT("Offline Mode"), MB_OK | MB_ICONWARNING);
+    } else {
+        MessageBox(m_mainWindow, TEXT("Failed to save item."),
+                   TEXT("Error"), MB_OK | MB_ICONERROR);
+    }
 }
 
 void Controller::UpdateUI()
@@ -347,6 +512,31 @@ LRESULT CALLBACK Controller::WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPA
             }
         }
         return 0;
+
+    case WM_COMMAND:
+        // Soft-key menu selections (the child views handle their own control
+        // commands via their own window procedures).
+        if (pController) {
+            switch (LOWORD(wParam)) {
+            case IDM_VIEW_SCAN:
+                pController->ShowScanView();
+                return 0;
+            case IDM_VIEW_QUEUE:
+                pController->ShowQueueView();
+                return 0;
+            case IDM_ACTION_SYNC:
+                pController->OnSyncRequested();
+                return 0;
+            case IDM_HELP_ABOUT:
+                MessageBox(hwnd, TEXT("HomeBox Client\nVersion 1.0.0"),
+                           TEXT("About"), MB_OK | MB_ICONINFORMATION);
+                return 0;
+            case IDM_FILE_EXIT:
+                DestroyWindow(hwnd);
+                return 0;
+            }
+        }
+        return DefWindowProc(hwnd, uMsg, wParam, lParam);
 
     default:
         return DefWindowProc(hwnd, uMsg, wParam, lParam);
