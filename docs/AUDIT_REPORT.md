@@ -60,6 +60,78 @@ See [SCANNING.md](SCANNING.md) for details and the per-EMDK-version knobs.
 
 ---
 
+## ✅ Full-Codebase Review and Verification Pass (2026-07-25)
+
+A second, much wider review crawled the whole repository and produced **130
+findings**. Each one was then re-checked against the source by an independent
+adversarial verification pass whose job was to *break* the finding, not to
+confirm it. That pass **confirmed 126 and refuted 4**. All 126 confirmed
+findings have been fixed.
+
+Gate after the fixes (`make -C tests/host check`):
+
+```
+All sources compile cleanly.                 (16 sources, host shim)
+All device paths compile cleanly.            (same 16, HBX_USE_EMDK + HBX_USE_WININET)
+==== 53/53 test cases passed, 1065/1065 checks passed ====
+```
+
+(48 cases and 1047 checks of those came with this pass; the remainder are the
+`ParseUrl` regression tests added immediately afterwards.)
+
+### Why 4 findings were refuted — one mechanism, four sites
+
+All four refutations were "fixed buffer can be overrun by `wsprintf`" claims, and
+they turn on a Windows CE detail worth recording because it decides the verdict
+either way:
+
+> **`wsprintf` on Windows CE stops after 1024 characters, including the NUL.**
+
+- A **1024-element** destination therefore **cannot** be overrun by a single
+  `wsprintf` call: the cap and the buffer are the same size. The output is
+  *truncated* instead — a correctness bug in some cases, but not memory
+  corruption, and not what those four findings claimed. That is the ground on
+  which all four were refuted.
+- A **smaller** destination can be overrun by whatever the call emits past its
+  end, i.e. up to `1024 - N` elements for a buffer of `N` (worst case: 1023 past
+  a one-element buffer). The 512-element sites — such as the old
+  `MarkTransactionSynced`, which did `TCHAR syncEntry[512]; wsprintf(syncEntry,
+  TEXT("%s"), transactionId);` over a journal line — were therefore **confirmed**,
+  not refuted.
+
+The distinction is easy to get wrong in either direction, so the host harness now
+reproduces the cap: `tests/host/shim/windows.h` implements `wsprintf` over
+`vsnprintf` with the same 1024-character limit. Without that, the host build
+would happily write past a length the device silently truncates, and the same
+defect would present completely differently on the two targets.
+
+Note that the cap bounds *one call*. It does **not** bound a call that starts at
+an offset into a buffer, and it says nothing about `lstrcpy`/`lstrcat` or a
+hand-rolled copy loop — which is why the fix was to route these sites through
+`HBX::Str` rather than to reason about the cap at each one.
+
+### The 126 confirmed findings, by area
+
+The review's per-finding severity labels were not carried into the repository, so
+this table groups the confirmed findings by area and by the **worst outcome
+observed in that area** rather than inventing per-area counts. Every claim below
+is checkable against the named files.
+
+| Area | Worst outcome | What was wrong |
+|------|---------------|----------------|
+| **Bounded strings** (`StrUtil.*`, and every caller) | Memory corruption | Caller- and server-supplied text was formatted into fixed stack buffers. Added `HBX::Str`: bounded copy/append that always NUL-terminates and reports truncation, saturating `ParseInt`, RFC 8259 escaping, real UTF-8 conversion, and a growable `Str::Buffer`. One implementation serves both TCHAR widths, so no `#ifdef`'d branch can rot |
+| **Journal / offline queue** (`Journal.*`) | Silent, permanent data loss | `SYNCED` markers embedded a copy of the acknowledged line: `GetPendingTransactions` tested the `TRANS` line for a substring it never contains, so synced work replayed forever while newer entries starved behind it; the copy overran a 512-TCHAR buffer; and any payload containing "SYNCED" was dropped unsent. Markers now carry the sequence number. `Initialize` rebuilds the queue from disk (a battery swap ends the process). `LogTransaction` writes AUDIT, so journalling a scan no longer enqueues a permanently failing entry. Records are UTF-8 on disk, the class is lock-guarded, and `Compact()` actually runs |
+| **HTTP transport** (`HttpClient.*`) | Truncated response accepted as success | The receive loop stopped at the headers; it now honours `Content-Length` and chunked transfer-encoding and fails a body that arrives short. URL, header and request construction are bounded; bodies are UTF-8 in both directions on both transports; timeouts work |
+| **API client & models** (`HbClient.*`, `Models/*`) | Requests the server can only reject | `ToJson`/`Config::Save` now build into a growable buffer with every value escaped; the auth response is accepted only when `token` is a non-empty string; `JsonLite` decodes `\uXXXX`, honours exponents, frees siblings iteratively and bounds nesting depth |
+| **Scanner** (`ScannerHAL.*`, `Views/ScanView.*`) | Use-after-free on shutdown; dead feature | Nothing ever called `EnableScanner`, so scanning did not work at all. Shutdown could free state a live monitor thread still touched — the shared state is now reference counted. The callback and its `userData` are published under one lock. Decodes are marshalled to the UI thread instead of running the journal, a blocking HTTP request and a modal dialog on the EMDK callback thread |
+| **Application lifecycle** (`Controller.*`, `Views/*`) | Features unreachable | The app now authenticates, lays views out on `WM_SIZE`, can reach `ItemView`, auto-syncs on a timer, refreshes the queue UI when the queue changes, and refuses a second instance (two copies fought over the journal file and the `SCN1:` port) |
+| **Sync scheduling** (`SyncEngine.*`) | Deferred work sitting idle | A queue recovered from disk is due for its first auto-sync immediately rather than after a full interval; the connectivity probe is cached and invalidated on a total sync failure |
+| **Harness fidelity** (`tests/host/*`) | Tests that agreed with the bug | The shim gained real pthread-backed critical sections, interlocked operations and the 1024-character `wsprintf` cap. `SyncEngine.cpp` and `StrUtil.cpp` joined the test build — the entire offline pipeline had been compile-checked but never executed — and the journal and offline-sync tests were rewritten against the corrected semantics, having previously asserted the buggy behaviour in their own comments |
+
+Everything below this line is the **original 2025-12-04 audit**, kept as written.
+
+---
+
 ## Executive Summary
 
 This comprehensive audit evaluated the MC75 HomeBox Client codebase for **code completeness** and **logic accuracy**. The application is a native C++ Windows Mobile 6.5 application designed for Motorola MC75 handheld scanner devices.

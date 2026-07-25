@@ -217,40 +217,53 @@ The application follows a **modified MVC pattern** adapted for embedded Windows 
 
 **Responsibility**: Manages offline transaction queuing and synchronization
 
-**Sync Status State Machine**:
+**Sync Status State Machine** (all six states of `SyncEngine::SyncStatus`):
 ```
 ┌─────────────┐
-│  SYNC_IDLE  │ ◄──────────┐
-└──────┬──────┘            │
-       │ Sync() called     │
-       ▼                   │
-┌──────────────────┐       │
-│ SYNC_IN_PROGRESS │       │
-└──────┬───────────┘       │
-       │                   │
-       ├──────────────┐    │
-       │              │    │
-       ▼              ▼    │
-┌──────────────┐  ┌────────────┐
-│ SYNC_SUCCESS │  │ SYNC_FAILED│
-└──────┬───────┘  └─────┬──────┘
-       │                │
-       └────────────────┴────────┘
+│  SYNC_IDLE  │ ◄─────────────────────────┐
+└──────┬──────┘                           │
+       │ Sync() called                    │
+       ▼                                  │
+┌──────────────────┐                      │
+│ SYNC_IN_PROGRESS │                      │
+└──────┬───────────┘                      │
+       │                                  │
+       ├───────────────┬──────────────┬───┴──────────┐
+       ▼               ▼              ▼              ▼
+┌──────────────┐ ┌─────────────┐ ┌────────────┐ ┌──────────────┐
+│ SYNC_SUCCESS │ │ SYNC_PARTIAL│ │SYNC_FAILED │ │ SYNC_OFFLINE │
+│ all replayed │ │ some stayed │ │ none got   │ │ no route to  │
+│              │ │ queued      │ │ through    │ │ the server   │
+└──────────────┘ └─────────────┘ └────────────┘ └──────────────┘
 ```
 
+`SYNC_PARTIAL` is a success from the caller's point of view — `Sync()` returns
+true — because the entries that failed are still queued and will be retried.
+`SYNC_FAILED` additionally discards the cached connectivity answer.
+
 **Queue Management**:
-- Transactions stored in `Journal` as file entries
-- Each transaction: `TYPE|DATA|TIMESTAMP`
-- Queue persists across application restarts
-- FIFO processing during sync
+- Transactions are stored in the `Journal`, which owns the durable queue
+- `QueueTransaction` writes the payload `[tick] TYPE: DATA`; the journal wraps it
+  in its own record header (see the Journal section below)
+- `DATA` is `SCAN:<barcode>`, `SCANLOC:<barcodeLength>:<barcode><locationId>`, or
+  `UPDATE:<item json>`. The location form carries an explicit length because a
+  Code 128 or QR barcode may legally contain any separator character
+- Queue persists across application restarts — the MC75 loses its process on
+  every battery swap, so `Journal::Initialize` rebuilds the pending set from disk
+- FIFO processing during sync; a failed entry stays queued for the next attempt
 
 **Connectivity Detection**:
 ```cpp
-bool CheckConnectivity():
-    1. DNS lookup of API base URL
-    2. If successful → IsOnline() = true
-    3. If failed → IsOnline() = false
-    4. Cache result for 60 seconds to avoid overhead
+bool CheckConnectivity() const:
+    1. gethostbyname() on the host parsed out of the API base URL
+    2. If it resolves → online
+    3. If it fails → offline
+    4. Cache the answer for 5 seconds (kConnectivityCacheMs)
+
+// The probe is a blocking DNS lookup that costs seconds on GPRS, and the UI
+// status line, IsOnline() and Sync() all ask for it - hence the cache. A sync
+// where every transaction failed invalidates it immediately rather than
+// reporting "online" for the rest of the window.
 ```
 
 **Sync Algorithm**:
@@ -284,43 +297,59 @@ bool CheckConnectivity():
 
 **File**: `src/Journal.cpp`, `include/Journal.hpp`
 
-**Responsibility**: Persistent transaction logging and audit trail
+**Responsibility**: Audit trail **and** the durable offline queue — one file, two
+kinds of record
 
-**Log Entry Format**:
+**Record Format** (one CRLF-terminated line each, as documented in
+`include/Journal.hpp`):
 ```
-[TIMESTAMP] [LEVEL] [TAG] Message
+[2026-07-25 09:14:02] INFO: application started
+[2026-07-25 09:14:07] ERROR: HTTP_500: server rejected update
+[2026-07-25 09:14:09] AUDIT: SCAN 123456789: Barcode scanned
+[2026-07-25 09:14:09] TRANS 00000042: [51234] ITEM_SCAN: SCAN:123456789
+[2026-07-25 09:15:11] SYNCED 00000042
 ```
 
-**Example Entries**:
-```
-[2025-11-15 14:32:15] INFO [INIT] Application initialized successfully
-[2025-11-15 14:32:45] TRANS [SCAN] Barcode: 1234567890
-[2025-11-15 14:33:02] SYNCED [SCAN] Transaction synced to server
-[2025-11-15 14:35:12] ERROR [API_CALL] Connection timeout
-```
+Two properties of that layout carry the design:
+
+1. **Only `TRANS` records are queue work.** `INFO` / `ERROR` / `AUDIT` are pure
+   history. `LogTransaction` writes `AUDIT`, so journaling a scan does not also
+   enqueue it — the controller journals every scan, and when both used the
+   `TRANS` label each one became a queue entry that could never be replayed.
+2. **A `SYNCED` marker names a sequence number, not the text of the record it
+   acknowledges.** Correlating by an 8-digit fixed-width sequence is exact and
+   bounded; embedding the original line instead both overflowed a fixed buffer
+   and mis-classified any payload containing the word "SYNCED".
 
 **Transaction Lifecycle**:
 ```
 1. User scans item
-   └─ LogTransaction("SCAN", barcode, "Barcode scanned")
+   └─ Journal::LogTransaction("SCAN", barcode, ...)   → AUDIT record (history only)
 
-2. Queued for sync (if offline)
-   └─ Entry remains in journal as "TRANS"
+2. Cannot reach the server
+   └─ SyncEngine::QueueScan → Journal::QueueTransaction → TRANS <seq> record
+      (the assigned sequence is returned to the caller)
 
 3. Sync successful
-   └─ LogInfo("Transaction synced to server")
-   └─ Mark entry as "SYNCED"
+   └─ Journal::MarkTransactionSynced(line) → parses <seq> → SYNCED <seq> record
+      The transaction leaves the pending set; the record itself goes at the next
+      Compact().
 
 4. Sync failed
-   └─ LogError("SYNC_FAILED", error message)
-   └─ Entry remains as "TRANS" for retry
+   └─ No marker is written; the TRANS record stays pending and is retried
 ```
 
 **File Persistence**:
-- Location: `\Program Files\HBXClient\hbx.journal`
-- Format: Plain text (UTF-16 on Windows Mobile)
-- Append-only (no in-place edits)
-- Survives application crashes and device reboots
+- Location: whatever `journalPath` in `hb_conf.json` says
+  (default `\My Documents\hbx_journal.log`)
+- Format: **UTF-8** bytes on disk, decoded back to TCHAR on read
+- Append-only, then compacted: `Compact()` rewrites the file keeping the
+  unacknowledged transactions and the most recent ERROR records, and runs
+  automatically once the file passes `SetMaxFileBytes` (default 256 KB, since
+  the MC75's persistent store is small)
+- Sequence numbering continues across compaction and across restarts
+- All public methods are serialised by a critical section: the EMDK scanner
+  thread and the UI thread share one `Journal` and one file pointer
 
 ---
 
@@ -349,33 +378,56 @@ bool CheckConnectivity():
 └──────────────────┘
 ```
 
-**Scan Thread Model**:
+**Scan Thread Model** (device build, `HBX_USE_EMDK`):
 ```
-Main Thread              Scan Thread
-    │                        │
-    │ Initialize()           │
-    ├───────────────────────>│ CreateThread()
-    │                        │
-    │                        │ Loop:
-    │                        │   WaitForScanEvent()
-    │                        │   ReadBarcode()
-    │<───────────────────────┤ PostMessage(barcode)
-    │ OnScanReceived()       │
-    │                        │
+UI Thread                        Scan Thread
+    │                                │
+    │ Initialize() + EnableScanner() │
+    ├───────────────────────────────>│ CreateThread()
+    │                                │
+    │                                │ Loop while running:
+    │                                │   SCAN_ReadLabelWait(..., 1000 ms)
+    │                                │   on E_SCN_SUCCESS: DeliverScan()
+    │                                │     └─ invokes the registered callback
+    │                                │        ON THIS THREAD
+    │                                │
+    │   ScanView::ScanThunk runs here ┘  (copies the label, PostMessage)
+    │<─── MSG_SCAN_DECODED (WM_APP+1, LPARAM = heap copy) ───
+    │ ScanView::OnScanReceived → Controller::OnScanReceived
 ```
+
+The callback itself is **not** on the UI thread — `ScannerHAL` calls it from the
+monitor thread. Marshalling is the *view's* job: `ScanView::ScanThunk` duplicates
+the barcode and posts it, and the window procedure takes ownership of that copy
+and frees it. Everything downstream (journal write, blocking lookup, message
+boxes) then runs on the UI thread.
+
+In the simulation build (`HBX_USE_EMDK` off) no monitor thread is created at all;
+`TriggerScan` / `InjectScan` deliver a decode synchronously on the caller's
+thread. An idle polling loop would only cost battery.
 
 **EMDK Function Calls**:
-- `SCAN_Open()`: Initialize scanner hardware
-- `SCAN_Enable()`: Enable scanning
-- `SCAN_ReadLabelWait()`: Wait for scan (blocking)
-- `SCAN_Disable()`: Disable scanning
-- `SCAN_Close()`: Release scanner hardware
+- `SCAN_Open("SCN1:")` / `SCAN_Close()`: acquire and release the scanner
+- `SCAN_AllocateBuffer()` / `SCAN_DeallocateBuffer()`: the reusable decode buffer
+- `SCAN_Enable()` / `SCAN_Disable()`: arm and disarm the beam
+- `SCAN_GetParameters()` / `SCAN_SetParameters()`: trigger mode, beep, vibrate
+- `SCAN_Flush()` + `SCAN_SetSoftTrigger()`: soft trigger from the Scan button
+- `SCAN_ReadLabelWait(handle, buffer, 1000)`: blocking read with a 1 s timeout,
+  which is what keeps the loop responsive to shutdown
 
 **Safety Features**:
-- ✅ Thread-safe scan event handling
-- ✅ Graceful failure if hardware unavailable
-- ✅ Automatic retry on transient errors
-- ✅ Proper cleanup on shutdown
+- ✅ The callback + its `userData` are published and snapshotted under one lock,
+  so a decode can never pair a new callback with a stale context
+- ✅ Shared state is reference counted. `Controller` can delete the `ScannerHAL`
+  while a decode is still in flight; the last owner out releases the hardware, so
+  the decode buffer and handle stay valid as long as the thread can touch them
+- ✅ Shutdown detaches the callback before the views are destroyed, and waits up
+  to 5 s for the thread; on timeout it hands its reference to the thread rather
+  than freeing state the thread may still read
+- ✅ Graceful failure if hardware is unavailable — `Controller::Initialize`
+  journals the failure and continues, so manual barcode entry still works
+- ✅ The scanner follows window activation (`WM_ACTIVATE`), because leaving the
+  imager armed in a holster is what empties an MC75 battery overnight
 
 ---
 
@@ -513,75 +565,82 @@ No intermediate representation → Direct model population
 
 ### Scan-to-Sync Complete Flow
 
+The thread boundary is the first thing to read here: the decode arrives on the
+scanner thread and is handed to the UI thread before anything else happens.
+
 ```
 ┌────────────┐
-│    User    │
+│    User    │  trigger pull, or the on-screen Scan button
 │  Triggers  │
 │   Scan     │
 └─────┬──────┘
       │
       ▼
 ┌────────────────────┐
-│   ScannerHAL       │
-│   Read barcode     │
+│   ScannerHAL       │   ── SCANNER THREAD ──
+│   ReadLabelWait    │
+│   DeliverScan()    │
 └─────┬──────────────┘
-      │ OnScanReceived(barcode)
+      │ ScanView::ScanThunk: copy the label,
+      │ PostMessage(MSG_SCAN_DECODED)
       ▼
 ┌────────────────────┐
-│   Controller       │
-│   Route event      │
+│   ScanView         │   ── UI THREAD from here on ──
+│   OnScanReceived   │   shows the barcode, frees the copy
+└─────┬──────────────┘
+      │ Controller::OnScanReceived(barcode)
+      ▼
+┌────────────────────┐
+│   Controller       │  AUDIT the scan (not queue work)
+│   Route event      │  EnsureAuthenticated, then LookupItem
 └─────┬──────────────┘
       │
-      ├──────────────────┐
-      │                  │
-      ▼                  ▼
- ┌──────────┐      ┌──────────┐
- │ Online?  │      │ Offline? │
- │  YES     │      │  YES     │
- └────┬─────┘      └────┬─────┘
-      │                  │
-      ▼                  ▼
-┌──────────────┐   ┌──────────────┐
-│  HbClient    │   │  SyncEngine  │
-│  GetItem()   │   │  QueueTrans()│
-└─────┬────────┘   └─────┬────────┘
-      │                  │
-      ▼                  ▼
-┌──────────────┐   ┌──────────────┐
-│  API Call    │   │  Journal     │
-│  Response    │   │  Write       │
-└─────┬────────┘   └─────┬────────┘
-      │                  │
-      ▼                  ▼
-┌──────────────┐   ┌──────────────┐
-│  ItemView    │   │  QueueView   │
-│  Display     │   │  Add Item    │
-└──────────────┘   └──────────────┘
+      ├─────────────────────────┐
+      │ lookup resolved         │ lookup did not resolve
+      ▼                         ▼
+┌──────────────┐    ┌──────────────────────────┐
+│  HbClient    │    │ Reachable AND authed?    │
+│  GetItem()   │    └────┬────────────────┬────┘
+└─────┬────────┘         │ yes            │ no
+      │                  ▼                ▼
+      │         ┌────────────────┐ ┌──────────────┐
+      │         │ "Not found -   │ │  SyncEngine  │
+      │         │  create it?"   │ │  QueueScan() │
+      │         └────────────────┘ └─────┬────────┘
+      ▼                                  ▼
+┌──────────────┐                  ┌──────────────┐
+│  ItemView    │                  │  Journal     │
+│  Display     │                  │  TRANS <seq> │
+└──────────────┘                  └─────┬────────┘
+                                        ▼
+                                  ┌──────────────┐
+                                  │ Title bar +  │
+                                  │ QueueView    │
+                                  └──────────────┘
 
-       Later:
-       ┌──────────────┐
-       │  User clicks │
-       │  Sync button │
-       └─────┬────────┘
-             │
+       Later - the 15 s WM_TIMER poll, or the Sync button:
+       ┌──────────────────────────────┐
+       │ Controller::RunSync          │  refuses to overlap a scan lookup
+       └─────┬────────────────────────┘
              ▼
-       ┌──────────────┐
-       │  SyncEngine  │
-       │  Sync()      │
-       └─────┬────────┘
-             │
+       ┌──────────────────────────────┐
+       │ SyncEngine::Sync()           │
+       │  · CheckConnectivity()       │  → SYNC_OFFLINE and stop
+       │  · GetPendingTransactions()  │
+       │  · replay each, one at a time│  → HbClient GetItem / UpdateItemLocation
+       │  · MarkTransactionSynced()   │     / UpdateItem
+       └─────┬────────────────────────┘
              ▼
-       ┌──────────────┐
-       │  HbClient    │
-       │  Send batch  │
-       └─────┬────────┘
-             │
-             ▼
-       ┌──────────────┐
-       │  Update UI   │
-       │  Clear queue │
-       └──────────────┘
+       ┌──────────────────────────────┐
+       │ SYNC_SUCCESS / SYNC_PARTIAL /│  failures stay queued for the next run
+       │ SYNC_FAILED, then refresh UI │
+       └──────────────────────────────┘
 ```
+
+Note what is *not* in the picture: there is no batch endpoint. `Sync()` walks the
+pending records and replays each one through the ordinary item API, marking each
+acknowledged individually, so a partial success is a normal outcome
+(`SYNC_PARTIAL`) rather than an all-or-nothing failure.
 
 ---
 
@@ -601,40 +660,59 @@ No intermediate representation → Direct model population
 
 #### **1. Transaction Queuing**
 ```cpp
-User Action → Check IsOnline()
-              ├─ Online  → Direct API call
-              └─ Offline → Queue transaction
+User action → try the server first
+              ├─ call succeeded            → done, nothing is queued
+              └─ call failed / unreachable → queue it
 
-Queue stored in Journal:
-  TRANS|SCAN|1234567890|2025-11-15T14:32:15
-  TRANS|UPDATE|{"id":"123","qty":50}|2025-11-15T14:33:02
+Queue stored in the Journal as TRANS records:
+  [2026-07-25 09:14:09] TRANS 00000042: [51234] ITEM_SCAN: SCAN:123456789
+  [2026-07-25 09:14:31] TRANS 00000043: [73180] ITEM_UPDATE: UPDATE:{"id":"123",...}
 ```
+
+The client does not ask "am I online?" and then choose a path. It attempts the
+call, and queues only what actually failed — a probe that says "online" seconds
+before a request that times out would otherwise lose the scan.
+
+One escape hatch: if `offlineModeEnabled` is `false` in `hb_conf.json` the scan is
+**discarded** instead of queued, and the operator is told so immediately. That is
+the point of the setting — an installation that does not want deferred work
+should not discover an empty queue at the end of a shift.
 
 #### **2. Connectivity Detection**
 ```cpp
 CheckConnectivity():
-    1. Try DNS lookup of API hostname
-    2. If successful → online
-    3. If failed → offline
-    4. Cache result for 60 seconds
+    1. gethostbyname() on the host from apiBaseUrl
+    2. Resolves    → online
+    3. Fails       → offline
+    4. Cache the answer for 5 seconds; a sync in which everything failed
+       discards the cache immediately
 ```
+
+It is used to decide *how to interpret* a failed lookup — "no such item" is a
+conclusion only a device that can reach the server is allowed to draw — and to
+short-circuit a sync that has no chance of working.
 
 #### **3. Automatic Sync**
 ```
-Background timer (every 5 minutes):
-  └─ If IsOnline():
-      └─ SyncEngine.Sync()
-          ├─ Process queued transactions
-          ├─ Mark synced items
-          └─ Update UI
+WM_TIMER on the main window, every 15 s (AUTOSYNC_TICK_MS):
+  └─ skip entirely if a scan lookup or a sync is already running
+  └─ SyncEngine::ShouldAutoSync(GetTickCount()):
+      ├─ auto-sync enabled (syncIntervalSeconds > 0)?
+      ├─ work queued?
+      └─ first attempt, or syncIntervalSeconds elapsed?  (wrap-safe comparison)
+          └─ Controller::RunSync(interactive = false)
 ```
+
+A queue recovered from disk at startup is due immediately rather than after a
+full interval — the app restarts on every battery swap, and waiting five minutes
+each time would be the common case, not the rare one. A background sync never
+raises a dialog: the device is usually in a holster with nobody to dismiss it.
 
 #### **4. User-Initiated Sync**
 ```
-User clicks "Sync" button:
-  └─ QueueView → Controller → SyncEngine
-      └─ Force immediate sync attempt
-      └─ Show progress/results
+User taps "Sync" (QueueView or the soft-key menu):
+  └─ QueueView → Controller::OnSyncRequested → RunSync(interactive = true)
+      └─ same code path, but failures are reported in a message box
 ```
 
 ---
@@ -669,92 +747,129 @@ Controller::~Controller() {
 }
 ```
 
-#### **String Management**
-```cpp
-// WRONG: Memory leak
-void SetName(const TCHAR* name) {
-    m_name = new TCHAR[lstrlen(name) + 1];
-    lstrcpy(m_name, name);
-}  // If called twice, first allocation leaks!
+#### **String Management — `HBX::Str` owns the bounded cases**
 
-// CORRECT: Clean up first
-void SetName(const TCHAR* name) {
-    if (m_name) {
-        delete[] m_name;  // Free existing
-        m_name = NULL;
-    }
-    if (name) {
-        int len = lstrlen(name) + 1;
-        m_name = new TCHAR[len];
-        lstrcpy(m_name, name);
-    }
-}
+`include/StrUtil.hpp` is the one place that knows how to move text safely. It
+exists because the alternative — formatting caller- or server-supplied text into
+a fixed stack buffer with `wsprintf` — is not merely ugly here, it is wrong:
+**on Windows CE `wsprintf` stops after 1024 characters**, so it silently
+truncates on the device, and that cap does not bound a call that starts partway
+into a buffer at all.
+
+```cpp
+// Fixed destination: bounded, always NUL-terminated, reports truncation.
+TCHAR title[128];
+Str::Copy(title, 128, TEXT("HomeBox Client"));
+Str::Append(title, 128, TEXT(" [Queue: "));
+Str::AppendInt(title, 128, queueDepth);
+Str::Append(title, 128, TEXT("]"));
+
+// Unbounded content: grow instead of guessing a size. Allocation failure is
+// sticky, so one check at the end covers every append.
+Str::Buffer body;
+body.AppendChar((TCHAR)'{');
+body.AppendJsonPair(TEXT("deviceId"), deviceId);   // value is escaped
+body.AppendChar((TCHAR)'}');
+if (body.Failed()) { return false; }
 ```
 
-#### **Return Value Ownership**
+The same header owns the JSON escaping and the real UTF-8 ⇄ TCHAR conversions
+used by the journal, both HTTP transports and `Config`. One implementation
+serves both TCHAR widths (device `WCHAR`, host `char`) — the width is inspected
+with `sizeof()` and the compiler folds the branch — so there is no `#ifdef`'d
+copy that can rot in the configuration nobody builds.
+
+#### **Ownership of Heap Returns**
 ```cpp
-// Caller must delete returned pointer
+// Buffer::Detach hands over its storage; the caller deletes it.
 TCHAR* Item::ToJson() const {
-    TCHAR* json = new TCHAR[2048];
-    // ... build JSON ...
-    return json;  // Caller's responsibility to delete
+    Str::Buffer out;
+    // ... append escaped fields ...
+    if (out.Failed()) { return NULL; }   // NULL means "could not build it"
+    return out.Detach();
 }
 
-// Usage:
 TCHAR* json = item.ToJson();
-// ... use json ...
-delete[] json;  // Caller deletes
+if (json) {
+    // ... use json ...
+    delete[] json;
+}
 ```
+
+Multi-level returns state their contract in the header. `Journal::GetPendingTransactions`
+hands back a `TCHAR*[]` of heap strings: the caller must `delete[]` each entry and
+then the array — including the empty case, where the array is still allocated.
 
 **Memory Leak Prevention**:
-- ✅ Use destructors for cleanup
-- ✅ Initialize all pointers to `NULL`
-- ✅ Check for `NULL` before delete (safe but redundant)
-- ✅ Test with limited memory scenarios
+- ✅ Destructors do the cleanup; `Controller::Shutdown` is idempotent so the
+  failure paths in `Initialize` release the same components the normal exit does
+- ✅ Every owner class here is non-copyable (private copy ctor / assignment), so
+  a stray copy cannot produce a double `delete[]`
+- ✅ Ownership transfer is documented at the declaration, not inferred at the
+  call site
+- ✅ A posted `MSG_SCAN_DECODED` frees its payload in the window procedure even
+  when the view has already detached — a message in flight still owns memory
 
 ---
 
 ## 🧵 Threading Model
 
-### Single-Threaded with Background Scanner
+### UI Thread + Background Scanner
 
-**Main Thread**:
+**UI Thread**:
 - Windows message loop
 - UI updates
 - All business logic
-- API calls (blocking acceptable)
+- API calls — blocking, and deliberately so: they run here, not on the scan
+  thread, and `Controller` refuses to start a sync while a lookup is in flight
+  (`m_busy`) because both drive the single `HbClient`
 
-**Scanner Thread**:
+**Scanner Thread** (device build only, `HBX_USE_EMDK`):
 - Dedicated thread for hardware polling
-- Blocks on `SCAN_ReadLabelWait()`
-- Posts message to main thread on scan
-- No direct UI access
+- Blocks on `SCAN_ReadLabelWait(..., 1000)` — the 1 s timeout is what lets it
+  notice a shutdown request
+- Delivers the decode by calling the registered callback **on this thread**
+- Never touches a window, never makes an HTTP call
 
-**Thread Communication**:
+**Thread Communication** — the marshalling is the view's job:
 ```cpp
-Scanner Thread:
-    while (running) {
-        barcode = SCAN_ReadLabelWait();
-        if (barcode) {
-            PostMessage(mainWindow, WM_SCAN_RECEIVED, barcode);
-        }
+// Scanner thread: ScannerHAL::DeliverScan invokes the callback here.
+void ScanView::ScanThunk(const TCHAR* barcode, void* userData) {
+    ScanView* self = (ScanView*)userData;
+    TCHAR* copy = Str::Dup(barcode);            // the decode buffer is reused
+    if (!PostMessage(self->m_hwnd, MSG_SCAN_DECODED, 0, (LPARAM)copy)) {
+        delete[] copy;                          // nobody will receive it
     }
+}
 
-Main Thread:
-    case WM_SCAN_RECEIVED:
-        Controller.OnScanReceived(barcode);
-        break;
+// UI thread: the window procedure owns the copy and frees it.
+case MSG_SCAN_DECODED: {
+    TCHAR* barcode = (TCHAR*)lParam;
+    if (pThis) { pThis->OnScanReceived(barcode); }   // → Controller
+    delete[] barcode;
+    return 0;
+}
 ```
 
-**Synchronization**:
-- No shared data structures (message passing only)
-- Scanner thread → Main thread communication via Windows messages
-- Main thread owns all application state
+Doing the work directly in the callback is what this replaces, and it was not a
+style problem: it ran the journal write, a blocking HTTP lookup and a modal
+message box on the scanner thread — driving windows owned by the UI thread from
+a worker, and sharing one `HttpClient` socket between two threads.
 
-**Benefits**:
-- ✅ Simple, no race conditions
-- ✅ No mutexes or critical sections needed
-- ✅ Easy to debug and maintain
+**Synchronization** — message passing is the *main* mechanism, not the only one:
+| Shared thing | Guard | Why it is shared |
+|---|---|---|
+| `Journal` (file handle, counters) | private `CRITICAL_SECTION` on every public method | the scan thread and the UI thread both journal |
+| `ScannerHAL::SharedState` (callback + `userData`, last barcode) | `CRITICAL_SECTION`, plus a reference count on the state itself | the monitor thread outlives an early `ScannerHAL` deletion |
+| `HttpClient` (socket, header list) | `CRITICAL_SECTION` | it protects the instance from corruption; it does **not** make concurrent requests meaningful — one request at a time per instance, one instance per thread if you need parallelism |
+
+**Consequences**:
+- ✅ All application state is still reached from the UI thread only
+- ✅ A decode arriving during teardown is either dropped or freed, never
+  delivered to a destroyed view
+- ⚠️ A long API call blocks the UI thread. That is the accepted trade for a
+  single-`HbClient` design; the scan-timeout timer and the busy flag exist so the
+  screen never *looks* wedged
 
 ---
 
@@ -903,17 +1018,24 @@ ARMV4I             // ARM architecture
 
 ---
 
-### Why Single Thread + Scanner Thread?
+### Why UI Thread + Scanner Thread?
 
-**Decision**: Main thread + dedicated scanner polling thread
+**Decision**: One UI thread that owns the application state, plus a dedicated
+scanner polling thread that only reads labels
 
 **Rationale**:
-- UI responsiveness (scanner blocking call doesn't freeze UI)
-- Simple synchronization (message passing only)
-- Hardware requirement (EMDK blocking read)
-- No race conditions (no shared state)
+- Hardware requirement — the EMDK read is blocking, so it cannot live in the
+  message loop
+- UI responsiveness (a 1 s blocking read does not freeze the screen)
+- Keeping *all* work on the UI thread means one `HbClient`, one socket, and one
+  owner of every view
 
-**Trade-off**: Slight overhead of thread creation, but worth it for responsiveness
+**Trade-off**: the decode has to be marshalled across the boundary — a heap copy
+and a `PostMessage` per scan — and the few objects both threads touch
+(`Journal`, the scanner's shared state, `HttpClient`) need real critical
+sections. That is cheaper than making the whole application thread-safe, and far
+cheaper than the alternative it replaced, which was to run the business logic on
+whichever thread happened to deliver the barcode.
 
 ---
 
@@ -925,9 +1047,9 @@ ARMV4I             // ARM architecture
    - Tab-based interface
    - View stack for navigation history
 
-2. **Background Sync Timer**
-   - Automatic periodic sync
-   - Configurable interval
+2. **Batched Sync Endpoint**
+   - Replay the queue in one request instead of one call per entry
+   - (Periodic auto-sync itself is implemented — see Offline-First Strategy)
 
 3. **Batch Operations**
    - Scan multiple items

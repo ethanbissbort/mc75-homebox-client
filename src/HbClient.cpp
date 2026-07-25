@@ -7,6 +7,11 @@ namespace HBX {
 
 namespace {
 
+// The one HTTP status this client acts on itself: the server has retired the
+// token, which is not the same failure as "no such item" even though both used
+// to reach the caller as a bare false.
+const int kHttpUnauthorized = 401;
+
 /**
  * Builds "<prefix><id><suffix>" into a bounded buffer.
  *
@@ -89,6 +94,7 @@ HbClient::HbClient()
     , m_authToken(NULL)
     , m_deviceId(NULL)
     , m_authenticated(false)
+    , m_lastStatusCode(0)
 {
     m_httpClient = new HttpClient();
 }
@@ -176,6 +182,60 @@ void HbClient::Logout()
         delete[] m_authToken;
         m_authToken = NULL;
     }
+}
+
+const TCHAR* HbClient::GetAuthToken() const
+{
+    return m_authToken;
+}
+
+void HbClient::SetAuthToken(const TCHAR* deviceId, const TCHAR* token)
+{
+    if (!token || token[0] == (TCHAR)'\0') {
+        Logout();
+        return;
+    }
+
+    // Both copies are taken before anything is released: on a device this
+    // short of heap, a failed allocation half-way through would otherwise leave
+    // the client with no token at all instead of the one it already had.
+    TCHAR* tokenCopy = Str::Dup(token);
+    if (!tokenCopy) {
+        return;
+    }
+
+    TCHAR* deviceCopy = NULL;
+    if (deviceId) {
+        deviceCopy = Str::Dup(deviceId);
+        if (!deviceCopy) {
+            delete[] tokenCopy;
+            return;
+        }
+    }
+
+    if (m_authToken) {
+        delete[] m_authToken;
+    }
+    m_authToken = tokenCopy;
+
+    if (deviceCopy) {
+        if (m_deviceId) {
+            delete[] m_deviceId;
+        }
+        m_deviceId = deviceCopy;
+    }
+
+    m_authenticated = true;
+
+    // A restored session has never been through MakeApiRequest, so install the
+    // bearer header now rather than leaving the header list from whatever the
+    // previous session sent.
+    SetAuthHeaders();
+}
+
+int HbClient::GetLastStatusCode() const
+{
+    return m_lastStatusCode;
 }
 
 bool HbClient::GetItem(const TCHAR* barcode, Models::Item* item)
@@ -492,6 +552,13 @@ const TCHAR* HbClient::GetBaseUrl() const
     return m_baseUrl;
 }
 
+void HbClient::SetRequestTimeout(DWORD timeoutMs)
+{
+    if (m_httpClient) {
+        m_httpClient->SetTimeout(timeoutMs);
+    }
+}
+
 bool HbClient::MakeApiRequest(const TCHAR* method, const TCHAR* endpoint, const TCHAR* body, TCHAR** response)
 {
     if (response) {
@@ -514,6 +581,10 @@ bool HbClient::MakeApiRequest(const TCHAR* method, const TCHAR* endpoint, const 
     // Set authentication headers
     SetAuthHeaders();
 
+    // Start from "no answer" so a caller inspecting GetLastStatusCode() after a
+    // failed request cannot read the status of the previous one.
+    m_lastStatusCode = 0;
+
     // Make HTTP request
     HttpClient::HttpResponse httpResponse;
     bool success = false;
@@ -526,6 +597,22 @@ bool HbClient::MakeApiRequest(const TCHAR* method, const TCHAR* endpoint, const 
         success = m_httpClient->Put(fullUrl.Get(), body, &httpResponse);
     } else if (lstrcmp(method, TEXT("DELETE")) == 0) {
         success = m_httpClient->Delete(fullUrl.Get(), &httpResponse);
+    }
+
+    m_lastStatusCode = httpResponse.statusCode;
+
+    // The session has been retired server-side (an expired token, or one issued
+    // to a device that has since been revoked). Dropping it here is what keeps
+    // a stale token from turning every later lookup into a permanent "not
+    // found": the owner sees IsAuthenticated() go false and can re-authenticate
+    // once and retry. Done before the transport check because a 401 whose body
+    // arrived truncated is still a 401.
+    if (m_lastStatusCode == kHttpUnauthorized) {
+        m_authenticated = false;
+        if (m_authToken) {
+            delete[] m_authToken;
+            m_authToken = NULL;
+        }
     }
 
     if (!success) {

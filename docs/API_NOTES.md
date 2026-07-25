@@ -26,12 +26,36 @@ The **HomeBox API** is a RESTful HTTP API that provides inventory management ser
 
 | Feature | Details |
 |---------|---------|
-| **Protocol** | HTTPS (recommended) or HTTP |
+| **Protocol** | HTTPS (device build, WinInet) or HTTP (both transports) |
 | **Architecture** | RESTful |
-| **Data Format** | JSON (application/json) |
-| **Authentication** | Bearer Token (JWT) |
+| **Data Format** | JSON (`application/json; charset=utf-8`) |
+| **Authentication** | Bearer Token |
 | **Versioning** | URL path (`/api/v1/...`) |
-| **Character Encoding** | UTF-8 |
+| **Character Encoding** | **UTF-8, both directions, on both transports** |
+
+### 🔡 Encoding and Framing (what the client actually does)
+
+These are properties of `src/HttpClient.cpp`, so they hold regardless of which
+transport a build uses:
+
+- **Request bodies are encoded to UTF-8** before they go on the wire, and
+  `Content-Length` counts **wire bytes**, not characters — a body with any
+  non-ASCII text has a byte count larger than its length in TCHARs.
+- **Response bodies are decoded from UTF-8** into the client's TCHAR text.
+  Malformed byte sequences become U+FFFD rather than failing the request.
+- **`Content-Length` is honoured.** The WinSock transport keeps reading until the
+  declared length has arrived; a body that stops short is reported as a failed
+  request, not handed to the caller as a short JSON document.
+- **`Transfer-Encoding: chunked` is honoured.** The WinSock transport de-frames
+  the chunks itself and requires the terminating zero-length chunk before it
+  considers the response complete. On the WinInet transport the OS stack does the
+  de-framing.
+- A response carrying **neither** framing header is read until the peer closes,
+  which is why the client sends `Connection: close` unless a caller has set its
+  own `Connection` header.
+- Responses are capped at 512 KB (`kMaxResponseBytes`) on both transports;
+  a larger reply fails the request rather than growing the buffer indefinitely on
+  a 64 MB device.
 
 ### 🔗 Base URL Configuration
 
@@ -87,8 +111,9 @@ The base URL is configured in `hb_conf.json`:
        │
        ▼
 ┌──────────────────────────────────┐
-│ Store token in memory            │
-│ m_authToken = "eyJhbGc..."       │
+│ Hold the token in HbClient, and  │
+│ write it back to hb_conf.json so │
+│ a restart can resume the session │
 └──────┬───────────────────────────┘
        │
        ▼
@@ -106,11 +131,12 @@ The base URL is configured in `hb_conf.json`:
 
 **Request Headers**:
 ```http
-Content-Type: application/json
+Content-Type: application/json; charset=utf-8
 Accept: application/json
 ```
 
-**Request Body**:
+**Request Body** (both values are JSON-escaped, and the body is built in a
+growable buffer — an API key or device id has no length limit):
 ```json
 {
   "deviceId": "MC75-WAREHOUSE-001",
@@ -148,11 +174,17 @@ Accept: application/json
 ```
 
 **Token Lifecycle**:
-1. Obtain token on application startup
-2. Store in memory (`m_authToken`)
-3. Include in all API requests
-4. Token typically valid for 24 hours
-5. Re-authenticate if token expires (401 response)
+1. Obtained at startup by exchanging `deviceId` + `apiKey`. Failing is **not**
+   fatal — a device that boots out of coverage still scans and queues
+2. Held by `HbClient` and sent as `Authorization: Bearer …` on every later call
+3. Only a non-empty **string** `token` member is accepted. A null, a number or
+   `""` leaves the client unauthenticated rather than carrying a garbage bearer
+   value into every subsequent request
+4. Cached in `hb_conf.json` so a restart — a battery swap ends the process
+   several times a shift — does not need a fresh handshake
+5. A `401` drops the session; the caller re-authenticates once and retries that
+   one request. Lookups that fail for any other reason are **not** retried: a
+   404 for an unknown barcode should not cost the operator a second round trip
 
 ---
 
@@ -451,6 +483,20 @@ bool HbClient::GetAllLocations(Models::Location** locations, int* count) {
 
 **Purpose**: Batch synchronize queued offline transactions
 
+> ⚠️ **Nothing in the running application calls this endpoint.**
+> `SyncEngine::Sync` replays the queue one entry at a time through the ordinary
+> item endpoints (`GET /api/v1/items/{barcode}`,
+> `PUT /api/v1/items/{barcode}/location`, `PUT /api/v1/items/{id}`) and
+> acknowledges each one in the journal separately.
+>
+> `HbClient::SyncPendingTransactions` does exist and does POST here, but it is
+> currently reached only from the integration tests — and the body it builds is
+> **not** the shape below: it sends each transaction as an escaped **string**
+> (the raw journal record line), i.e.
+> `{"deviceId":"…","transactions":["[…] TRANS 00000042: …", …]}`.
+> Treat the request/response shapes in this section as the intended server
+> contract for a future batching client, not as something the device sends today.
+
 **Request Body**:
 ```json
 {
@@ -516,20 +562,27 @@ bool HbClient::GetAllLocations(Models::Location** locations, int* count) {
 
 ### Request Headers
 
-**Standard Headers**:
+**What the client sends** (`HbClient::SetAuthHeaders` plus the transport):
 ```http
-Content-Type: application/json
+Content-Type: application/json; charset=utf-8
 Accept: application/json
-Authorization: Bearer {token}
-User-Agent: HBXClient/1.0 (Windows Mobile 6.5)
+Authorization: Bearer {token}        (only once a session token is held)
+Host: {host}[:{port}]                (WinSock builds it; WinInet supplies its own)
+Content-Length: {wire bytes}         (WinSock writes it; WinInet derives it from
+                                      the same UTF-8 byte count)
+Connection: close                    (WinSock only, unless a caller overrides it)
 ```
 
-**Optional Headers**:
+The charset is stated explicitly because bodies really are UTF-8 encoded — see
+[Encoding and Framing](#-encoding-and-framing-what-the-client-actually-does).
+
+**Not sent today** (a server must not depend on them):
 ```http
-X-Device-ID: MC75-WAREHOUSE-001
-X-Request-ID: req_12345
-X-Client-Version: 1.0.0
+User-Agent, X-Device-ID, X-Request-ID, X-Client-Version
 ```
+The device identifies itself in the auth request body (`deviceId`), not in a
+header. `HttpClient::AddHeader` is public, so any of these can be added by a
+caller if the server starts requiring them.
 
 ### Response Structure
 
@@ -719,11 +772,20 @@ X-RateLimit-Reset: 1700062800
 
 When the device is offline or API calls fail, transactions are queued locally.
 
-**Queue Entry Format** (in Journal):
+**Queue Entry Format** (in the Journal — one CRLF-terminated, UTF-8 line each):
 ```
-TRANS|SCAN|1234567890|2025-11-15T14:30:15
-TRANS|UPDATE_LOCATION|{"barcode":"9876543210","locationId":"loc_b02"}|2025-11-15T14:35:22
+[2026-07-25 09:14:09] TRANS 00000042: [51234] ITEM_SCAN: SCAN:1234567890
+[2026-07-25 09:14:31] TRANS 00000043: [73180] ITEM_SCAN: SCANLOC:10:9876543210loc_b02
+[2026-07-25 09:15:02] TRANS 00000044: [98220] ITEM_UPDATE: UPDATE:{"id":"123","quantity":50}
+[2026-07-25 09:16:44] SYNCED 00000042
 ```
+
+`TRANS <seq>` is the record header the journal adds; the rest is the payload the
+sync engine wrote. A `SYNCED` marker acknowledges a **sequence number**, so a
+payload that happens to contain the word "SYNCED" cannot be mistaken for one.
+The location form is length-prefixed (`SCANLOC:<barcodeLength>:…`) because a
+barcode may legally contain any separator character. The record format is
+documented in `include/Journal.hpp` and in [DESIGN.md](DESIGN.md).
 
 ### Sync Process
 
@@ -761,20 +823,28 @@ TRANS|UPDATE_LOCATION|{"barcode":"9876543210","locationId":"loc_b02"}|2025-11-15
 ### Connectivity Detection
 
 ```cpp
-bool SyncEngine::IsOnline() const {
-    // Try DNS lookup of API hostname
-    WSADATA wsaData;
-    WSAStartup(MAKEWORD(2, 2), &wsaData);
+// SyncEngine::CheckConnectivity - the host is parsed out of apiBaseUrl and
+// encoded to UTF-8 rather than each character being truncated to a byte.
+WSADATA wsaData;
+bool winsockStarted = (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0);
 
-    struct hostent* host = gethostbyname("api.homebox.example.com");
+struct hostent* hostInfo = gethostbyname(asciiHost);
 
+// Released only if it was actually acquired: an unconditional WSACleanup after
+// a failed WSAStartup drops somebody else's reference and can tear WinSock down
+// while a request is in flight.
+if (winsockStarted) {
     WSACleanup();
-
-    return (host != NULL);
 }
+return (hostInfo != NULL);
 ```
 
-**Caching**: Result cached for 60 seconds to avoid overhead.
+**Caching**: the answer is cached for **5 seconds**
+(`kConnectivityCacheMs` in `src/SyncEngine.cpp`). The probe is a blocking DNS
+lookup that costs seconds on a GPRS link, and the UI status line, `IsOnline()`
+and `Sync()` all ask for it. A sync in which every transaction failed drops the
+cached answer immediately rather than claiming "online" for the rest of the
+window.
 
 ---
 

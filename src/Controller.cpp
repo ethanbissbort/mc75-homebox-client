@@ -13,6 +13,10 @@ namespace {
 const TCHAR* const kInstanceMutexName = TEXT("HBXClientInstanceMutex");
 const TCHAR* const kMainWindowClass   = TEXT("HBXClientWndClass");
 
+// The server rejected our token. HbClient reports it here (and drops the
+// session) so a failed call can be told apart from a missing record.
+const int kHttpUnauthorized = 401;
+
 /** Clears the controller's busy flag however the guarded handler returns. */
 class BusyScope {
 public:
@@ -93,8 +97,11 @@ bool Controller::Initialize(HINSTANCE hInstance)
         return false;
     }
 
-    // Configure API client
+    // Configure API client. The timeout matters as much as the URL here: the
+    // transport's own default would block a scan handler for half a minute on a
+    // link that has gone away.
     m_hbClient->SetBaseUrl(m_config->GetApiBaseUrl());
+    m_hbClient->SetRequestTimeout((DWORD)REQUEST_TIMEOUT_MS);
 
     // Initialize scanner
     if (m_scanner->Initialize()) {
@@ -341,6 +348,21 @@ bool Controller::EnsureAuthenticated(bool force)
         return true;
     }
 
+    // Prefer a token saved by an earlier run. A battery swap ends this process
+    // several times a shift, and the restart that happens in the back of a
+    // warehouse cannot complete a handshake at all - it would come up
+    // unauthenticated, and queue every scan, while holding a perfectly good
+    // token. Restoring costs no round trip; if the server has since retired the
+    // token the first 401 drops it and the caller forces the branch below.
+    if (!force) {
+        const TCHAR* storedToken = m_config->GetAuthToken();
+        if (storedToken && lstrlen(storedToken) > 0) {
+            m_hbClient->SetAuthToken(m_config->GetDeviceId(), storedToken);
+            m_journal->LogInfo(TEXT("Restored saved session"));
+            return true;
+        }
+    }
+
     const TCHAR* apiKey = m_config->GetApiKey();
     if (!apiKey || lstrlen(apiKey) == 0) {
         m_journal->LogError(TEXT("AUTH_NO_KEY"),
@@ -354,7 +376,62 @@ bool Controller::EnsureAuthenticated(bool force)
     }
 
     m_journal->LogInfo(TEXT("Device authenticated"));
+    PersistAuthToken();
     return true;
+}
+
+void Controller::PersistAuthToken()
+{
+    if (!m_config || !m_hbClient) {
+        return;
+    }
+
+    const TCHAR* token = m_hbClient->GetAuthToken();
+    if (!token || lstrlen(token) == 0) {
+        return;
+    }
+
+    // hb_conf.json lives on the device's flash, so it is only rewritten when
+    // the token actually changed - re-authenticating against an unchanged
+    // session should not cost a write.
+    const TCHAR* storedToken = m_config->GetAuthToken();
+    if (storedToken && lstrcmp(storedToken, token) == 0) {
+        return;
+    }
+
+    m_config->SetAuthToken(token);
+
+    const TCHAR* configPath = m_config->GetConfigPath();
+    if (!configPath || !m_config->Save(configPath)) {
+        // Not fatal: this session works, it just will not outlive the process.
+        m_journal->LogError(TEXT("AUTH_SAVE_FAILED"),
+                            TEXT("Auth token could not be written to hb_conf.json"));
+    }
+}
+
+bool Controller::RetryWithFreshToken()
+{
+    if (!m_hbClient || !m_config) {
+        return false;
+    }
+
+    // Only a 401 is worth a second attempt. A 404 for an unknown barcode, or a
+    // call that never reached the server at all (status 0), must not cost the
+    // operator another blocking round trip.
+    if (m_hbClient->GetLastStatusCode() != kHttpUnauthorized) {
+        return false;
+    }
+
+    // The stored token is the one that was just rejected, so drop it before
+    // asking for a new one: leaving it in the configuration would have
+    // EnsureAuthenticated restore it again on the next call and spend a wasted
+    // request per scan re-discovering that it is dead.
+    m_config->SetAuthToken(NULL);
+
+    // Forced, so this always goes to the server rather than restoring anything.
+    // The retry it authorises is a single repeat by the caller; a server that
+    // keeps answering 401 fails that repeat and the call ends there.
+    return EnsureAuthenticated(true);
 }
 
 bool Controller::LookupItem(const TCHAR* barcode, Models::Item* item)
@@ -363,15 +440,18 @@ bool Controller::LookupItem(const TCHAR* barcode, Models::Item* item)
         return false;
     }
 
-    if (EnsureAuthenticated(false) && m_hbClient->GetItem(barcode, item)) {
+    if (!EnsureAuthenticated(false)) {
+        return false;
+    }
+
+    if (m_hbClient->GetItem(barcode, item)) {
         return true;
     }
 
-    // HbClient reports "unauthorised" and "no such item" identically, as a bare
-    // false, so a failed lookup is retried once against a freshly issued token.
-    // An expired session is the common cause after a shift-long gap in
-    // coverage, and one extra round trip is cheaper than losing the scan.
-    if (!EnsureAuthenticated(true)) {
+    // An expired session is the common failure after a shift-long gap in
+    // coverage, or after a restart that restored a token the server has since
+    // retired. That case, and only that case, is worth one extra round trip.
+    if (!RetryWithFreshToken()) {
         return false;
     }
     return m_hbClient->GetItem(barcode, item);
@@ -495,6 +575,9 @@ void Controller::OnLocationScan(const TCHAR* barcode)
     bool pushed = false;
     if (EnsureAuthenticated(false)) {
         pushed = m_hbClient->UpdateItemLocation(m_pendingItemBarcode, barcode);
+        if (!pushed && RetryWithFreshToken()) {
+            pushed = m_hbClient->UpdateItemLocation(m_pendingItemBarcode, barcode);
+        }
     }
 
     if (pushed) {
@@ -536,6 +619,14 @@ void Controller::RunSync(bool interactive)
     EnsureAuthenticated(false);
 
     bool ok = m_syncEngine->Sync();
+
+    // A stale token fails every entry in the batch, which looks exactly like a
+    // server-side outage from here. Replaying under a fresh token is safe: the
+    // engine only marks an entry synced once the server has accepted it, so the
+    // second pass sends precisely what the first one could not.
+    if (!ok && RetryWithFreshToken()) {
+        ok = m_syncEngine->Sync();
+    }
 
     if (ok) {
         m_journal->LogInfo(TEXT("Sync completed successfully"));
@@ -795,6 +886,12 @@ void Controller::OnItemSave(const Models::Item* item)
     bool ok = false;
     if (EnsureAuthenticated(false)) {
         ok = hasId ? m_hbClient->UpdateItem(item) : m_hbClient->CreateItem(item);
+
+        // A 401 means the server never applied the edit, so repeating it under a
+        // new token cannot duplicate the item.
+        if (!ok && RetryWithFreshToken()) {
+            ok = hasId ? m_hbClient->UpdateItem(item) : m_hbClient->CreateItem(item);
+        }
     }
 
     if (ok) {

@@ -83,7 +83,7 @@ simulation stub. See [SCANNING.md](SCANNING.md) for the full picture.
 | 3 | **Windows Mobile 6 Professional SDK (Refresh)** | `Windows Mobile 6 Professional SDK (Refresh).msi` | Microsoft Download Center |
 | 4 | **Windows Mobile 6.5 Developer Tool Kit** (recommended) | `WM65DTK.msi` (6.5) / `WM653_DTK.msi` (6.5.3) | Microsoft Download Center |
 | 5 | **Windows Mobile Device Center 6.1** (deploy/debug only) | `drvupdate-x86.exe` / `drvupdate-amd64.exe` | Microsoft Download Center |
-| 6 | **Zebra EMDK for C** (OPTIONAL, real scanner only) | EMDK for C installer | Zebra support/developer portal (free account) |
+| 6 | **Zebra EMDK for C** (required by the default build; skippable only if you drop `HBX_USE_EMDK`) | EMDK for C installer | Zebra support/developer portal (free account) |
 | 7 | **Git for Windows** (to clone) | `Git-*-64-bit.exe` | git‑scm.com (or download the repo ZIP instead) |
 
 > These are **legacy** downloads. VS2008 itself requires a valid license /
@@ -142,10 +142,12 @@ platform will appear.
 
 `ScannerHAL.cpp` now drives the imager through the real Scanner C API, enabled
 by the `HBX_USE_EMDK` define (on by default). Install the **Zebra EMDK for C**
-(a.k.a. Motorola/Symbol EMDK for C), then point the project at it (see §7): the
-include folder containing **`ScanCAPI.h`**, the matching **WM65\ARMV4I** lib
-folder, and link **`ScanAPIWM.lib`** (older Symbol SMDK builds use `ScanAPI.lib`
-/ `SCNAPI32.lib`).
+(a.k.a. Motorola/Symbol EMDK for C), then set `%ZEBRAEMDK%` to its install root
+(see §7) — the project already searches `$(ZEBRAEMDK)\Include` for
+**`ScanCAPI.h`** and `$(ZEBRAEMDK)\Lib\ARMV4I` for **`ScanAPIWM.lib`**, which it
+links. Older Symbol SMDK builds ship `ScanAPI.lib` / `SCNAPI32.lib` and may nest
+the lib folder differently; those cases need the project's linker settings
+adjusted (§7).
 
 > **Just want a first build with no scanner?** Remove `HBX_USE_EMDK` from
 > *C/C++ → Preprocessor → Preprocessor Definitions* (both configs). `ScannerHAL`
@@ -255,48 +257,61 @@ If VS2008 does manage to load the projects:
 
 ---
 
-## 7. (Optional) Clean up the hard‑coded include / library paths
+## 7. Point the project at *your* SDK and EMDK (two environment variables)
 
-`proj\HBXClient.vcproj` lists some **absolute** search paths that were written
-for a specific machine:
+`proj\HBXClient.vcproj` does **not** contain absolute paths. Both configurations
+list these search paths verbatim:
 
 ```
 AdditionalIncludeDirectories =
     ..\include ;
-    C:\Program Files\Windows Mobile 6.5 SDK\PocketPC\Include\Armv4i ;
-    C:\Program Files\Zebra EMDK\C\Include
+    $(WINDOWSMOBILE65SDK)\PocketPC\Include\Armv4i ;
+    $(ZEBRAEMDK)\Include
 
 AdditionalLibraryDirectories =
-    C:\Program Files\Windows Mobile 6.5 SDK\PocketPC\Lib\Armv4i ;
-    C:\Program Files\Zebra EMDK\C\Lib\ARMV4I
+    $(WINDOWSMOBILE65SDK)\PocketPC\Lib\Armv4i ;
+    $(ZEBRAEMDK)\Lib\ARMV4I
+```
+
+`$(WINDOWSMOBILE65SDK)` and `$(ZEBRAEMDK)` are ordinary **environment
+variables** that VS2008 expands as project macros. A non-default install
+therefore never requires editing the project file — you set the variables
+instead:
+
+```batch
+set WINDOWSMOBILE65SDK=C:\Program Files\Windows Mobile 6.5 SDK
+set ZEBRAEMDK=C:\Program Files\Zebra Technologies\EMDK-C
 ```
 
 What you need to know:
 
-- **`..\include` is essential** — it is where the project's own headers live.
-  Leave it.
-- The two absolute **Windows Mobile** paths are **redundant**. When you select
-  a Smart Device platform, VS2008 automatically adds that SDK's real system
-  include/lib folders. If those hard‑coded folders do not exist on your machine
-  VS just emits a *"cannot find directory"* **warning** and builds anyway using
-  the platform's own paths.
-- The **Zebra EMDK** paths **must** point at your real EMDK install, because the
-  default build enables real scanning (`HBX_USE_EMDK`) and links
-  `ScanAPIWM.lib`. Update them to the folders on your machine (versions differ):
-  the include folder containing **`ScanCAPI.h`** (e.g.
-  `C:\Program Files\Motorola EMDK for C\v2.x\Include`) and the matching
-  **`...\Lib\WM65\ARMV4I`** folder. The linked lib is `ScanAPIWM.lib` (older
-  Symbol SMDK builds use `ScanAPI.lib` / `SCNAPI32.lib` — match yours under
-  *Linker → Input → Additional Dependencies*).
-
-**Recommended:** trim the redundant hard-coded Windows Mobile paths down to
-`..\include` and your real EMDK include/lib folders. `wininet.lib` needs no
-path (it is part of the SDK).
+- **`..\include` is essential** — it is where the project's own headers live,
+  relative to `proj\`. Leave it.
+- **For IDE builds, set both variables system-wide** (System Properties →
+  Environment Variables) *before* starting Visual Studio: VS reads the
+  environment once, at launch. Setting them in a console after VS is running has
+  no effect on the IDE.
+- **For command-line builds you can skip this step**: `scripts\build_winmobile.bat`
+  defaults both variables to the paths above when they are not already set, and
+  warns if the resulting directories do not exist.
+- The **Windows Mobile** entry is a convenience. Selecting a Smart Device
+  platform already puts that SDK's real system include/lib folders on the search
+  path, so the build works even when `%WINDOWSMOBILE65SDK%` points nowhere — VS
+  just emits a *"cannot open include directory"* warning.
+- The **`$(ZEBRAEMDK)`** entry is *not* optional for the default build: it is how
+  `ScanCAPI.h` and `ScanAPIWM.lib` are found, and real scanning (`HBX_USE_EMDK`)
+  is on by default. Point `%ZEBRAEMDK%` at the install root that contains
+  `Include\ScanCAPI.h` and `Lib\ARMV4I\ScanAPIWM.lib`.
+- EMDK layouts differ by version. If yours nests the libraries differently (e.g.
+  `...\Lib\WM65\ARMV4I`) or ships `ScanAPI.lib` / `SCNAPI32.lib` instead of
+  `ScanAPIWM.lib`, adjust *Linker → General → Additional Library Directories* and
+  *Linker → Input → Additional Dependencies* to match — that is the one case
+  where the project file (or the per-project property page) does need editing.
+- `wininet.lib` needs no path at all; it is part of the SDK.
 
 **Building with no scanner?** Remove `HBX_USE_EMDK` from the Preprocessor
-Definitions (§4.6) — then the EMDK include/lib folders and `ScanAPIWM.lib` are no
-longer needed and `ScannerHAL` uses its simulation stub. See
-[SCANNING.md](SCANNING.md).
+Definitions (§4.6) — then `%ZEBRAEMDK%` and `ScanAPIWM.lib` are not needed at all
+and `ScannerHAL` uses its simulation path. See [SCANNING.md](SCANNING.md).
 
 ---
 
@@ -390,9 +405,11 @@ REM -> should report an ARM (Thumb) machine, not x86
 3. Create the runtime config `\Program Files\HBXClient\hb_conf.json` on the
    device (see `docs/DEPLOYMENT.md`) so the app knows your API endpoint.
 
-> The real barcode scanner will not fire until `ScannerHAL.cpp` is backed by the
-> Zebra EMDK (today it is a simulation stub) — but the UI, HTTP, journal and
-> offline‑sync logic all run.
+> With `HBX_USE_EMDK` on (the default) `ScannerHAL.cpp` drives the real imager,
+> and `Controller::Initialize` enables the scanner at startup, so the physical
+> trigger works as soon as the app is running. Build without `HBX_USE_EMDK` — the
+> emulator case — and the scanner falls back to its simulation path while the UI,
+> HTTP, journal and offline‑sync logic all still run.
 
 ---
 
@@ -402,10 +419,10 @@ REM -> should report an ARM (Thumb) machine, not x86
 |---------|-------|-----|
 | *"The project platform 'Windows Mobile 6.5 Professional SDK (ARMV4I)' is not installed"* / project shows **(unavailable)** | The pinned platform name does not match any installed SDK | Do **§6** — find/replace the platform string to your installed platform, or retarget via Configuration Manager |
 | No Windows Mobile platform appears at all in VS2008 | An SDK was installed **before** VS2008, or VS2008 SP1 is missing | Install order must be VS2008 → SP1 → SDK → DTK (§4). Re‑run the SDK/DTK installer to re‑integrate |
-| `warning: cannot open include directory 'C:\Program Files\Windows Mobile 6.5 SDK\...'` or `...\Zebra EMDK\...` | Hard‑coded absolute paths that do not exist on your PC | Harmless — the build still uses the platform's real paths. Optionally trim them to `..\include` (§7) |
+| `warning: cannot open include directory '\PocketPC\Include\Armv4i'` or `'\Include'` (the drive/root is missing) | `%WINDOWSMOBILE65SDK%` / `%ZEBRAEMDK%` are unset, so `$(…)` expanded to nothing | Set both variables system-wide and restart VS (§7). Harmless for the SDK entry — the platform supplies those paths anyway — but fatal for the EMDK one |
 | `fatal error C1083: Cannot open include file: 'windows.h'` | No Smart Device platform selected / wrong platform | Confirm the active platform is a real installed **… (ARMV4I)** platform (§6), not "Win32" |
-| `fatal error C1083: Cannot open include file: 'ScanCAPI.h'` | EMDK include folder not on the include path | Point *Additional Include Directories* at your EMDK's include folder (§7), or remove `HBX_USE_EMDK` to build without a scanner (§4.6) |
-| `error LNK2019: unresolved external symbol …` referencing `SCAN_*` | EMDK scanner lib not linked (or wrong name for your EMDK version) | Add the EMDK lib folder and the correct import lib — `ScanAPIWM.lib` (or `ScanAPI.lib` / `SCNAPI32.lib`) — under *Linker* (§7); or remove `HBX_USE_EMDK` (§4.6) |
+| `fatal error C1083: Cannot open include file: 'ScanCAPI.h'` | `%ZEBRAEMDK%` unset/wrong, so `$(ZEBRAEMDK)\Include` does not resolve to your EMDK | Set `%ZEBRAEMDK%` to the EMDK install root and restart VS (§7), or remove `HBX_USE_EMDK` to build without a scanner (§4.6) |
+| `error LNK2019: unresolved external symbol …` referencing `SCAN_*` | `%ZEBRAEMDK%` unset, or your EMDK nests the lib elsewhere / names it differently | Set `%ZEBRAEMDK%` (§7); if the lib is not at `$(ZEBRAEMDK)\Lib\ARMV4I\ScanAPIWM.lib`, correct the folder and the import lib name (`ScanAPI.lib` / `SCNAPI32.lib`) under *Linker*; or remove `HBX_USE_EMDK` (§4.6) |
 | `error LNK2019` referencing `Internet*`/`Http*` | `wininet.lib` not linked | Add `wininet.lib` to *Linker → Input → Additional Dependencies* (it ships with the SDK; no install) |
 | `warning C4819: file contains a character that cannot be represented…` | Source code page vs. file encoding | Cosmetic. If desired, add `/utf-8` (or save the file as the project's Windows‑1252 code page) |
 | `fatal error C1060: compiler is out of heap space` | Large TU on 32‑bit toolchain | Add `/Zm200` under *C/C++ → Command Line → Additional Options* |
@@ -428,6 +445,9 @@ Preprocessor defines:  WIN32; _WIN32_WCE=0x0600; UNDER_CE; WIN32_PLATFORM_PSPC;
                        (_DEBUG|NDEBUG); HBX_USE_WININET; HBX_USE_EMDK
 Linked libraries:      coredll.lib aygshell.lib commctrl.lib ole32.lib oleaut32.lib
                        winsock.lib wininet.lib ScanAPIWM.lib
+SDK/EMDK macros:       $(WINDOWSMOBILE65SDK)  e.g. C:\Program Files\Windows Mobile 6.5 SDK
+                       $(ZEBRAEMDK)           e.g. C:\Program Files\Zebra Technologies\EMDK-C
+                       (plain environment variables — set system-wide before starting VS)
 On‑device install dir: \Program Files\HBXClient\
 Runtime config file:   \Program Files\HBXClient\hb_conf.json
 ```
@@ -441,8 +461,9 @@ API request gating). The repo ships a host harness that builds with any modern
 
 ```bash
 ./scripts/build_host_debug.sh
-# compile-checks all 15 source files against a Win32/CE shim, then runs the
-# unit + integration suite:  ==== 32/32 test cases passed, 204/204 checks passed ====
+# compile-checks all 16 source files against a Win32/CE shim, repeats the check
+# with the device macros (HBX_USE_EMDK + HBX_USE_WININET), then runs the
+# unit + integration suite:  ==== 53/53 test cases passed, 1065/1065 checks passed ====
 ```
 
 This is for quick verification on any machine (Linux/macOS/WSL). It does **not**

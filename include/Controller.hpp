@@ -59,7 +59,16 @@ private:
         // configured sync interval: SyncEngine::ShouldAutoSync owns the real
         // cadence, this only has to give it a chance to say yes.
         TIMER_AUTOSYNC = 1,
-        AUTOSYNC_TICK_MS = 15000
+        AUTOSYNC_TICK_MS = 15000,
+
+        // Network timeout handed to HbClient. Every server call this class
+        // makes is synchronous and most of them run from a UI handler (a scan
+        // lookup, an item save), so the transport's 30 second default is 30
+        // seconds of dead screen with the operator holding the trigger. Eight
+        // seconds still covers a slow GPRS reply - a first request over a cold
+        // PDP context routinely takes three to five - while failing over to the
+        // offline queue quickly enough that scanning never has to stop.
+        REQUEST_TIMEOUT_MS = 8000
     };
 
     HINSTANCE m_hInstance;
@@ -120,6 +129,19 @@ private:
 
     // Server access
     bool EnsureAuthenticated(bool force);
+
+    /** Writes the client's current token to hb_conf.json so it survives a restart. */
+    void PersistAuthToken();
+
+    /**
+     * Answers "was that failure a rejected session, and did a new one arrive?".
+     * True only when the last server call came back 401 and re-authentication
+     * then succeeded, so a caller may repeat the call exactly once. Anything
+     * else - a 404, a dead link, a server that keeps rejecting the credentials -
+     * returns false, which is what bounds the retry.
+     */
+    bool RetryWithFreshToken();
+
     bool LookupItem(const TCHAR* barcode, Models::Item* item);
     void RunSync(bool interactive);
     void QueueScanForSync(const TCHAR* barcode, const TCHAR* locationId);

@@ -45,7 +45,7 @@ The **MC75 HomeBox Client** is a native C++ application designed for Motorola MC
 | 🌐 **API Integration** | RESTful communication with HomeBox backend | ✅ Complete |
 | 💾 **Offline Queue** | Transaction queuing with automatic sync | ✅ Complete |
 | 📝 **Transaction Journal** | Audit trail with timestamp logging | ✅ Complete |
-| 🔄 **Background Sync** | Automatic synchronization when online | ✅ Complete |
+| 🔄 **Automatic Sync** | Timer-driven sync attempts from the UI thread when online | ✅ Complete |
 
 ### 🎨 User Interface
 
@@ -121,18 +121,23 @@ The **MC75 HomeBox Client** is a native C++ application designed for Motorola MC
 ### 🔨 Build
 
 ```bash
-# Open solution
-cd proj
+# Open the solution - it lives at the repository ROOT.
+# proj/ holds only the two .vcproj files the solution references.
 start mc75-homebox-client.sln
 
 # Build configurations available:
 # - Debug|Windows Mobile 6.5 Professional SDK (ARMV4I)
 # - Release|Windows Mobile 6.5 Professional SDK (ARMV4I)
 
-# Or use build script:
-cd scripts
-build_winmobile.bat
+# Or use the build script - it derives every path from its own location,
+# so it runs from any working directory:
+scripts\build_winmobile.bat            REM Release (default)
+scripts\build_winmobile.bat Debug
 ```
+
+> The project resolves the Windows Mobile SDK and the Zebra EMDK through the
+> `%WINDOWSMOBILE65SDK%` and `%ZEBRAEMDK%` environment variables rather than
+> hard-coded paths — see [BUILD.md → Environment Variables](docs/BUILD.md#environment-variables).
 
 ### 🧪 Test on any host (no device/SDK required)
 
@@ -142,28 +147,38 @@ and `make` are needed:
 
 ```bash
 ./scripts/build_host_debug.sh
-# -> compile-checks all 15 source files, then runs the unit + integration suite
-#    ==== 32/32 test cases passed, 204/204 checks passed ====
+# -> compile-checks all 16 source files against the shim, repeats the check with
+#    the device macros (HBX_USE_EMDK + HBX_USE_WININET), then runs the
+#    unit + integration suite:
+#    ==== 53/53 test cases passed, 1065/1065 checks passed ====
 ```
+
+The script is a thin wrapper around `make -C tests/host check`, which is the
+gate CI should run (`compile-all` + `compile-device` + the suite).
 
 See [BUILD.md → Host Build & Testing](docs/BUILD.md#-host-build--testing) for details.
 
 ### 📦 Deploy
 
 ```bash
-# Deploy to connected MC75 device:
-cd scripts
-deploy_to_device.bat
+# Deploy to a connected MC75 (ActiveSync / WMDC). Like the build script, it
+# locates the CAB relative to itself, so any working directory will do:
+scripts\deploy_to_device.bat           REM Release (default)
+scripts\deploy_to_device.bat Debug
 
 # Manual deployment:
-# 1. Build HBXClientCab project
-# 2. Copy bin/Release/HBXClient.cab to device
-# 3. Tap .cab file on device to install
+# 1. Build the HBXClientCab project
+# 2. Copy bin\Release\HBXClient.CAB (Debug builds: HBXClient_Debug.CAB) to the device
+# 3. Tap the .CAB file on the device to install
 ```
 
 ### ⚙️ Configure
 
-Create `hb_conf.json` in installation directory:
+Create `hb_conf.json` in the installation directory. The app looks in
+`\Program Files\HBXClient\`, then `\My Documents\`, then `\Storage Card\`, and
+runs on documented defaults if it finds none. Every key is optional; see
+[DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full table, including the `apiKey`
+(yours) / `authToken` (the app's) distinction.
 
 ```json
 {
@@ -203,9 +218,12 @@ mc75-homebox-client/
 ├── 📄 src/                    # Source files (.cpp)
 │   ├── main.cpp              # Application entry point
 │   ├── Controller.cpp        # Main controller
+│   ├── Config.cpp            # hb_conf.json loader
+│   ├── StrUtil.cpp           # HBX::Str bounded string / UTF-8 helpers
+│   ├── HttpClient.cpp        # HTTP/HTTPS transports
 │   ├── HbClient.cpp          # API client
 │   ├── SyncEngine.cpp        # Sync manager
-│   ├── Journal.cpp           # Transaction journal
+│   ├── Journal.cpp           # Transaction journal + offline queue
 │   ├── ScannerHAL.cpp        # Scanner abstraction
 │   ├── Views/                # UI components
 │   │   ├── ScanView.cpp
@@ -252,13 +270,27 @@ mc75-homebox-client/
 
 ### 🔍 Code Quality
 
+What the repository can actually demonstrate:
+
 ```bash
-✅ Zero TODO items remaining
-✅ Full implementation of all features
-✅ Comprehensive inline documentation
-✅ Memory leak prevention
-✅ Platform-appropriate error handling
-✅ Offline-first architecture
+✅ No TODO / FIXME markers in src/ or include/
+✅ Host compile gate clean: all 16 sources build against the Win32/CE shim
+✅ Device compile gate clean: the same 16 with HBX_USE_EMDK + HBX_USE_WININET
+✅ 53/53 test cases, 1065/1065 checks (make -C tests/host check)
+✅ Bounded string / UTF-8 handling centralised in HBX::Str (include/StrUtil.hpp)
+✅ Offline-first: scans are journalled and replayed rather than dropped
+```
+
+And what it does **not** demonstrate:
+
+```bash
+⚠️ The suite only RUNS the platform-independent core - StrUtil, JsonLite, Item,
+   Location, Config, Journal, HttpClient, HbClient, SyncEngine (tests/host/Makefile).
+   Controller, the three views, ScannerHAL and main are compile-checked only.
+⚠️ The EMDK and WinInet paths are compile-checked against the shim headers; they
+   can only be exercised on an MC75 (or the WM6.5 emulator, minus the scanner).
+⚠️ Memory is managed by hand (new[]/delete[]); ownership is documented per method
+   in the headers, but nothing in the build enforces it.
 ```
 
 ---

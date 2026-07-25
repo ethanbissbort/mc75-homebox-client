@@ -32,14 +32,45 @@ HTTP-only** transport. This is exactly how the Linux host test harness builds
 |-------------------|---------------------|
 | `OpenScanner()` | `SCAN_Open("SCN1:")`, `SCAN_GetParameters`/`SCAN_SetParameters` (defaults), `SCAN_AllocateBuffer` |
 | `EnableScanner()` / `DisableScanner()` | `SCAN_Enable` / `SCAN_Disable` |
-| `TriggerScan()` | `SCAN_Flush`, `SCAN_SetSoftTrigger(handle, TRUE)` (soft-fires the beam) |
+| `TriggerScan()` | `SCAN_Flush`, then `SCAN_SetSoftTrigger(handle, FALSE)` followed by `(handle, TRUE)` — some EMDK versions want the explicit release before the pull, or the beam does not re-arm on a repeated trigger |
 | `SetScanMode(0/1)` | `SCAN_SetParameters` → `TRIG_MODE_LEVEL` (continuous) / `TRIG_MODE_ONESHOT` (single) |
 | `SetBeepEnabled` / `SetVibrateEnabled` | `SCAN_SetParameters` beep / vibrate fields |
 | background `ScanThread()` | `SCAN_ReadLabelWait(handle, buf, 1000ms)`; on `E_SCN_SUCCESS`, `SCNBUF_GETDATA`/`SCNBUF_GETLEN` → `MultiByteToWideChar` → fire the scan callback |
 | `CloseScanner()` | `SCAN_DeallocateBuffer`, `SCAN_Close` |
 
-A decoded barcode flows: **imager → `ScannerHAL` callback → `ScanView` (shows it)
-→ `Controller::OnScanReceived` (looks the item up / queues it offline)**.
+### Enabling the scanner
+
+Opening the scanner is not enough to make it read anything: `SCAN_Enable` is what
+lets the monitor thread's reads return labels, and nothing used to call it.
+`Controller::Initialize` now enables the scanner right after configuring beep and
+vibrate, so the **physical trigger works from startup** — no soft trigger and no
+visit to the Scan button required. A failure there is journalled
+(`SCANNER_ENABLE`) and the app keeps running, because typing a barcode by hand is
+the fallback for a cracked scan window.
+
+The scanner then follows window activation (`WM_ACTIVATE` →
+`Controller::OnActivate`): disabled when the app goes to the background,
+re-enabled when it comes back. Leaving the imager armed while the MC75 sits in a
+holster is what empties the battery overnight.
+
+### How a decode reaches the application
+
+```
+imager
+  └─ scan thread: SCAN_ReadLabelWait → SCNBUF_GETDATA → MultiByteToWideChar
+       └─ ScannerHAL::DeliverScan → the registered callback, ON THE SCAN THREAD
+            └─ ScanView::ScanThunk: Str::Dup the label,
+               PostMessage(MSG_SCAN_DECODED = WM_APP+1, LPARAM = the copy)
+                 └─ UI thread: ScanView::OnScanReceived shows it and frees the copy
+                      └─ Controller::OnScanReceived → journal, lookup, queue
+```
+
+The hand-off matters: the callback fires on the EMDK scan thread, and everything
+downstream of it (a journal write, a blocking HTTP lookup, a modal dialog) must
+not run there. The view copies the label and posts it, so all of that happens on
+the UI thread instead. The `Lookup` button takes the same path from
+`OnScanReceived` onward, which is why a typed barcode behaves exactly like a
+decoded one.
 
 ### Build setup (Windows 7 + VS2008)
 
@@ -73,9 +104,13 @@ compile/link, check these (all are isolated in `src/ScannerHAL.cpp` /
 ### Build without a scanner (emulator / CI)
 
 Remove `HBX_USE_EMDK` from the project's Preprocessor Definitions. `ScannerHAL`
-then uses its **simulation** path (opens a fake handle, the scan thread idles),
-so the app builds and runs in the Windows Mobile emulator with no EMDK
-installed. Everything except live scanning works.
+then uses its **simulation** path: it stands in a non-NULL handle so the
+enable/trigger state machine stays honest, and **no monitor thread is created at
+all** — an idle polling loop would only cost battery. Scans instead arrive
+synchronously, on the caller's thread, from `TriggerScan()` (which synthesises
+`SIM1`, `SIM2`, …) or from `InjectScan()`. The app builds and runs in the Windows
+Mobile emulator with no EMDK installed, and everything except live scanning
+works.
 
 ---
 
@@ -121,9 +156,20 @@ orphaned:
 ### Offline transaction formats (produced by scans / edits, consumed by `SyncEngine::ProcessQueuedTransaction`)
 
 ```
-ITEM_SCAN     data = "SCAN:<barcode>"  or  "SCAN:<barcode>@<locationId>"
+ITEM_SCAN     data = "SCAN:<barcode>"
+              data = "SCANLOC:<barcodeLength>:<barcode><locationId>"
 ITEM_UPDATE   data = "UPDATE:<item-json>"   e.g. UPDATE:{"id":"42","barcode":"123","name":"Widget","quantity":3}
 ```
+
+The location form is length-prefixed rather than separator-delimited: Code 128
+and QR can both encode `:` and `@`, so any delimiter is a barcode a customer will
+eventually scan. Replay reads `<barcodeLength>` characters as the barcode and
+takes the remainder as the location id.
+
+`SyncEngine::QueueTransaction` wraps these as `[tick] TYPE: DATA`, and the
+journal wraps *that* in its own `TRANS <seq>:` record header — so a line handed
+back by `GetQueuedTransactions` carries all three layers, and
+`Journal::PayloadOf` strips the outermost one before dispatch.
 
 ---
 
@@ -134,7 +180,10 @@ The host harness compile-checks **both** the default and device paths
 but the EMDK, WinInet, and windowing behavior can only be *exercised* on an MC75
 (or the WM6.5 emulator, minus the scanner). Validate on-device:
 
-- A live trigger pull decodes and populates the scan display.
+- A live trigger pull decodes and populates the scan display **without** first
+  pressing the on-screen Scan button (that is what enabling at startup buys).
+- The app stays responsive while a lookup runs, and backgrounding it stops the
+  imager (check the scanner LED, or battery drain over a shift).
 - HTTPS requests to your HomeBox API succeed (correct cert handling).
 - The soft-key menu switches views and the queue list shows pending items.
 

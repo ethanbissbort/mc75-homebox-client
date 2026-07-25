@@ -100,8 +100,12 @@ This guide covers all deployment methods for installing the MC75 HomeBox Client 
    - VS will deploy automatically
 
 3. Deploy via Script
-   cd scripts
-   deploy_to_device.bat
+   scripts\deploy_to_device.bat            REM Release (default)
+   scripts\deploy_to_device.bat Debug
+
+   The script resolves the CAB relative to its own location, so it runs
+   from any working directory. It copies the CAB to \Temp\ on the device;
+   installing it is still a tap on the device.
 ```
 
 ### Method 3: Manual File Copy
@@ -110,8 +114,8 @@ This guide covers all deployment methods for installing the MC75 HomeBox Client 
 
 ```batch
 1. Build executable
-   cd proj
-   Build HBXClient project (Release)
+   Open mc75-homebox-client.sln (repository root) and build HBXClient (Release),
+   or run: scripts\build_winmobile.bat Release
 
 2. Connect device
    USB → ActiveSync/WMDC
@@ -353,6 +357,9 @@ Start Menu → Programs → HBXClient
 - `\My Documents\hb_conf.json` (alternative)
 - `\Storage Card\hb_conf.json` (portable)
 
+The file is **UTF-8**: `Config::Load` decodes it as UTF-8 and `Config::Save`
+writes it back as UTF-8, so accented item text and non-ASCII paths survive.
+
 ### Sample Configuration
 
 ```json
@@ -362,26 +369,49 @@ Start Menu → Programs → HBXClient
   "apiKey": "your-api-key-here",
   "syncIntervalSeconds": 300,
   "journalPath": "\\My Documents\\hbx_journal.log",
+  "logLevel": "INFO",
   "scannerBeepEnabled": true,
   "scannerVibrateEnabled": true,
-  "offlineMode": false,
-  "logLevel": "INFO"
+  "offlineModeEnabled": true
 }
 ```
 
+Every key is optional. A key that is absent takes the default below, and a file
+that fails a strict JSON parse (one trailing comma is enough) falls back to a
+tolerant key scanner, so the readable settings still apply instead of the whole
+file reverting to defaults.
+
+### The two credentials: `apiKey` vs `authToken`
+
+They are **not** interchangeable, and only one of them is yours to provision:
+
+- **`apiKey`** is the long-lived credential you deploy with the device. The
+  client POSTs `{"deviceId", "apiKey"}` to `/api/v1/auth/device`
+  (`HbClient::Authenticate`) and gets a session token back.
+- **`authToken`** is that server-issued session token. It is what goes on the
+  wire as `Authorization: Bearer <token>`; the app obtains it and writes it back
+  into `hb_conf.json` itself, so provisioning it by hand is neither required nor
+  useful. Delete the key if you want the device to re-authenticate from scratch.
+
+With no `apiKey` the app still starts, journals `AUTH_NO_KEY`, and works purely
+offline — every scan is queued and nothing reaches the server.
+
 ### Configuration Parameters
+
+Defaults are the ones `Config::InitDefaults` installs (`src/Config.cpp`).
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `apiBaseUrl` | string | (required) | HomeBox API server URL |
-| `deviceId` | string | (required) | Unique device identifier |
-| `apiKey` | string | (required) | API authentication key |
-| `syncIntervalSeconds` | int | 300 | Auto-sync interval (seconds) |
-| `journalPath` | string | `\My Documents\hbx_journal.log` | Transaction log path |
-| `scannerBeepEnabled` | bool | true | Enable beep on scan |
-| `scannerVibrateEnabled` | bool | true | Enable vibrate on scan |
-| `offlineMode` | bool | false | Start in offline mode |
-| `logLevel` | string | "INFO" | Logging level (DEBUG, INFO, WARN, ERROR) |
+| `apiBaseUrl` | string | `http://localhost:8080/api` | HomeBox API server URL. The localhost default is a placeholder — set it for any real deployment |
+| `deviceId` | string | `MC75-DEVICE-001` | Device identifier sent with the auth request. Must be unique per unit |
+| `apiKey` | string | `""` | Provisioned device credential, exchanged for a session token |
+| `authToken` | string | `""` | Session bearer token. Written by the app; not hand-provisioned |
+| `syncIntervalSeconds` | int | 300 | Minimum spacing between automatic syncs. `0` (or less) turns auto-sync off; values under 5 s are clamped to 5 s by `SyncEngine`, and the poll that checks it fires every 15 s |
+| `journalPath` | string | `\My Documents\hbx_journal.log` | Journal + offline queue file |
+| `logLevel` | string | `"INFO"` | Loaded and saved, but no code in `src/` reads it today — the journal writes INFO/ERROR/AUDIT records unconditionally |
+| `scannerBeepEnabled` | bool | true | Decode beep (applied to the scanner at startup) |
+| `scannerVibrateEnabled` | bool | true | Decode vibrate (applied to the scanner at startup) |
+| `offlineModeEnabled` | bool | **true** | Whether a scan that cannot reach the server is queued for later sync. Set `false` only if unsent work should be **discarded** with an error dialog rather than queued. The older name `offlineMode` is still accepted on load; `Save()` writes `offlineModeEnabled` |
 
 ### Deployment Scenarios
 
