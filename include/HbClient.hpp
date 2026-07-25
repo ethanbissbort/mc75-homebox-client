@@ -48,9 +48,22 @@ private:
     TCHAR* m_deviceId;
     bool m_authenticated;
 
-    // Helper methods
-    bool MakeApiRequest(const TCHAR* method, const TCHAR* endpoint, const TCHAR* body, TCHAR* response, DWORD maxResponseLen);
+    /**
+     * Issues one authenticated API call against m_baseUrl + endpoint.
+     *
+     * On success *response receives the complete response body as a
+     * heap-allocated, NUL-terminated string (never NULL) that the caller must
+     * release with delete[]; on failure it is set to NULL. Pass NULL for
+     * `response` to discard the body. The body is never truncated to fit a
+     * caller buffer -- an API reply that does not fit used to be silently cut
+     * short and reported as a success.
+     */
+    bool MakeApiRequest(const TCHAR* method, const TCHAR* endpoint, const TCHAR* body, TCHAR** response);
     void SetAuthHeaders();
+
+    // Not copyable: the instance owns the HTTP client and its strings.
+    HbClient(const HbClient&);
+    HbClient& operator=(const HbClient&);
 };
 
 } // namespace HBX

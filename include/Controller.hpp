@@ -7,6 +7,7 @@
 #include "SyncEngine.hpp"
 #include "Journal.hpp"
 #include "ScannerHAL.hpp"
+#include "Views/ViewHelpers.hpp"
 #include "Views/ScanView.hpp"
 #include "Views/QueueView.hpp"
 #include "Views/ItemView.hpp"
@@ -53,6 +54,14 @@ public:
     void OnItemSave(const Models::Item* item);
 
 private:
+    enum {
+        // Drives auto-sync. The tick is deliberately much shorter than the
+        // configured sync interval: SyncEngine::ShouldAutoSync owns the real
+        // cadence, this only has to give it a chance to say yes.
+        TIMER_AUTOSYNC = 1,
+        AUTOSYNC_TICK_MS = 15000
+    };
+
     HINSTANCE m_hInstance;
     HWND m_mainWindow;
     AppState m_state;
@@ -70,14 +79,55 @@ private:
     Views::ItemView* m_itemView;
     HWND m_menuBar;
 
+    // Set when another copy of the application already owns the instance mutex;
+    // this one activates the running instance and exits without touching the
+    // journal or the scanner.
+    bool m_secondInstance;
+    HANDLE m_instanceMutex;
+
+    bool m_autoSyncTimerRunning;
+
+    // Set while a handler is inside a blocking server call. Windows Mobile
+    // pumps messages inside MessageBox, so the auto-sync timer can fire while
+    // a modal dialog is up; without this the timer would start a second
+    // synchronous request on the one shared HbClient.
+    bool m_busy;
+
+    // "Assign location" mode: the next scan names the item, the one after it
+    // names the location it moved to.
+    bool m_locationMode;
+    TCHAR* m_pendingItemBarcode;
+
     // UI management
     bool InitializeUI();
     void UpdateUI();
     bool CreateMainWindow();
     bool CreateViews();
     bool CreateMenuBar();
+    void LayoutViews();
     void ShowScanView();
     void ShowQueueView();
+    void ShowItemView(const Models::Item* item, const TCHAR* newBarcode);
+    void RefreshQueueUI();
+
+    // Lifecycle helpers
+    bool AcquireSingleInstance();
+    void ReleaseSingleInstance();
+    void StartAutoSyncTimer();
+    void StopAutoSyncTimer();
+    void OnAutoSyncTick();
+    void OnActivate(bool active);
+
+    // Server access
+    bool EnsureAuthenticated(bool force);
+    bool LookupItem(const TCHAR* barcode, Models::Item* item);
+    void RunSync(bool interactive);
+    void QueueScanForSync(const TCHAR* barcode, const TCHAR* locationId);
+
+    // Location workflow
+    void ToggleLocationMode();
+    void OnLocationScan(const TCHAR* barcode);
+    void ClearPendingLocationScan();
 
     // Window procedure
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
@@ -86,6 +136,12 @@ private:
     static void ScanCallbackThunk(const TCHAR* barcode, void* userData);
     static void SyncCallbackThunk(void* userData);
     static void ItemSaveThunk(const Models::Item* item, void* userData);
+    static void ItemCancelThunk(void* userData);
+    static void QueueChangedThunk(void* userData);
+
+    // Not copyable: the instance owns the components and the window.
+    Controller(const Controller&);
+    Controller& operator=(const Controller&);
 };
 
 } // namespace HBX

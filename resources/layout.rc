@@ -11,21 +11,25 @@ IDM_MAINMENU MENU
 BEGIN
     POPUP "&Menu"
     BEGIN
-        MENUITEM "&Scan",       IDM_VIEW_SCAN
-        MENUITEM "&Queue",      IDM_VIEW_QUEUE
-        MENUITEM "S&ync now",   IDM_ACTION_SYNC
+        MENUITEM "&Scan",           IDM_VIEW_SCAN
+        MENUITEM "&Item",           IDM_VIEW_ITEM
+        MENUITEM "Set &location",   IDM_ACTION_SETLOC
+        MENUITEM "&Queue",          IDM_VIEW_QUEUE
+        MENUITEM "S&ync now",       IDM_ACTION_SYNC
         MENUITEM SEPARATOR
-        MENUITEM "&About",      IDM_HELP_ABOUT
-        MENUITEM "E&xit",       IDM_FILE_EXIT
+        MENUITEM "&About",          IDM_HELP_ABOUT
+        MENUITEM "E&xit",           IDM_FILE_EXIT
     END
 END
 
 // Windows Mobile soft-key menu bar (created at runtime with SHCreateMenuBar).
-// This is the canonical SHMENUBAR template; tweak on-device if the soft-key
-// layout needs adjusting.
+// The first field is the resource ID of the MENU that supplies the popups -
+// SHCreateMenuBar LoadMenu()s it - and the trailing 0 of the button record is
+// the index of the popup to drop down. Naming the menu bar's own ID there
+// makes LoadMenu fail and the whole bar never appears.
 IDR_MENUBAR SHMENUBAR MOVEABLE PURE
 BEGIN
-    IDR_MENUBAR, 1,
+    IDM_MAINMENU, 1,
     I_IMAGENONE, IDM_MAINMENU, TBSTATE_ENABLED,
         TBSTYLE_DROPDOWN | TBSTYLE_AUTOSIZE, IDS_MENU, 0, 0
 END

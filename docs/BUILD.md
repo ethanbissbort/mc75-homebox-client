@@ -52,8 +52,9 @@
 3. **Zebra EMDK for C/C++**
    ```
    Download from Zebra Developer Portal
-   Install to default location
-   Note: Include paths will be referenced in project
+   Install to C:\Program Files\Zebra Technologies\EMDK-C
+   If you install elsewhere, set %ZEBRAEMDK% - the project resolves the
+   EMDK include/lib paths through that variable (see Environment Variables)
    ```
 
 4. **ActiveSync or Windows Mobile Device Center**
@@ -78,19 +79,32 @@
 Verify these paths exist after SDK installation:
 
 ```
-✅ C:\Program Files\Windows Mobile 6.5 SDK\
-✅ C:\Program Files\Zebra Technologies\EMDK-C\
+✅ C:\Program Files\Windows Mobile 6.5 SDK\PocketPC\Include\Armv4i\
+✅ C:\Program Files\Zebra Technologies\EMDK-C\Include\
 ✅ C:\Program Files\Microsoft Visual Studio 9.0\
 ```
 
 ### Environment Variables
 
-Set if not automatically configured:
+`proj/HBXClient.vcproj` does **not** hard-code the SDK or EMDK location — it
+references these two variables, so a non-default install never requires editing
+the project file:
 
 ```batch
 set WINDOWSMOBILE65SDK=C:\Program Files\Windows Mobile 6.5 SDK
 set ZEBRAEMDK=C:\Program Files\Zebra Technologies\EMDK-C
 ```
+
+- `scripts\build_winmobile.bat` sets both to the values above when they are not
+  already defined, and warns if the resulting directories do not exist.
+- For **IDE** builds set them system-wide (System Properties → Environment
+  Variables) *before* starting Visual Studio — VS reads the environment once at
+  launch.
+- Leaving them unset makes the extra include/library paths expand to a bare
+  `\PocketPC\Include\Armv4i`, which VS reports as a "cannot open include
+  directory" warning. The Windows Mobile headers themselves still resolve
+  through the selected platform, but `ScanCAPI.h` / `ScanAPIWM.lib` from the
+  EMDK will **not** be found and the `HBX_USE_EMDK` build will fail.
 
 ---
 
@@ -98,7 +112,8 @@ set ZEBRAEMDK=C:\Program Files\Zebra Technologies\EMDK-C
 
 ### Visual Studio Solution
 
-**File**: `proj/mc75-homebox-client.sln`
+**File**: `mc75-homebox-client.sln` (repository root; the two `.vcproj` files it
+references live in `proj/`)
 
 ```
 mc75-homebox-client.sln
@@ -119,6 +134,7 @@ mc75-homebox-client.sln
 src/main.cpp                  // Entry point
 src/Controller.cpp            // Application controller
 src/Config.cpp               // Configuration manager
+src/StrUtil.cpp              // Bounded string / UTF-8 helpers (HBX::Str)
 
 // Networking
 src/HttpClient.cpp           // HTTP client
@@ -145,18 +161,24 @@ src/Models/JsonLite.cpp     // JSON parser
 
 #### Include Directories
 
+Exactly as configured in `proj/HBXClient.vcproj` (both configurations):
+
 ```
-../include
-$(WINDOWSMOBILE65SDK)\Include\ARMV4I
+..\include
+$(WINDOWSMOBILE65SDK)\PocketPC\Include\Armv4i
 $(ZEBRAEMDK)\Include
 ```
 
 #### Library Directories
 
 ```
-$(WINDOWSMOBILE65SDK)\Lib\ARMV4I
+$(WINDOWSMOBILE65SDK)\PocketPC\Lib\Armv4i
 $(ZEBRAEMDK)\Lib\ARMV4I
 ```
+
+> Paths are relative to `proj/`, which is why the project include is
+> `..\include`. See [Environment Variables](#environment-variables) for how the
+> two macros are resolved.
 
 #### Linked Libraries
 
@@ -194,11 +216,13 @@ ScanAPIWM.lib    // Zebra Scanner C API for real scanning (HBX_USE_EMDK; from th
 Output Directory:    ../bin/Debug/
 Intermediate Dir:    ../obj/Debug/
 Output File:         HBXClient.exe
+CAB File:            HBXClient_Debug.CAB
 Runtime Library:     Multi-threaded Debug DLL (/MDd)
 Optimization:        Disabled (/Od)
 Debug Info:          Program Database (/Zi)
 Warnings:            Level 3 (/W3)
-Preprocessor:        WIN32;_WIN32_WCE=0x0650;UNDER_CE;DEBUG;_DEBUG
+Preprocessor:        WIN32;_WIN32_WCE=0x0600;UNDER_CE;WIN32_PLATFORM_PSPC;_DEBUG;
+                     HBX_USE_WININET;HBX_USE_EMDK
 ```
 
 ### Release Configuration
@@ -209,13 +233,19 @@ Preprocessor:        WIN32;_WIN32_WCE=0x0650;UNDER_CE;DEBUG;_DEBUG
 Output Directory:    ../bin/Release/
 Intermediate Dir:    ../obj/Release/
 Output File:         HBXClient.exe
+CAB File:            HBXClient.CAB
 Runtime Library:     Multi-threaded DLL (/MD)
 Optimization:        Maximize Speed (/O2)
-Inline:              Any Suitable (/Ob2)
-Debug Info:          None
+Inline:              Only __inline (/Ob1)
+Intrinsics:          Enabled (/Oi), favour fast code (/Ot), no frame pointers (/Oy)
+Debug Info:          Not linked (GenerateDebugInformation=false)
 Warnings:            Level 3 (/W3)
-Preprocessor:        WIN32;_WIN32_WCE=0x0650;UNDER_CE;NDEBUG
+Preprocessor:        WIN32;_WIN32_WCE=0x0600;UNDER_CE;WIN32_PLATFORM_PSPC;NDEBUG;
+                     HBX_USE_WININET;HBX_USE_EMDK
 ```
+
+> `_WIN32_WCE=0x0600` is the Windows CE 6 kernel version underneath Windows
+> Mobile 6.5 — it is **not** the Windows Mobile version number.
 
 ---
 
@@ -226,7 +256,7 @@ Preprocessor:        WIN32;_WIN32_WCE=0x0650;UNDER_CE;NDEBUG
 1. **Open Solution**
    ```
    File → Open → Project/Solution
-   Navigate to: proj/mc75-homebox-client.sln
+   Navigate to: mc75-homebox-client.sln (repository root)
    ```
 
 2. **Select Configuration**
@@ -252,49 +282,45 @@ Preprocessor:        WIN32;_WIN32_WCE=0x0650;UNDER_CE;NDEBUG
 ### Method 2: Build Script
 
 ```batch
-cd scripts
-build_winmobile.bat
+REM From anywhere - the script resolves every path from its own location
+scripts\build_winmobile.bat            REM Release (default)
+scripts\build_winmobile.bat Debug
 ```
 
-**Script Contents**:
-```batch
-@echo off
-echo 🔨 Building MC75 HomeBox Client...
+**What the script does**:
 
-REM Set paths
-set SOLUTION=..\proj\mc75-homebox-client.sln
-set CONFIG=Release
-set PLATFORM="Windows Mobile 6.5 Professional SDK (ARMV4I)"
+1. Resolves the repository root from `%~dp0`, so the working directory does not
+   matter.
+2. Validates the configuration argument (`Debug` / `Release`, default
+   `Release`) and that `mc75-homebox-client.sln` exists.
+3. Requires `%VS90COMNTOOLS%` and calls `vsvars32.bat`.
+4. Defaults `%WINDOWSMOBILE65SDK%` / `%ZEBRAEMDK%` when unset and warns if the
+   SDK/EMDK directories are missing.
+5. Runs `devenv /Clean` then `devenv /Build` for
+   `<Config>|Windows Mobile 6.5 Professional SDK (ARMV4I)`.
+6. Prints the resulting `.exe` and `.CAB` paths, and the deploy command.
 
-REM Build
-"C:\Program Files\Microsoft Visual Studio 9.0\Common7\IDE\devenv.exe" ^
-  %SOLUTION% /Build "%CONFIG%|%PLATFORM%"
-
-if %ERRORLEVEL% EQU 0 (
-  echo ✅ Build successful!
-  echo 📦 Output: bin\%CONFIG%\HBXClient.exe
-) else (
-  echo ❌ Build failed with error code %ERRORLEVEL%
-  exit /b 1
-)
-```
-
-### Method 3: Command Line (MSBuild)
+### Method 3: Command Line (devenv)
 
 ```batch
-REM Navigate to project
-cd proj
+REM Run from the repository root (the .sln path is relative to the CWD here)
+call "%VS90COMNTOOLS%\vsvars32.bat"
 
-REM Build Debug
-msbuild HBXClient.vcproj /p:Configuration=Debug /p:Platform="Windows Mobile 6.5 Professional SDK (ARMV4I)"
-
-REM Build Release
-msbuild HBXClient.vcproj /p:Configuration=Release /p:Platform="Windows Mobile 6.5 Professional SDK (ARMV4I)"
+devenv mc75-homebox-client.sln /Build "Debug|Windows Mobile 6.5 Professional SDK (ARMV4I)"
+devenv mc75-homebox-client.sln /Build "Release|Windows Mobile 6.5 Professional SDK (ARMV4I)"
 ```
+
+> Use `devenv`, not MSBuild: MSBuild 3.5 cannot build VS2008 native `.vcproj`
+> files, and smart-device projects additionally need the IDE's deployment
+> machinery. `build_winmobile.bat` wraps exactly these commands.
 
 ---
 
 ## 📜 Build Scripts
+
+> All three scripts resolve their paths from their own location, so they can be
+> invoked from the repository root, from `scripts\`, or from a shortcut with an
+> unrelated working directory.
 
 ### `build_winmobile.bat`
 
@@ -302,25 +328,40 @@ msbuild HBXClient.vcproj /p:Configuration=Release /p:Platform="Windows Mobile 6.
 
 **Usage**:
 ```batch
-cd scripts
-build_winmobile.bat [Debug|Release]
+scripts\build_winmobile.bat [Debug|Release]     REM default: Release
 ```
 
 **Features**:
-- ✅ Validates SDK installation
-- ✅ Builds solution
-- ✅ Reports build status
-- ✅ Shows output location
+- ✅ Validates the configuration argument and the solution path
+- ✅ Requires VS2008 (`%VS90COMNTOOLS%`) and warns about a missing SDK/EMDK
+- ✅ Cleans, then builds the solution
+- ✅ Reports build status and the `.exe` / `.CAB` output paths
+
+### `deploy_to_device.bat`
+
+**Purpose**: Copy the built CAB to a connected MC75 over ActiveSync/WMDC.
+
+**Usage**:
+```batch
+scripts\deploy_to_device.bat [Debug|Release]    REM default: Release
+```
+
+Picks `bin\Release\HBXClient.CAB` or `bin\Debug\HBXClient_Debug.CAB` to match
+the CAB project's output names, copies it to `\Temp\` on the device, and fails
+loudly if the device is absent or the copy does not complete.
 
 ### `build_host_debug.sh`
 
-**Purpose**: Compile-check the entire codebase and run the unit + integration
-tests on a POSIX host (Linux/macOS) **without** the Windows Mobile SDK, VS2008,
-or a device. Ideal for CI and quick local validation of the core logic.
+**Purpose**: The host gate in one command — compile-check the entire codebase
+(host *and* device configurations) and run the unit + integration tests on a
+POSIX host (Linux/macOS) **without** the Windows Mobile SDK, VS2008, or a
+device. This is the CI entry point; it is a thin wrapper around
+`make -C tests/host check`.
 
 **Usage**:
 ```bash
 ./scripts/build_host_debug.sh
+CXX=clang++ ./scripts/build_host_debug.sh   # override the compiler
 ```
 
 **Requirements**: only a C++ compiler (`g++` or `clang++`) and `make`.
@@ -337,11 +378,15 @@ repository ships a small **Win32/CE shim** under `tests/host/shim/` that maps
 the subset of the Windows API the code uses onto the host:
 
 - `TCHAR` becomes `char` and `TEXT("x")` a narrow literal, so `wsprintf`'s
-  `%s` semantics match `wsprintfW`.
+  `%s` semantics match `wsprintfW`. The shim also enforces the real
+  `wsprintf`/`wsprintfW` **1024-character output cap**, so a format call that
+  would be truncated on the device is truncated on the host too.
 - The `lstr*` / `wcs*` string helpers become inline wrappers over `<cstring>`.
 - File I/O (`CreateFile`/`ReadFile`/`WriteFile`/`SetFilePointer`/…) is mapped to
   POSIX `open`/`read`/`write`/`lseek`, so `Journal` and `Config` exercise real
   files.
+- The CE critical-section API maps to POSIX mutexes, which is why the host build
+  links with `-pthread`.
 - `<winsock.h>` maps to BSD sockets; the GUI surface (`<commctrl.h>`, window
   APIs) is provided as inert stubs so the UI translation units compile.
 
@@ -349,8 +394,11 @@ the subset of the Windows API the code uses onto the host:
 
 | Layer | Host build |
 |-------|-----------|
-| `JsonLite`, `Item`, `Location`, `Journal`, `Config`, `HttpClient` URL parsing, `HbClient` request gating | **compiled + unit/integration tested** |
+| `StrUtil`, `JsonLite`, `Item`, `Location`, `Journal`, `Config`, `SyncEngine` queue/replay, `HttpClient` URL parsing, `HbClient` request gating | **compiled + unit/integration tested** |
 | GUI views, `Controller`, `main`, `ScannerHAL` | **compile-checked** (need a real device to run) |
+
+The compiled-and-tested set is `CORE_SRC` in `tests/host/Makefile`; every source
+under `src/` is compile-checked by the two gates regardless.
 
 ### Running
 
@@ -366,12 +414,18 @@ make -C tests/host compile-device # syntax-check the device paths (HBX_USE_EMDK 
 make -C tests/host clean
 ```
 
-Expected tail of a successful run:
+A successful run ends with every gate clean and no failing case — the totals
+move as tests are added, so match the shape, not the numbers:
 
 ```
-==== 32/32 test cases passed, 204/204 checks passed ====
+All sources compile cleanly.
+All device paths compile cleanly.
+==== <N>/<N> test cases passed, <M>/<M> checks passed ====
 Host debug build & tests completed successfully.
 ```
+
+Any `FAIL <path>` line, or a passed count below the total, fails the gate and
+the script exits non-zero.
 
 ### Layout
 
@@ -381,7 +435,7 @@ tests/host/
 ├── test_framework.hpp    # tiny zero-dependency assertion framework (TEST_CASE / CHECK*)
 ├── test_main.cpp         # runner entry point
 └── Makefile              # build gate + test runner
-tests/unit/               # test_json.cpp, test_journal.cpp, test_http.cpp
+tests/unit/               # test_strutil.cpp, test_json.cpp, test_journal.cpp, test_http.cpp
 tests/integration/        # test_api_endpoints.cpp, test_offline_sync.cpp
 ```
 
@@ -417,9 +471,9 @@ fatal error C1083: Cannot open include file: 'ScanCAPI.h'
 **Solution**:
 ```
 1. Install Zebra EMDK for C/C++
-2. Add EMDK include path to project:
-   Project Properties → C/C++ → General → Additional Include Directories
-   Add: $(ZEBRAEMDK)\Include
+2. Set %ZEBRAEMDK% to the install directory (see Environment Variables) and
+   restart Visual Studio - the project already references $(ZEBRAEMDK)\Include
+3. Or build without real scanning by removing HBX_USE_EMDK (see SCANNING.md)
 ```
 
 #### ❌ Error: Unresolved External Symbol
@@ -430,13 +484,11 @@ error LNK2019: unresolved external symbol _SCAN_Open
 
 **Solution**:
 ```
-1. Add EMDK library path:
-   Project Properties → Linker → General → Additional Library Directories
-   Add: $(ZEBRAEMDK)\Lib\ARMV4I
+1. Set %ZEBRAEMDK% (see Environment Variables) and restart Visual Studio - the
+   project already references $(ZEBRAEMDK)\Lib\ARMV4I
 
-2. Add EMDK library:
-   Project Properties → Linker → Input → Additional Dependencies
-   Add: ScanAPI.lib
+2. Confirm the EMDK ships ScanAPIWM.lib (the Windows Mobile import library) in
+   that directory; it is already listed in Additional Dependencies
 ```
 
 #### ❌ Error: Charset Mismatch
@@ -506,16 +558,21 @@ HBXClient.exe          // Executable (optimized)
 
 ### CAB Installer
 
-**Location**: `bin/Release/`
+**Location**: `bin/Release/` (Release) or `bin/Debug/` (Debug)
 
 ```
-HBXClient.cab          // CAB installer package
+HBXClient.CAB          // Release CAB installer package
+HBXClient_Debug.CAB    // Debug CAB installer package
 ```
 
-**Contents**:
+**Contents** (identical for both configurations):
 - HBXClient.exe
-- Default configuration (if exists)
+- hb_conf.json (only if present in the repository root)
 - Installation manifest
+
+Everything else the app needs is linked into the executable — the `.rc` files
+under `resources/` are compile-time resource scripts and are deliberately **not**
+deployed; installing them would only waste device storage.
 
 ---
 
@@ -538,7 +595,7 @@ HBXClient.cab          // CAB installer package
 ### Before Release
 
 1. ✅ **Rebuild in Release** configuration
-2. ✅ **Run all tests** (unit + integration)
+2. ✅ **Run all tests** (`./scripts/build_host_debug.sh` — compile gates + suite)
 3. ✅ **Test on actual hardware** (MC75 device)
 4. ✅ **Verify CAB installation** works correctly
 5. ✅ **Document build number** and commit hash
@@ -566,8 +623,9 @@ After successful build:
 REM Copy to device
 copy bin\Release\HBXClient.exe "\Mobile Device\My Documents\"
 
-REM Or deploy via ActiveSync
+REM Or deploy the CAB via ActiveSync (Release by default)
 scripts\deploy_to_device.bat
+scripts\deploy_to_device.bat Debug
 ```
 
 ---

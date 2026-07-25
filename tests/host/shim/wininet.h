@@ -36,6 +36,10 @@ typedef uintptr_t DWORD_PTR;
 /* HttpQueryInfo dwInfoLevel */
 #define HTTP_QUERY_STATUS_CODE      19
 #define HTTP_QUERY_FLAG_NUMBER      0x20000000
+/* InternetSetOption dwOption -- values match the Windows Mobile 6.5 SDK. */
+#define INTERNET_OPTION_CONNECT_TIMEOUT 2
+#define INTERNET_OPTION_SEND_TIMEOUT    5
+#define INTERNET_OPTION_RECEIVE_TIMEOUT 6
 
 /* -------------------------------------------------------------- functions -- */
 inline HINTERNET InternetOpen(LPCTSTR /*agent*/, DWORD /*accessType*/,
@@ -89,6 +93,12 @@ inline BOOL InternetReadFile(HINTERNET /*file*/, LPVOID /*buffer*/,
 {
     /* No data on the host: report zero bytes so the read loop terminates. */
     if (bytesRead) *bytesRead = 0;
+    return TRUE;
+}
+
+inline BOOL InternetSetOption(HINTERNET /*handle*/, DWORD /*option*/,
+                              LPVOID /*buffer*/, DWORD /*bufferLength*/)
+{
     return TRUE;
 }
 

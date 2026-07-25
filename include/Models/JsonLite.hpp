@@ -3,6 +3,8 @@
 
 #include <windows.h>
 
+#include "../StrUtil.hpp"
+
 namespace HBX {
 namespace Models {
 
@@ -15,11 +17,33 @@ public:
     JsonLite();
     ~JsonLite();
 
+    /**
+     * Nesting limit for Parse(). The parser descends recursively into objects
+     * and arrays, and the MC75 gives each thread a small stack, so a malformed
+     * or hostile response must not be able to pick the depth. Real HomeBox
+     * payloads nest three or four levels.
+     */
+    enum { MAX_PARSE_DEPTH = 64 };
+
     // Parsing
     bool Parse(const TCHAR* jsonString);
 
     // Value extraction
+    /**
+     * Copies the value of `key` into `value`. Returns false if the key is
+     * missing, is not a string, or the value did not fit in `maxLen` TCHARs --
+     * a truncated field used to be reported as success, which silently wrote a
+     * shortened value back to the server on the next update.
+     */
     bool GetString(const TCHAR* key, TCHAR* value, DWORD maxLen) const;
+
+    /**
+     * Heap copy of the value of `key`, or NULL if it is missing or not a
+     * string. Caller must delete[] the result. Use this instead of GetString
+     * when the value length is not known in advance.
+     */
+    TCHAR* GetStringAlloc(const TCHAR* key) const;
+
     bool GetInt(const TCHAR* key, int* value) const;
     bool GetBool(const TCHAR* key, bool* value) const;
     bool GetDouble(const TCHAR* key, double* value) const;
@@ -42,8 +66,18 @@ public:
     void AddDouble(const TCHAR* key, double value);
 
     // Output
+    /** Serialized document; caller must delete[]. NULL if nothing was built. */
     TCHAR* ToString() const;
     void Clear();
+
+    /**
+     * Decodes one JSON string literal. `*ptr` must point at the opening quote;
+     * on success it is advanced past the closing quote and `*out` receives a
+     * heap copy (caller delete[]s) with all escape sequences -- including
+     * \uXXXX and surrogate pairs -- resolved. Exposed so the hand-rolled
+     * scanner in Config can decode values the same way the parser does.
+     */
+    static bool DecodeStringLiteral(const TCHAR** ptr, TCHAR** out);
 
 private:
     struct Node {
@@ -59,6 +93,7 @@ private:
     // When true, m_root points into another JsonLite's tree (see
     // GetArrayElement) and must not be freed by this instance.
     bool m_borrowedRoot;
+    int m_depth;
 
     // Helper methods
     Node* CreateNode();
@@ -68,8 +103,8 @@ private:
     bool ParseObject(const TCHAR** ptr, Node* node);
     bool ParseArray(const TCHAR** ptr, Node* node);
     bool ParseString(const TCHAR** ptr, TCHAR** out);
-    void SkipWhitespace(const TCHAR** ptr);
-    void BuildString(const Node* node, TCHAR** buffer, int* pos, int maxLen) const;
+    static void SkipWhitespace(const TCHAR** ptr);
+    void BuildString(const Node* node, Str::Buffer& out) const;
 };
 
 } // namespace Models

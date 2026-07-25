@@ -1,27 +1,131 @@
 #include "../include/ScannerHAL.hpp"
+#include "../include/StrUtil.hpp"
+
+// The host shim declares WaitForSingleObject but not the wait result codes;
+// the real windows.h does, so these definitions only ever apply off-device.
+#ifndef WAIT_OBJECT_0
+#define WAIT_OBJECT_0 ((DWORD)0x00000000)
+#endif
 
 namespace HBX {
 
+namespace {
+
+// Shutdown budget for the monitor thread. The loop's blocking read uses a 1s
+// timeout, so a healthy thread exits well inside this; the margin covers a
+// decode callback that is still running.
+const DWORD kThreadJoinTimeoutMs = 5000;
+
+} // namespace
+
 ScannerHAL::ScannerHAL()
-    : m_scannerHandle(NULL)
+    : m_state(CreateState())
     , m_initialized(false)
-    , m_enabled(false)
-    , m_lastBarcode(NULL)
-    , m_callback(NULL)
-    , m_callbackUserData(NULL)
     , m_scanThread(NULL)
-    , m_scanThreadRunning(false)
-#ifdef HBX_USE_EMDK
-    , m_scanBuffer(NULL)
-#endif
 {
 }
 
 ScannerHAL::~ScannerHAL()
 {
     Shutdown();
-    if (m_lastBarcode) {
-        delete[] m_lastBarcode;
+
+    // Drops this object's reference. If a wedged monitor thread still holds
+    // one, it frees the state (and the scanner) when it finally exits.
+    ReleaseState(m_state);
+    m_state = NULL;
+}
+
+ScannerHAL::SharedState* ScannerHAL::CreateState()
+{
+    SharedState* state = new SharedState;
+    if (!state) {
+        return NULL;
+    }
+
+    state->refCount = 1;
+    state->running = 0;
+    state->enabled = 0;
+    InitializeCriticalSection(&state->lock);
+    state->callback = NULL;
+    state->callbackUserData = NULL;
+    state->lastBarcode[0] = (TCHAR)'\0';
+    state->hasLastBarcode = false;
+    state->scannerHandle = NULL;
+#ifdef HBX_USE_EMDK
+    state->scanBuffer = NULL;
+#else
+    state->simSequence = 0;
+#endif
+
+    return state;
+}
+
+void ScannerHAL::AddRefState(SharedState* state)
+{
+    if (state) {
+        InterlockedIncrement(&state->refCount);
+    }
+}
+
+void ScannerHAL::ReleaseState(SharedState* state)
+{
+    if (!state) {
+        return;
+    }
+
+    if (InterlockedDecrement(&state->refCount) != 0) {
+        return;
+    }
+
+    // Last owner out closes the hardware. On a shutdown whose join timed out
+    // that owner is the monitor thread itself, which is exactly the point: the
+    // decode buffer and the scanner handle survive until nothing can read them.
+    ReleaseHardware(state);
+    DeleteCriticalSection(&state->lock);
+    delete state;
+}
+
+void ScannerHAL::ReleaseHardware(SharedState* state)
+{
+    if (!state) {
+        return;
+    }
+
+#ifdef HBX_USE_EMDK
+    if (state->scanBuffer) {
+        SCAN_DeallocateBuffer(state->scanBuffer);
+        state->scanBuffer = NULL;
+    }
+    if (state->scannerHandle) {
+        SCAN_Close((SCAN_HANDLE)state->scannerHandle);
+    }
+#endif
+    state->scannerHandle = NULL;
+}
+
+void ScannerHAL::DeliverScan(SharedState* state, const TCHAR* barcode)
+{
+    if (!state || !barcode) {
+        return;
+    }
+
+    ScanCallback callback = NULL;
+    void* userData = NULL;
+
+    EnterCriticalSection(&state->lock);
+    Str::Copy(state->lastBarcode, (int)MAX_BARCODE_CHARS, barcode);
+    state->hasLastBarcode = true;
+    // Snapshot the pair together: SetScanCallback publishes both under this
+    // same lock, so a decode can never pair a new callback with a stale
+    // userData (or vice versa).
+    callback = state->callback;
+    userData = state->callbackUserData;
+    LeaveCriticalSection(&state->lock);
+
+    // Invoked outside the lock: the handler runs the whole scan pipeline and
+    // must not be able to block GetLastScan or SetScanCallback while it does.
+    if (callback) {
+        callback(barcode, userData);
     }
 }
 
@@ -31,31 +135,40 @@ bool ScannerHAL::Initialize()
         return true;
     }
 
-    // Initialize Zebra EMDK
-    // In a real implementation, this would call EMDK_Init() or similar
-    // For MC75 with Symbol/Zebra scanner, we'd typically use:
-    // - SCAN_Open() from the Symbol scanner API
-    // - Or EMDK Manager initialization for newer EMDK versions
+    if (!m_state) {
+        return false;
+    }
 
     if (!OpenScanner()) {
         return false;
     }
 
-    // Start scan monitoring thread
-    m_scanThreadRunning = true;
+#ifdef HBX_USE_EMDK
+    // The monitor thread owns a reference for its whole life, so deleting the
+    // ScannerHAL mid-decode cannot pull the state out from under it.
+    InterlockedExchange(&m_state->running, 1);
+    AddRefState(m_state);
+
     m_scanThread = CreateThread(
         NULL,
         0,
         ScanThread,
-        this,
+        m_state,
         0,
         NULL
     );
 
     if (!m_scanThread) {
+        InterlockedExchange(&m_state->running, 0);
+        ReleaseState(m_state);
         CloseScanner();
         return false;
     }
+#else
+    // The simulation build has no hardware to poll: barcodes arrive through
+    // InjectScan / TriggerScan on the caller's thread, so no monitor thread is
+    // started (an empty polling loop would just burn battery).
+#endif
 
     m_initialized = true;
     return true;
@@ -66,7 +179,7 @@ bool ScannerHAL::Shutdown()
     if (!m_initialized) {
         return true;
     }
-    
+
     DisableScanner();
     CloseScanner();
     m_initialized = false;
@@ -80,23 +193,20 @@ bool ScannerHAL::IsInitialized() const
 
 bool ScannerHAL::EnableScanner()
 {
-    if (!m_initialized) {
+    if (!m_initialized || !m_state || !m_state->scannerHandle) {
         return false;
     }
 
     // Enable scanner via EMDK
-    if (m_scannerHandle) {
 #ifdef HBX_USE_EMDK
-        DWORD result = SCAN_Enable((SCAN_HANDLE)m_scannerHandle);
-        if (result != E_SCN_SUCCESS) {
-            return false;
-        }
-#endif
-        m_enabled = true;
-        return true;
+    DWORD result = SCAN_Enable((SCAN_HANDLE)m_state->scannerHandle);
+    if (result != E_SCN_SUCCESS) {
+        return false;
     }
+#endif
 
-    return false;
+    InterlockedExchange(&m_state->enabled, 1);
+    return true;
 }
 
 bool ScannerHAL::DisableScanner()
@@ -105,21 +215,22 @@ bool ScannerHAL::DisableScanner()
         return true; // Already disabled
     }
 
-    // Disable scanner via EMDK
-    if (m_scannerHandle) {
-#ifdef HBX_USE_EMDK
-        SCAN_Disable((SCAN_HANDLE)m_scannerHandle);
-#endif
-        m_enabled = false;
-        return true;
+    if (!m_state || !m_state->scannerHandle) {
+        return false;
     }
 
-    return false;
+    // Disable scanner via EMDK
+#ifdef HBX_USE_EMDK
+    SCAN_Disable((SCAN_HANDLE)m_state->scannerHandle);
+#endif
+
+    InterlockedExchange(&m_state->enabled, 0);
+    return true;
 }
 
 bool ScannerHAL::TriggerScan()
 {
-    if (!m_enabled || !m_scannerHandle) {
+    if (!m_state || !m_state->enabled || !m_state->scannerHandle) {
         return false;
     }
 
@@ -128,36 +239,63 @@ bool ScannerHAL::TriggerScan()
     // Flush any stale/pending decode data so the next read is fresh, then
     // pull the soft trigger to fire the beam. The decoded label is captured
     // by the scan thread's blocking SCAN_ReadLabelWait().
-    SCAN_Flush((SCAN_HANDLE)m_scannerHandle);
+    SCAN_Flush((SCAN_HANDLE)m_state->scannerHandle);
     // Some EMDK/SMDK versions want an explicit release (FALSE) before the
     // pull (TRUE); do both so the beam re-arms on repeated triggers.
-    SCAN_SetSoftTrigger((SCAN_HANDLE)m_scannerHandle, FALSE);
-    DWORD result = SCAN_SetSoftTrigger((SCAN_HANDLE)m_scannerHandle, TRUE);
+    SCAN_SetSoftTrigger((SCAN_HANDLE)m_state->scannerHandle, FALSE);
+    DWORD result = SCAN_SetSoftTrigger((SCAN_HANDLE)m_state->scannerHandle, TRUE);
     return (result == E_SCN_SUCCESS);
 #else
-    // For simulation, we'll just return true
-    // In production, the scan result would arrive via callback
-    // or polling in the scan thread
+    // Simulation: synthesise a decode so the emulator/host build exercises the
+    // same store-last + callback path the device does. Delivery is synchronous
+    // here, whereas the device delivers from the monitor thread.
+    TCHAR barcode[32];
+    barcode[0] = (TCHAR)'\0';
+    Str::Append(barcode, 32, TEXT("SIM"));
+    Str::AppendInt(barcode, 32, (long)InterlockedIncrement(&m_state->simSequence));
+
+    DeliverScan(m_state, barcode);
     return true;
 #endif
 }
 
-bool ScannerHAL::GetLastScan(TCHAR* barcode, DWORD maxLen)
+bool ScannerHAL::InjectScan(const TCHAR* barcode)
 {
-    if (!m_lastBarcode || !barcode) {
+    if (!m_state || !barcode || barcode[0] == (TCHAR)'\0') {
         return false;
     }
-    
-    lstrcpyn(barcode, m_lastBarcode, maxLen);
+
+    DeliverScan(m_state, barcode);
     return true;
+}
+
+bool ScannerHAL::GetLastScan(TCHAR* barcode, DWORD maxLen)
+{
+    if (!barcode || maxLen == 0 || !m_state) {
+        return false;
+    }
+
+    int cap = (maxLen > (DWORD)0x7FFFFFFF) ? 0x7FFFFFFF : (int)maxLen;
+    bool haveScan = false;
+
+    // Locked: on the device the monitor thread overwrites this buffer from
+    // under the UI thread.
+    EnterCriticalSection(&m_state->lock);
+    if (m_state->hasLastBarcode) {
+        Str::Copy(barcode, cap, m_state->lastBarcode);
+        haveScan = true;
+    }
+    LeaveCriticalSection(&m_state->lock);
+
+    return haveScan;
 }
 
 const TCHAR* ScannerHAL::GetScannerStatus() const
 {
-    if (!m_initialized) {
+    if (!m_initialized || !m_state) {
         return TEXT("Not initialized");
     }
-    if (!m_enabled) {
+    if (!m_state->enabled) {
         return TEXT("Disabled");
     }
     return TEXT("Ready");
@@ -165,7 +303,7 @@ const TCHAR* ScannerHAL::GetScannerStatus() const
 
 bool ScannerHAL::SetScanMode(int mode)
 {
-    if (!m_initialized || !m_scannerHandle) {
+    if (!m_initialized || !m_state || !m_state->scannerHandle) {
         return false;
     }
 
@@ -173,12 +311,12 @@ bool ScannerHAL::SetScanMode(int mode)
     // mode: 0 = continuous, 1 = single scan
 #ifdef HBX_USE_EMDK
     SCAN_PARAMS params;
-    if (SCAN_GetParameters((SCAN_HANDLE)m_scannerHandle, &params) != E_SCN_SUCCESS) {
+    if (SCAN_GetParameters((SCAN_HANDLE)m_state->scannerHandle, &params) != E_SCN_SUCCESS) {
         return false;
     }
     // 0 = continuous -> level trigger; 1 = single -> one-shot trigger.
     params.dwTriggerMode = (mode == 0) ? TRIG_MODE_LEVEL : TRIG_MODE_ONESHOT;
-    return (SCAN_SetParameters((SCAN_HANDLE)m_scannerHandle, &params) == E_SCN_SUCCESS);
+    return (SCAN_SetParameters((SCAN_HANDLE)m_state->scannerHandle, &params) == E_SCN_SUCCESS);
 #else
     (void)mode;
     return true;
@@ -187,20 +325,20 @@ bool ScannerHAL::SetScanMode(int mode)
 
 bool ScannerHAL::SetBeepEnabled(bool enabled)
 {
-    if (!m_initialized || !m_scannerHandle) {
+    if (!m_initialized || !m_state || !m_state->scannerHandle) {
         return false;
     }
 
     // Configure beep via EMDK
 #ifdef HBX_USE_EMDK
     SCAN_PARAMS params;
-    if (SCAN_GetParameters((SCAN_HANDLE)m_scannerHandle, &params) != E_SCN_SUCCESS) {
+    if (SCAN_GetParameters((SCAN_HANDLE)m_state->scannerHandle, &params) != E_SCN_SUCCESS) {
         return false;
     }
     params.dwDecodeBeepEnable    = enabled ? 1 : 0;
     params.dwDecodeBeepTime      = 200;   // Duration in milliseconds
     params.dwDecodeBeepFrequency = 2500;  // Frequency in Hz
-    return (SCAN_SetParameters((SCAN_HANDLE)m_scannerHandle, &params) == E_SCN_SUCCESS);
+    return (SCAN_SetParameters((SCAN_HANDLE)m_state->scannerHandle, &params) == E_SCN_SUCCESS);
 #else
     (void)enabled;
     return true;
@@ -209,19 +347,19 @@ bool ScannerHAL::SetBeepEnabled(bool enabled)
 
 bool ScannerHAL::SetVibrateEnabled(bool enabled)
 {
-    if (!m_initialized || !m_scannerHandle) {
+    if (!m_initialized || !m_state || !m_state->scannerHandle) {
         return false;
     }
 
     // Configure vibrate via EMDK
 #ifdef HBX_USE_EMDK
     SCAN_PARAMS params;
-    if (SCAN_GetParameters((SCAN_HANDLE)m_scannerHandle, &params) != E_SCN_SUCCESS) {
+    if (SCAN_GetParameters((SCAN_HANDLE)m_state->scannerHandle, &params) != E_SCN_SUCCESS) {
         return false;
     }
     params.dwDecodeVibrateEnable = enabled ? 1 : 0;
     params.dwDecodeVibrateTime   = 200;  // Duration in milliseconds
-    return (SCAN_SetParameters((SCAN_HANDLE)m_scannerHandle, &params) == E_SCN_SUCCESS);
+    return (SCAN_SetParameters((SCAN_HANDLE)m_state->scannerHandle, &params) == E_SCN_SUCCESS);
 #else
     (void)enabled;
     // Alternative on a real device: drive the vibrator directly via the
@@ -233,12 +371,26 @@ bool ScannerHAL::SetVibrateEnabled(bool enabled)
 
 void ScannerHAL::SetScanCallback(ScanCallback callback, void* userData)
 {
-    m_callback = callback;
-    m_callbackUserData = userData;
+    if (!m_state) {
+        return;
+    }
+
+    // The monitor thread is already running by the time the views register
+    // themselves, so the function and its context have to be published as one
+    // unit or a decode landing in between calls the new callback with the old
+    // userData.
+    EnterCriticalSection(&m_state->lock);
+    m_state->callback = callback;
+    m_state->callbackUserData = userData;
+    LeaveCriticalSection(&m_state->lock);
 }
 
 bool ScannerHAL::OpenScanner()
 {
+    if (!m_state) {
+        return false;
+    }
+
 #ifdef HBX_USE_EMDK
     // Open the default scanner. "SCN1:" is the primary scanner port exposed by
     // the Symbol/Zebra driver on the MC75; SCAN_Open returns a HANDLE.
@@ -247,96 +399,103 @@ bool ScannerHAL::OpenScanner()
     if (result != E_SCN_SUCCESS || hScanner == NULL) {
         return false;
     }
-    m_scannerHandle = hScanner;
+    m_state->scannerHandle = hScanner;
 
     // Configure scanner defaults: level (continuous) trigger with the decode
     // beep on, vibrate off. Best-effort - a config failure is not fatal.
     SCAN_PARAMS params;
-    if (SCAN_GetParameters((SCAN_HANDLE)m_scannerHandle, &params) == E_SCN_SUCCESS) {
+    if (SCAN_GetParameters((SCAN_HANDLE)m_state->scannerHandle, &params) == E_SCN_SUCCESS) {
         params.dwTriggerMode         = TRIG_MODE_LEVEL;
         params.dwDecodeBeepEnable    = 1;
         params.dwDecodeBeepTime      = 200;
         params.dwDecodeBeepFrequency = 2500;
         params.dwDecodeVibrateEnable = 0;
         params.dwDecodeVibrateTime   = 200;
-        SCAN_SetParameters((SCAN_HANDLE)m_scannerHandle, &params);
+        SCAN_SetParameters((SCAN_HANDLE)m_state->scannerHandle, &params);
     }
 
     // Allocate the reusable decode buffer used by the scan thread. TRUE selects
     // a text (as opposed to raw/binary) buffer format.
-    m_scanBuffer = SCAN_AllocateBuffer(TRUE, SCAN_MAX_LABEL_LEN);
-    if (m_scanBuffer == NULL) {
-        SCAN_Close((SCAN_HANDLE)m_scannerHandle);
-        m_scannerHandle = NULL;
+    m_state->scanBuffer = SCAN_AllocateBuffer(TRUE, SCAN_MAX_LABEL_LEN);
+    if (m_state->scanBuffer == NULL) {
+        SCAN_Close((SCAN_HANDLE)m_state->scannerHandle);
+        m_state->scannerHandle = NULL;
         return false;
     }
 
     return true;
 #else
-    // Open scanner device via EMDK
-    // For MC75 with Zebra EMDK, typical implementation:
-
-    // In a real implementation with EMDK library linked:
-    // SCAN_HANDLE scanHandle;
-    // DWORD result = SCAN_Open(&scanHandle);
-    // if (result != E_SCN_SUCCESS) return false;
-    // m_scannerHandle = (HANDLE)scanHandle;
-
-    // For now, create a simulated handle
-    // In production, this would be the actual EMDK scanner handle
-    m_scannerHandle = (HANDLE)0x12345678; // Simulated handle
-
-    // Configure scanner defaults
-    // Real EMDK calls would be:
-    // SCAN_SetParameters(scanHandle, &params);
-    // SCAN_SetCallBack(scanHandle, ScanCallback, this);
-
-    return (m_scannerHandle != NULL);
+    // Simulation: no EMDK to open, so stand in a non-NULL handle to keep the
+    // enable/trigger state machine (and the views driving it) honest.
+    m_state->scannerHandle = (HANDLE)0x12345678;
+    return true;
 #endif
 }
 
 void ScannerHAL::CloseScanner()
 {
-    // Stop scan thread first
+    if (!m_state) {
+        return;
+    }
+
+    InterlockedExchange(&m_state->running, 0);
+
+    bool threadStopped = true;
     if (m_scanThread) {
-        m_scanThreadRunning = false;
-        WaitForSingleObject(m_scanThread, 5000); // Wait up to 5 seconds
+        threadStopped = (WaitForSingleObject(m_scanThread, kThreadJoinTimeoutMs) == WAIT_OBJECT_0);
         CloseHandle(m_scanThread);
         m_scanThread = NULL;
     }
 
-    // Close scanner device via EMDK
-    if (m_scannerHandle) {
-#ifdef HBX_USE_EMDK
-        if (m_scanBuffer) {
-            SCAN_DeallocateBuffer(m_scanBuffer);
-            m_scanBuffer = NULL;
-        }
-        SCAN_Close((SCAN_HANDLE)m_scannerHandle);
-#endif
-        m_scannerHandle = NULL;
+    if (threadStopped) {
+        // Nothing can reach the hardware any more, so release it here and keep
+        // the state (with its callback registration) for a later Initialize().
+        ReleaseHardware(m_state);
+        return;
     }
+
+    // The thread is still inside the driver - a decode callback that blocks on
+    // the network or on a modal prompt makes this routine rather than
+    // exceptional. Deallocating the decode buffer or closing the handle now
+    // would be a use-after-free on a device that is merely slow, so hand this
+    // reference to the thread instead: it releases the state, and with it the
+    // hardware, when it finally leaves the loop. A fresh state carries the
+    // callback registration forward so the object stays usable.
+    SharedState* orphan = m_state;
+    SharedState* fresh = CreateState();
+
+    EnterCriticalSection(&orphan->lock);
+    if (fresh) {
+        fresh->callback = orphan->callback;
+        fresh->callbackUserData = orphan->callbackUserData;
+    }
+    // Unregister on the orphan so a late decode cannot call into a view that
+    // is about to be destroyed. The thread snapshots the pair under this same
+    // lock, so once we are past here it can no longer start a callback.
+    orphan->callback = NULL;
+    orphan->callbackUserData = NULL;
+    LeaveCriticalSection(&orphan->lock);
+
+    m_state = fresh;
+    ReleaseState(orphan);
 }
 
 DWORD WINAPI ScannerHAL::ScanThread(LPVOID param)
 {
-    ScannerHAL* pThis = (ScannerHAL*)param;
-    if (!pThis) {
+#ifdef HBX_USE_EMDK
+    SharedState* state = (SharedState*)param;
+    if (!state) {
         return 1;
     }
 
-    // Scan monitoring thread
-    // This thread would typically:
-    // 1. Wait for scan events from EMDK
-    // 2. Read scan data
-    // 3. Invoke callback with barcode data
-
-    while (pThis->m_scanThreadRunning) {
-#ifdef HBX_USE_EMDK
+    // Monitor loop: poll the EMDK for a decoded label and deliver it. `running`
+    // is volatile and cleared with InterlockedExchange, so the compiler cannot
+    // hoist the load out of the loop.
+    while (state->running) {
         // Only issue reads while the scanner is enabled; otherwise idle so we
         // don't spin on immediate error returns.
-        if (!pThis->m_enabled || pThis->m_scannerHandle == NULL ||
-            pThis->m_scanBuffer == NULL) {
+        if (!state->enabled || state->scannerHandle == NULL ||
+            state->scanBuffer == NULL) {
             Sleep(100);
             continue;
         }
@@ -352,21 +511,21 @@ DWORD WINAPI ScannerHAL::ScanThread(LPVOID param)
         // SCAN_ReadLabelWait(handle, buffer, timeoutMs) - it delivers exactly
         // the "on E_SCN_SUCCESS with data" semantics used below. Both symbols
         // are declared in the shim / vendor header.
-        DWORD result = SCAN_ReadLabelWait((SCAN_HANDLE)pThis->m_scannerHandle,
-                                          pThis->m_scanBuffer,
+        DWORD result = SCAN_ReadLabelWait((SCAN_HANDLE)state->scannerHandle,
+                                          state->scanBuffer,
                                           1000); // 1 second timeout
 
         if (result == E_SCN_SUCCESS) {
-            DWORD dataLen = SCNBUF_GETLEN(pThis->m_scanBuffer);
-            const char* rawData = (const char*)SCNBUF_GETDATA(pThis->m_scanBuffer);
+            DWORD dataLen = SCNBUF_GETLEN(state->scanBuffer);
+            const char* rawData = (const char*)SCNBUF_GETDATA(state->scanBuffer);
 
             if (dataLen > 0 && rawData != NULL) {
                 // Convert the decoded bytes to TCHAR. On-device TCHAR is WCHAR,
                 // so MultiByteToWideChar performs the real narrow->wide
                 // conversion; on the host TCHAR is char and it is a bounded
                 // copy. Clamp to the local buffer and NUL-terminate.
-                const int kMaxChars = 255;
-                TCHAR barcode[256];
+                const int kMaxChars = (int)MAX_BARCODE_CHARS - 1;
+                TCHAR barcode[MAX_BARCODE_CHARS];
                 int copyLen = (dataLen < (DWORD)kMaxChars) ? (int)dataLen : kMaxChars;
                 int cch = MultiByteToWideChar(CP_ACP, 0, rawData, copyLen,
                                               barcode, kMaxChars);
@@ -374,29 +533,23 @@ DWORD WINAPI ScannerHAL::ScanThread(LPVOID param)
                 if (cch > kMaxChars) cch = kMaxChars;
                 barcode[cch] = (TCHAR)0;
 
-                // Store last barcode (free the previous one first).
-                if (pThis->m_lastBarcode) {
-                    delete[] pThis->m_lastBarcode;
-                    pThis->m_lastBarcode = NULL;
-                }
-                int len = lstrlen(barcode) + 1;
-                pThis->m_lastBarcode = new TCHAR[len];
-                lstrcpy(pThis->m_lastBarcode, barcode);
-
-                // Notify the listener.
-                if (pThis->m_callback) {
-                    pThis->m_callback(barcode, pThis->m_callbackUserData);
-                }
+                DeliverScan(state, barcode);
             }
         }
         // On timeout / other codes just loop again and re-check the run flag.
-#else
-        // For simulation, just sleep
-        Sleep(100);
-#endif
     }
 
+    // Releases the thread's own reference; frees the state (and the scanner)
+    // if the ScannerHAL gave up waiting and already let go of its own.
+    ReleaseState(state);
     return 0;
+#else
+    // No monitor thread exists in the simulation build - scans are delivered
+    // synchronously by InjectScan / TriggerScan - so this is never entered. It
+    // stays compiled so both configurations keep type-checking the entry point.
+    (void)param;
+    return 0;
+#endif
 }
 
 } // namespace HBX

@@ -1,8 +1,40 @@
 #include "../../include/Models/Location.hpp"
 #include "../../include/Models/JsonLite.hpp"
+#include "../../include/StrUtil.hpp"
 
 namespace HBX {
 namespace Models {
+
+namespace {
+
+// Appends `"key":"escaped value"` to an object under construction, inserting
+// the separating comma only when something has already been written.
+void AppendField(Str::Buffer& out, bool* first, const TCHAR* key, const TCHAR* value)
+{
+    if (!value) {
+        return;
+    }
+    if (!*first) {
+        out.AppendChar((TCHAR)',');
+    }
+    *first = false;
+    out.AppendJsonPair(key, value);
+}
+
+// Reads one string field at its full length; extracting through a shared fixed
+// buffer would silently cap every field.
+void AssignField(const JsonLite& parser, const TCHAR* key, Location* location,
+                 void (Location::*setter)(const TCHAR*))
+{
+    TCHAR* value = parser.GetStringAlloc(key);
+    if (!value) {
+        return;
+    }
+    (location->*setter)(value);
+    delete[] value;
+}
+
+} // namespace
 
 Location::Location()
     : m_id(NULL)
@@ -102,78 +134,37 @@ bool Location::FromJson(const TCHAR* json)
     }
 
     // Extract fields
-    TCHAR buffer[512];
-
-    if (parser.GetString(TEXT("id"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
-        SetId(buffer);
-    }
-
-    if (parser.GetString(TEXT("name"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
-        SetName(buffer);
-    }
-
-    if (parser.GetString(TEXT("description"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
-        SetDescription(buffer);
-    }
-
-    if (parser.GetString(TEXT("parentId"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
-        SetParentId(buffer);
-    }
-
-    if (parser.GetString(TEXT("path"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
-        SetPath(buffer);
-    }
+    AssignField(parser, TEXT("id"),          this, &Location::SetId);
+    AssignField(parser, TEXT("name"),        this, &Location::SetName);
+    AssignField(parser, TEXT("description"), this, &Location::SetDescription);
+    AssignField(parser, TEXT("parentId"),    this, &Location::SetParentId);
+    AssignField(parser, TEXT("path"),        this, &Location::SetPath);
 
     return IsValid();
 }
 
 TCHAR* Location::ToJson() const
 {
-    // Build JSON string manually
-    TCHAR* json = new TCHAR[2048];
-    int pos = 0;
+    // Same construction as Item::ToJson: a growable buffer with escaped values,
+    // since the fields are caller-sized and a location name can legitimately
+    // contain a quote or a slash.
+    Str::Buffer out;
+    out.AppendChar((TCHAR)'{');
 
-    json[pos++] = '{';
+    bool first = true;
+    AppendField(out, &first, TEXT("id"),          m_id);
+    AppendField(out, &first, TEXT("name"),        m_name);
+    AppendField(out, &first, TEXT("description"), m_description);
+    AppendField(out, &first, TEXT("parentId"),    m_parentId);
+    AppendField(out, &first, TEXT("path"),        m_path);
 
-    // Add id
-    if (m_id) {
-        wsprintf(json + pos, TEXT("\"id\":\"%s\","), m_id);
-        pos = lstrlen(json);
+    out.AppendChar((TCHAR)'}');
+
+    if (out.Failed()) {
+        return NULL;
     }
 
-    // Add name
-    if (m_name) {
-        wsprintf(json + pos, TEXT("\"name\":\"%s\","), m_name);
-        pos = lstrlen(json);
-    }
-
-    // Add description
-    if (m_description) {
-        wsprintf(json + pos, TEXT("\"description\":\"%s\","), m_description);
-        pos = lstrlen(json);
-    }
-
-    // Add parentId
-    if (m_parentId) {
-        wsprintf(json + pos, TEXT("\"parentId\":\"%s\","), m_parentId);
-        pos = lstrlen(json);
-    }
-
-    // Add path (remove trailing comma)
-    if (m_path) {
-        wsprintf(json + pos, TEXT("\"path\":\"%s\""), m_path);
-        pos = lstrlen(json);
-    } else {
-        // Remove trailing comma if exists
-        if (pos > 1 && json[pos - 1] == ',') {
-            pos--;
-        }
-    }
-
-    json[pos++] = '}';
-    json[pos] = '\0';
-
-    return json;
+    return out.Detach();
 }
 
 bool Location::IsValid() const

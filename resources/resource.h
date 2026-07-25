@@ -4,7 +4,9 @@
 // Application icons
 #define IDI_APPICON                     100
 
-// Windows Mobile soft-key menu bar + the popup menu it hosts
+// Windows Mobile soft-key menu bar + the popup menu it hosts.
+// SHCreateMenuBar is given IDR_MENUBAR; the first field of that SHMENUBAR
+// template names IDM_MAINMENU, the MENU resource the popups come from.
 #define IDR_MENUBAR                     101
 #define IDM_MAINMENU                    102
 
@@ -14,6 +16,8 @@
 #define IDM_VIEW_SCAN                   1010
 #define IDM_VIEW_QUEUE                  1011
 #define IDM_ACTION_SYNC                 1012
+#define IDM_VIEW_ITEM                   1013
+#define IDM_ACTION_SETLOC               1014
 
 // Control IDs
 #define IDC_SCAN_BUTTON                 2001

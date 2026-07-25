@@ -1,8 +1,87 @@
 #include "../include/HbClient.hpp"
+#include "../include/StrUtil.hpp"
 #include <string.h>
 #include <wchar.h>
 
 namespace HBX {
+
+namespace {
+
+/**
+ * Builds "<prefix><id><suffix>" into a bounded buffer.
+ *
+ * Returns false instead of truncating: ids and barcodes come from the server
+ * or from a queued journal payload and are not length-limited, and a shortened
+ * id addresses a different record (or none) on the server.
+ */
+bool BuildEndpoint(TCHAR* dst, int cap, const TCHAR* prefix, const TCHAR* id, const TCHAR* suffix)
+{
+    if (!Str::Copy(dst, cap, prefix)) {
+        return false;
+    }
+    if (!Str::Append(dst, cap, id)) {
+        return false;
+    }
+    if (suffix && !Str::Append(dst, cap, suffix)) {
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Extracts the value of the "token" member of an auth response.
+ *
+ * Returns a heap copy (caller delete[]s) only when the value really is a
+ * non-empty JSON string. A null, a number or "" must not be accepted: doing so
+ * left the client convinced it was authenticated while carrying a garbage
+ * bearer token, and every later call failed with an unhelpful 401.
+ */
+TCHAR* ExtractAuthToken(const TCHAR* response)
+{
+    if (!response) {
+        return NULL;
+    }
+
+    const TCHAR* p = wcsstr(response, TEXT("\"token\""));
+    if (!p) {
+        return NULL;
+    }
+    p += 7; // past the quoted key
+
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+        p++;
+    }
+    if (*p != ':') {
+        return NULL;
+    }
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+        p++;
+    }
+    if (*p != '"') {
+        return NULL; // not a string value
+    }
+    p++;
+
+    const TCHAR* end = p;
+    while (*end != '\0' && *end != '"') {
+        if (*end == '\\' && end[1] != '\0') {
+            end++; // an escaped quote does not end the string
+        }
+        end++;
+    }
+    if (*end != '"') {
+        return NULL; // unterminated string
+    }
+
+    int tokenLen = (int)(end - p);
+    if (tokenLen == 0) {
+        return NULL;
+    }
+    return Str::DupN(p, tokenLen);
+}
+
+} // namespace
 
 HbClient::HbClient()
     : m_httpClient(NULL)
@@ -36,70 +115,51 @@ bool HbClient::Authenticate(const TCHAR* deviceId, const TCHAR* apiKey)
         return false;
     }
 
+    // Drop any previous session first, so the request that asks for a new
+    // token does not carry the stale bearer header.
+    m_authenticated = false;
+    if (m_authToken) {
+        delete[] m_authToken;
+        m_authToken = NULL;
+    }
+
     // Remember the device id so later requests (e.g. sync) can identify us.
     if (m_deviceId) {
         delete[] m_deviceId;
     }
-    m_deviceId = new TCHAR[lstrlen(deviceId) + 1];
-    lstrcpy(m_deviceId, deviceId);
+    m_deviceId = Str::Dup(deviceId);
+    if (!m_deviceId) {
+        return false;
+    }
 
-    // Build authentication request body
-    TCHAR requestBody[1024];
-    wsprintf(requestBody,
-        TEXT("{\"deviceId\":\"%s\",\"apiKey\":\"%s\"}"),
-        deviceId, apiKey);
+    // Build authentication request body. Both values are JSON-escaped and the
+    // buffer grows to fit: hb_conf.json allows credentials several hundred
+    // characters long, which no longer has to match a fixed request buffer.
+    Str::Buffer requestBody;
+    requestBody.AppendChar((TCHAR)'{');
+    requestBody.AppendJsonPair(TEXT("deviceId"), deviceId);
+    requestBody.AppendChar((TCHAR)',');
+    requestBody.AppendJsonPair(TEXT("apiKey"), apiKey);
+    requestBody.AppendChar((TCHAR)'}');
+    if (requestBody.Failed()) {
+        return false;
+    }
 
     // Make authentication request
-    TCHAR response[4096];
-    bool success = MakeApiRequest(TEXT("POST"), TEXT("/api/v1/auth/device"), requestBody, response, sizeof(response) / sizeof(TCHAR));
-
-    if (!success) {
-        m_authenticated = false;
+    TCHAR* response = NULL;
+    if (!MakeApiRequest(TEXT("POST"), TEXT("/api/v1/auth/device"), requestBody.Get(), &response)) {
         return false;
     }
 
-    // Parse token from response
-    // Expected format: {"token": "..."}
-    const TCHAR* tokenStart = wcsstr(response, TEXT("\"token\""));
-    if (!tokenStart) {
-        m_authenticated = false;
+    // Parse token from response; expected format: {"token": "..."}
+    TCHAR* token = ExtractAuthToken(response);
+    delete[] response;
+
+    if (!token) {
         return false;
     }
 
-    // Find the token value
-    tokenStart = wcsstr(tokenStart, TEXT(":"));
-    if (!tokenStart) {
-        m_authenticated = false;
-        return false;
-    }
-
-    // Skip whitespace and opening quote
-    tokenStart++;
-    while (*tokenStart == ' ' || *tokenStart == '\t') {
-        tokenStart++;
-    }
-    if (*tokenStart == '"') {
-        tokenStart++;
-    }
-
-    // Find closing quote
-    const TCHAR* tokenEnd = wcsstr(tokenStart, TEXT("\""));
-    if (!tokenEnd) {
-        m_authenticated = false;
-        return false;
-    }
-
-    // Extract token
-    int tokenLen = tokenEnd - tokenStart;
-    if (m_authToken) {
-        delete[] m_authToken;
-    }
-    m_authToken = new TCHAR[tokenLen + 1];
-    for (int i = 0; i < tokenLen; i++) {
-        m_authToken[i] = tokenStart[i];
-    }
-    m_authToken[tokenLen] = '\0';
-
+    m_authToken = token;
     m_authenticated = true;
     return true;
 }
@@ -130,18 +190,22 @@ bool HbClient::GetItem(const TCHAR* barcode, Models::Item* item)
 
     // Build endpoint URL
     TCHAR endpoint[512];
-    wsprintf(endpoint, TEXT("/api/v1/items/%s"), barcode);
+    if (!BuildEndpoint(endpoint, sizeof(endpoint) / sizeof(TCHAR),
+                       TEXT("/api/v1/items/"), barcode, NULL)) {
+        return false;
+    }
 
     // Make GET request
-    TCHAR response[8192];
-    bool success = MakeApiRequest(TEXT("GET"), endpoint, NULL, response, sizeof(response) / sizeof(TCHAR));
-
-    if (!success) {
+    TCHAR* response = NULL;
+    if (!MakeApiRequest(TEXT("GET"), endpoint, NULL, &response)) {
         return false;
     }
 
     // Parse JSON response into Item object
-    return item->FromJson(response);
+    bool parsed = item->FromJson(response);
+    delete[] response;
+
+    return parsed;
 }
 
 bool HbClient::UpdateItemLocation(const TCHAR* barcode, const TCHAR* locationId)
@@ -156,15 +220,22 @@ bool HbClient::UpdateItemLocation(const TCHAR* barcode, const TCHAR* locationId)
 
     // Build endpoint URL
     TCHAR endpoint[512];
-    wsprintf(endpoint, TEXT("/api/v1/items/%s/location"), barcode);
+    if (!BuildEndpoint(endpoint, sizeof(endpoint) / sizeof(TCHAR),
+                       TEXT("/api/v1/items/"), barcode, TEXT("/location"))) {
+        return false;
+    }
 
     // Build request body
-    TCHAR requestBody[512];
-    wsprintf(requestBody, TEXT("{\"locationId\":\"%s\"}"), locationId);
+    Str::Buffer requestBody;
+    requestBody.AppendChar((TCHAR)'{');
+    requestBody.AppendJsonPair(TEXT("locationId"), locationId);
+    requestBody.AppendChar((TCHAR)'}');
+    if (requestBody.Failed()) {
+        return false;
+    }
 
     // Make PATCH request (using PUT as fallback)
-    TCHAR response[4096];
-    return MakeApiRequest(TEXT("PUT"), endpoint, requestBody, response, sizeof(response) / sizeof(TCHAR));
+    return MakeApiRequest(TEXT("PUT"), endpoint, requestBody.Get(), NULL);
 }
 
 bool HbClient::CreateItem(const Models::Item* item)
@@ -184,8 +255,7 @@ bool HbClient::CreateItem(const Models::Item* item)
     }
 
     // Make POST request
-    TCHAR response[4096];
-    bool success = MakeApiRequest(TEXT("POST"), TEXT("/api/v1/items"), requestBody, response, sizeof(response) / sizeof(TCHAR));
+    bool success = MakeApiRequest(TEXT("POST"), TEXT("/api/v1/items"), requestBody, NULL);
 
     // Cleanup
     delete[] requestBody;
@@ -205,7 +275,10 @@ bool HbClient::UpdateItem(const Models::Item* item)
 
     // Build endpoint URL
     TCHAR endpoint[512];
-    wsprintf(endpoint, TEXT("/api/v1/items/%s"), item->GetId());
+    if (!BuildEndpoint(endpoint, sizeof(endpoint) / sizeof(TCHAR),
+                       TEXT("/api/v1/items/"), item->GetId(), NULL)) {
+        return false;
+    }
 
     // Serialize item to JSON
     TCHAR* requestBody = item->ToJson();
@@ -214,8 +287,7 @@ bool HbClient::UpdateItem(const Models::Item* item)
     }
 
     // Make PUT request
-    TCHAR response[4096];
-    bool success = MakeApiRequest(TEXT("PUT"), endpoint, requestBody, response, sizeof(response) / sizeof(TCHAR));
+    bool success = MakeApiRequest(TEXT("PUT"), endpoint, requestBody, NULL);
 
     // Cleanup
     delete[] requestBody;
@@ -235,18 +307,22 @@ bool HbClient::GetLocation(const TCHAR* locationId, Models::Location* location)
 
     // Build endpoint URL
     TCHAR endpoint[512];
-    wsprintf(endpoint, TEXT("/api/v1/locations/%s"), locationId);
+    if (!BuildEndpoint(endpoint, sizeof(endpoint) / sizeof(TCHAR),
+                       TEXT("/api/v1/locations/"), locationId, NULL)) {
+        return false;
+    }
 
     // Make GET request
-    TCHAR response[8192];
-    bool success = MakeApiRequest(TEXT("GET"), endpoint, NULL, response, sizeof(response) / sizeof(TCHAR));
-
-    if (!success) {
+    TCHAR* response = NULL;
+    if (!MakeApiRequest(TEXT("GET"), endpoint, NULL, &response)) {
         return false;
     }
 
     // Parse JSON response into Location object
-    return location->FromJson(response);
+    bool parsed = location->FromJson(response);
+    delete[] response;
+
+    return parsed;
 }
 
 bool HbClient::GetAllLocations(Models::Location** locations, int* count)
@@ -262,11 +338,10 @@ bool HbClient::GetAllLocations(Models::Location** locations, int* count)
         return false;
     }
 
-    // Make GET request
-    TCHAR response[16384]; // Larger buffer for array response
-    bool success = MakeApiRequest(TEXT("GET"), TEXT("/api/v1/locations"), NULL, response, sizeof(response) / sizeof(TCHAR));
-
-    if (!success) {
+    // Make GET request. The array response is kept on the heap: a location
+    // list can be arbitrarily long and must not be sized by a stack buffer.
+    TCHAR* response = NULL;
+    if (!MakeApiRequest(TEXT("GET"), TEXT("/api/v1/locations"), NULL, &response)) {
         return false;
     }
 
@@ -287,11 +362,16 @@ bool HbClient::GetAllLocations(Models::Location** locations, int* count)
     }
 
     if (locationCount == 0) {
+        delete[] response;
         return true; // Empty array is valid
     }
 
     // Allocate array for locations
     Models::Location* locArray = new Models::Location[locationCount];
+    if (!locArray) {
+        delete[] response;
+        return false;
+    }
     int currentLoc = 0;
 
     // Parse each location object
@@ -318,12 +398,11 @@ bool HbClient::GetAllLocations(Models::Location** locations, int* count)
 
             if (*objEnd == '}') {
                 // Extract object JSON
-                int objLen = objEnd - objStart + 1;
-                TCHAR* objJson = new TCHAR[objLen + 1];
-                for (int i = 0; i < objLen; i++) {
-                    objJson[i] = objStart[i];
+                int objLen = (int)(objEnd - objStart) + 1;
+                TCHAR* objJson = Str::DupN(objStart, objLen);
+                if (!objJson) {
+                    break;
                 }
-                objJson[objLen] = '\0';
 
                 // Parse into location object; only keep it if it is valid so
                 // callers never receive half-parsed / empty Location entries.
@@ -338,6 +417,8 @@ bool HbClient::GetAllLocations(Models::Location** locations, int* count)
             }
         }
     }
+
+    delete[] response;
 
     // If nothing valid was parsed, hand back an empty result rather than an
     // array of default-constructed (invalid) Location objects.
@@ -371,46 +452,27 @@ bool HbClient::SyncPendingTransactions(const TCHAR* const* transactions, int cou
 
     // Build the batch body:
     //   {"deviceId":"<id>","transactions":["<t0>","<t1>",...]}
-    // Size the buffer for the worst case where every character needs escaping.
-    int capacity = 128 + (m_deviceId ? lstrlen(m_deviceId) : 0);
-    for (int i = 0; i < count; i++) {
-        if (transactions && transactions[i]) {
-            capacity += lstrlen(transactions[i]) * 2 + 8;
-        } else {
-            capacity += 8;
-        }
-    }
-
-    TCHAR* body = new TCHAR[capacity];
-    int pos = 0;
-    pos += wsprintf(body + pos, TEXT("{\"deviceId\":\"%s\",\"transactions\":["),
-        m_deviceId ? m_deviceId : TEXT(""));
+    // Every value goes through the JSON escaper, including the device id: it
+    // comes from hb_conf.json and a quote or backslash in it used to produce a
+    // body the server could only reject.
+    Str::Buffer body;
+    body.AppendChar((TCHAR)'{');
+    body.AppendJsonPair(TEXT("deviceId"), m_deviceId ? m_deviceId : TEXT(""));
+    body.Append(TEXT(",\"transactions\":["));
 
     for (int i = 0; i < count; i++) {
         if (i > 0) {
-            body[pos++] = ',';
+            body.AppendChar((TCHAR)',');
         }
-        body[pos++] = '"';
-        const TCHAR* t = (transactions && transactions[i]) ? transactions[i] : TEXT("");
-        for (int j = 0; t[j] != '\0'; j++) {
-            TCHAR c = t[j];
-            if (c == '"' || c == '\\') {
-                body[pos++] = '\\';   // JSON-escape quotes and backslashes
-            }
-            body[pos++] = c;
-        }
-        body[pos++] = '"';
+        body.AppendJsonString((transactions && transactions[i]) ? transactions[i] : TEXT(""));
     }
-    body[pos++] = ']';
-    body[pos++] = '}';
-    body[pos] = '\0';
 
-    TCHAR response[8192];
-    bool success = MakeApiRequest(TEXT("POST"), TEXT("/api/v1/sync"), body, response,
-        sizeof(response) / sizeof(TCHAR));
+    body.Append(TEXT("]}"));
+    if (body.Failed()) {
+        return false;
+    }
 
-    delete[] body;
-    return success;
+    return MakeApiRequest(TEXT("POST"), TEXT("/api/v1/sync"), body.Get(), NULL);
 }
 
 void HbClient::SetBaseUrl(const TCHAR* baseUrl)
@@ -419,9 +481,7 @@ void HbClient::SetBaseUrl(const TCHAR* baseUrl)
         delete[] m_baseUrl;
     }
     if (baseUrl) {
-        int len = lstrlen(baseUrl) + 1;
-        m_baseUrl = new TCHAR[len];
-        lstrcpy(m_baseUrl, baseUrl);
+        m_baseUrl = Str::Dup(baseUrl);
     } else {
         m_baseUrl = NULL;
     }
@@ -432,15 +492,24 @@ const TCHAR* HbClient::GetBaseUrl() const
     return m_baseUrl;
 }
 
-bool HbClient::MakeApiRequest(const TCHAR* method, const TCHAR* endpoint, const TCHAR* body, TCHAR* response, DWORD maxResponseLen)
+bool HbClient::MakeApiRequest(const TCHAR* method, const TCHAR* endpoint, const TCHAR* body, TCHAR** response)
 {
+    if (response) {
+        *response = NULL;
+    }
     if (!m_httpClient || !m_baseUrl || !method || !endpoint) {
         return false;
     }
 
-    // Build full URL
-    TCHAR fullUrl[1024];
-    wsprintf(fullUrl, TEXT("%s%s"), m_baseUrl, endpoint);
+    // Build full URL. Base URL (configuration) and endpoint (item ids) are both
+    // variable length, so the URL grows to fit instead of being formatted into
+    // a fixed buffer that wsprintf would overrun or silently cut short.
+    Str::Buffer fullUrl;
+    fullUrl.Append(m_baseUrl);
+    fullUrl.Append(endpoint);
+    if (fullUrl.Failed()) {
+        return false;
+    }
 
     // Set authentication headers
     SetAuthHeaders();
@@ -450,16 +519,19 @@ bool HbClient::MakeApiRequest(const TCHAR* method, const TCHAR* endpoint, const 
     bool success = false;
 
     if (lstrcmp(method, TEXT("GET")) == 0) {
-        success = m_httpClient->Get(fullUrl, &httpResponse);
+        success = m_httpClient->Get(fullUrl.Get(), &httpResponse);
     } else if (lstrcmp(method, TEXT("POST")) == 0) {
-        success = m_httpClient->Post(fullUrl, body, &httpResponse);
+        success = m_httpClient->Post(fullUrl.Get(), body, &httpResponse);
     } else if (lstrcmp(method, TEXT("PUT")) == 0) {
-        success = m_httpClient->Put(fullUrl, body, &httpResponse);
+        success = m_httpClient->Put(fullUrl.Get(), body, &httpResponse);
     } else if (lstrcmp(method, TEXT("DELETE")) == 0) {
-        success = m_httpClient->Delete(fullUrl, &httpResponse);
+        success = m_httpClient->Delete(fullUrl.Get(), &httpResponse);
     }
 
     if (!success) {
+        if (httpResponse.body) {
+            delete[] httpResponse.body;
+        }
         return false;
     }
 
@@ -471,21 +543,20 @@ bool HbClient::MakeApiRequest(const TCHAR* method, const TCHAR* endpoint, const 
         return false;
     }
 
-    // Copy response body to output buffer
-    if (httpResponse.body && response && maxResponseLen > 0) {
-        int len = lstrlen(httpResponse.body);
-        if (len >= (int)maxResponseLen) {
-            len = maxResponseLen - 1;
+    // Hand the complete body to the caller; no truncation, no second copy.
+    TCHAR* payload = httpResponse.body;
+    httpResponse.body = NULL;
+    if (!payload) {
+        payload = Str::Dup(TEXT(""));
+        if (!payload) {
+            return false;
         }
-        for (int i = 0; i < len; i++) {
-            response[i] = httpResponse.body[i];
-        }
-        response[len] = '\0';
     }
 
-    // Cleanup
-    if (httpResponse.body) {
-        delete[] httpResponse.body;
+    if (response) {
+        *response = payload;
+    } else {
+        delete[] payload;
     }
 
     return true;
@@ -500,15 +571,20 @@ void HbClient::SetAuthHeaders()
     // Clear existing headers
     m_httpClient->ClearHeaders();
 
-    // Set standard headers
-    m_httpClient->AddHeader(TEXT("Content-Type"), TEXT("application/json"));
+    // Set standard headers. Bodies go on the wire as UTF-8 on both transports,
+    // so the charset is stated explicitly.
+    m_httpClient->AddHeader(TEXT("Content-Type"), TEXT("application/json; charset=utf-8"));
     m_httpClient->AddHeader(TEXT("Accept"), TEXT("application/json"));
 
-    // Set authorization header if authenticated
+    // Set authorization header if authenticated. The token is server-issued and
+    // has no length limit, so the header is built in a growable buffer.
     if (m_authToken) {
-        TCHAR authHeader[512];
-        wsprintf(authHeader, TEXT("Bearer %s"), m_authToken);
-        m_httpClient->AddHeader(TEXT("Authorization"), authHeader);
+        Str::Buffer authHeader;
+        authHeader.Append(TEXT("Bearer "));
+        authHeader.Append(m_authToken);
+        if (!authHeader.Failed()) {
+            m_httpClient->AddHeader(TEXT("Authorization"), authHeader.Get());
+        }
     }
 }
 

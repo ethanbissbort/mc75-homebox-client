@@ -1,4 +1,5 @@
 #include "../include/HttpClient.hpp"
+#include "../include/StrUtil.hpp"
 #include <string.h>
 
 #ifdef HBX_USE_WININET
@@ -8,7 +9,338 @@
 #include <wininet.h>
 #endif
 
+#if !defined(UNDER_CE) && !defined(_WIN32) && !defined(WIN32)
+// POSIX takes SO_RCVTIMEO / SO_SNDTIMEO as a struct timeval, not as the DWORD
+// of milliseconds WinSock expects (see Connect).
+#include <sys/time.h>
+#endif
+
 namespace HBX {
+
+namespace {
+
+// Hard ceiling on one HTTP response. The MC75 has very little usable heap, so
+// a runaway (or hostile) reply must not be allowed to grow until the allocator
+// gives up: it is reported as a failed request instead.
+const int kMaxResponseBytes = 512 * 1024;
+
+// Framing state of a chunked body.
+const int kChunkIncomplete = 0;
+const int kChunkComplete   = 1;
+const int kChunkMalformed  = -1;
+
+/**
+ * Growable byte buffer for raw wire bytes. Always keeps a NUL one past the
+ * last byte, so anything that scans the buffer as a C string stops at the end
+ * of the received data instead of running into uninitialised memory.
+ */
+class ByteBuffer {
+public:
+    ByteBuffer() : m_data(NULL), m_len(0), m_cap(0), m_failed(false) {}
+    ~ByteBuffer() { delete[] m_data; }
+
+    bool Append(const char* data, int n)
+    {
+        if (n <= 0) {
+            return !m_failed;
+        }
+        if (!Reserve(n)) {
+            return false;
+        }
+        for (int i = 0; i < n; i++) {
+            m_data[m_len + i] = data[i];
+        }
+        m_len += n;
+        m_data[m_len] = '\0';
+        return true;
+    }
+
+    // NULL while empty; every caller checks Length() first.
+    char* Data() { return m_data; }
+    int Length() const { return m_len; }
+    bool Failed() const { return m_failed; }
+
+private:
+    bool Reserve(int extra)
+    {
+        if (m_failed) {
+            return false;
+        }
+        int needed = m_len + extra + 1;
+        if (needed <= m_cap) {
+            return true;
+        }
+
+        int newCap = (m_cap > 0) ? m_cap : 4096;
+        while (newCap < needed) {
+            if (newCap > kMaxResponseBytes) {
+                m_failed = true;
+                return false;
+            }
+            newCap *= 2;
+        }
+
+        char* grown = new char[newCap];
+        if (!grown) {
+            m_failed = true;
+            return false;
+        }
+        for (int i = 0; i < m_len; i++) {
+            grown[i] = m_data[i];
+        }
+        grown[m_len] = '\0';
+
+        delete[] m_data;
+        m_data = grown;
+        m_cap = newCap;
+        return true;
+    }
+
+    char* m_data;
+    int m_len;
+    int m_cap;
+    bool m_failed;
+
+    ByteBuffer(const ByteBuffer&);
+    ByteBuffer& operator=(const ByteBuffer&);
+};
+
+// Enters a critical section for the duration of a scope. Win32/WinCE critical
+// sections are recursive, so a helper that re-locks is harmless.
+class ScopedLock {
+public:
+    explicit ScopedLock(CRITICAL_SECTION* cs) : m_cs(cs) { EnterCriticalSection(m_cs); }
+    ~ScopedLock() { LeaveCriticalSection(m_cs); }
+
+private:
+    CRITICAL_SECTION* m_cs;
+
+    ScopedLock(const ScopedLock&);
+    ScopedLock& operator=(const ScopedLock&);
+};
+
+// Index just past the "\r\n\r\n" that ends the header block, or -1 when the
+// headers are not complete yet. Scans only the bytes actually received.
+int FindHeaderEnd(const char* buf, int len)
+{
+    if (!buf) {
+        return -1;
+    }
+    for (int i = 0; i + 3 < len; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n' &&
+            buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+            return i + 4;
+        }
+    }
+    return -1;
+}
+
+// Case-insensitive ASCII comparison of the span [p, p+len) with `lower`, which
+// must already be lowercase. Header names are ASCII by definition.
+bool SpanEqualsNoCase(const char* p, int len, const char* lower)
+{
+    int i = 0;
+    for (; i < len && lower[i] != '\0'; i++) {
+        char c = p[i];
+        if (c >= 'A' && c <= 'Z') {
+            c = (char)(c - 'A' + 'a');
+        }
+        if (c != lower[i]) {
+            return false;
+        }
+    }
+    return (i == len && lower[i] == '\0');
+}
+
+// Pulls the framing headers out of the response header block. contentLength is
+// -1 when absent; a value larger than the response ceiling is clamped so the
+// caller rejects it rather than overflowing while counting.
+void ParseFramingHeaders(const char* buf, int headerEnd, long* contentLength, bool* chunked)
+{
+    *contentLength = -1;
+    *chunked = false;
+
+    int i = 0;
+    // Skip the status line.
+    while (i + 1 < headerEnd && !(buf[i] == '\r' && buf[i + 1] == '\n')) {
+        i++;
+    }
+    i += 2;
+
+    while (i < headerEnd) {
+        int lineStart = i;
+        while (i + 1 < headerEnd && !(buf[i] == '\r' && buf[i + 1] == '\n')) {
+            i++;
+        }
+        int lineEnd = i;
+        i += 2;
+
+        if (lineEnd <= lineStart) {
+            break; // empty line: end of the header block
+        }
+
+        int colon = lineStart;
+        while (colon < lineEnd && buf[colon] != ':') {
+            colon++;
+        }
+        if (colon >= lineEnd) {
+            continue;
+        }
+
+        int valueStart = colon + 1;
+        while (valueStart < lineEnd && (buf[valueStart] == ' ' || buf[valueStart] == '\t')) {
+            valueStart++;
+        }
+
+        if (SpanEqualsNoCase(buf + lineStart, colon - lineStart, "content-length")) {
+            long value = 0;
+            bool anyDigit = false;
+            for (int k = valueStart; k < lineEnd && buf[k] >= '0' && buf[k] <= '9'; k++) {
+                if (value > kMaxResponseBytes) {
+                    value = (long)kMaxResponseBytes + 1;
+                    anyDigit = true;
+                    break;
+                }
+                value = value * 10 + (buf[k] - '0');
+                anyDigit = true;
+            }
+            if (anyDigit) {
+                *contentLength = value;
+            }
+        } else if (SpanEqualsNoCase(buf + lineStart, colon - lineStart, "transfer-encoding")) {
+            // "chunked" is always the final coding when it is present at all.
+            for (int k = valueStart; k + 7 <= lineEnd; k++) {
+                if (SpanEqualsNoCase(buf + k, 7, "chunked")) {
+                    *chunked = true;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Walks a chunked body starting at `start`. When `out` is non-NULL the
+ * de-framed bytes are written there (decoding only ever shrinks the data, so
+ * writing back into the same buffer at `start` is safe). Returns
+ * kChunkComplete once the terminating zero-length chunk is seen,
+ * kChunkIncomplete while more bytes are needed, kChunkMalformed on a chunk
+ * header that is not hexadecimal or is larger than the response ceiling.
+ */
+int ScanChunkedBody(const char* buf, int start, int len, char* out, int* outLen)
+{
+    int pos = start;
+    int written = 0;
+
+    for (;;) {
+        int lineEnd = -1;
+        for (int i = pos; i + 1 < len; i++) {
+            if (buf[i] == '\r' && buf[i + 1] == '\n') {
+                lineEnd = i;
+                break;
+            }
+        }
+        if (lineEnd < 0) {
+            return kChunkIncomplete;
+        }
+
+        long size = 0;
+        bool anyDigit = false;
+        for (int i = pos; i < lineEnd; i++) {
+            char c = buf[i];
+            int digit;
+            if (c >= '0' && c <= '9') {
+                digit = c - '0';
+            } else if (c >= 'a' && c <= 'f') {
+                digit = c - 'a' + 10;
+            } else if (c >= 'A' && c <= 'F') {
+                digit = c - 'A' + 10;
+            } else {
+                break; // chunk extension (";...") or trailing whitespace
+            }
+            size = size * 16 + digit;
+            anyDigit = true;
+            if (size > kMaxResponseBytes) {
+                return kChunkMalformed;
+            }
+        }
+        if (!anyDigit) {
+            return kChunkMalformed;
+        }
+
+        int dataStart = lineEnd + 2;
+        if (size == 0) {
+            // Trailers may follow; the payload is complete either way.
+            if (outLen) {
+                *outLen = written;
+            }
+            return kChunkComplete;
+        }
+        if (dataStart + (int)size + 2 > len) {
+            return kChunkIncomplete; // this chunk (or its CRLF) has not arrived
+        }
+
+        if (out) {
+            memmove(out + written, buf + dataStart, (size_t)size);
+        }
+        written += (int)size;
+        pos = dataStart + (int)size + 2;
+    }
+}
+
+// Extracts the numeric status from "HTTP/1.1 200 OK". Returns 0 when the reply
+// does not start with a status line we understand.
+int ParseStatusLine(const char* buf, int len)
+{
+    if (len < 12 || strncmp(buf, "HTTP/", 5) != 0) {
+        return 0;
+    }
+
+    int i = 0;
+    while (i < len && buf[i] != ' ' && buf[i] != '\r') {
+        i++;
+    }
+    while (i < len && buf[i] == ' ') {
+        i++;
+    }
+
+    int code = 0;
+    int digits = 0;
+    while (i < len && digits < 3 && buf[i] >= '0' && buf[i] <= '9') {
+        code = code * 10 + (buf[i] - '0');
+        i++;
+        digits++;
+    }
+    return (digits == 3) ? code : 0;
+}
+
+// ASCII case-insensitive TCHAR compare, used to detect headers the caller has
+// already supplied. lstrcmpi is locale-aware on the device and unavailable in
+// this form on the host shim, so the comparison is spelled out.
+bool TcharEqualsNoCase(const TCHAR* a, const TCHAR* b)
+{
+    if (!a || !b) {
+        return false;
+    }
+    for (int i = 0; ; i++) {
+        TCHAR ca = a[i];
+        TCHAR cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') {
+            ca = (TCHAR)(ca - 'A' + 'a');
+        }
+        if (cb >= 'A' && cb <= 'Z') {
+            cb = (TCHAR)(cb - 'A' + 'a');
+        }
+        if (ca != cb) {
+            return false;
+        }
+        if (ca == 0) {
+            return true;
+        }
+    }
+}
+
+} // namespace
 
 HttpClient::HttpClient()
     : m_socket(INVALID_SOCKET)
@@ -17,6 +349,8 @@ HttpClient::HttpClient()
     , m_lastError(NULL)
     , m_headers(NULL)
 {
+    InitializeCriticalSection(&m_lock);
+
     // Initialize WinSock
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
@@ -30,6 +364,8 @@ HttpClient::~HttpClient()
         delete[] m_lastError;
     }
     WSACleanup();
+
+    DeleteCriticalSection(&m_lock);
 }
 
 // Each verb dispatches to the WinInet transport when HBX_USE_WININET is defined
@@ -63,6 +399,7 @@ bool HttpClient::Delete(const TCHAR* url, HttpResponse* response)
 
 void HttpClient::SetTimeout(DWORD timeoutMs)
 {
+    ScopedLock guard(&m_lock);
     m_timeoutMs = timeoutMs;
 }
 
@@ -72,16 +409,22 @@ void HttpClient::AddHeader(const TCHAR* key, const TCHAR* value)
         return;
     }
 
+    ScopedLock guard(&m_lock);
+
     // Create new header node
     HttpHeader* newHeader = new HttpHeader();
+    if (!newHeader) {
+        return;
+    }
 
-    int keyLen = lstrlen(key) + 1;
-    newHeader->key = new TCHAR[keyLen];
-    lstrcpy(newHeader->key, key);
-
-    int valueLen = lstrlen(value) + 1;
-    newHeader->value = new TCHAR[valueLen];
-    lstrcpy(newHeader->value, value);
+    newHeader->key = Str::Dup(key);
+    newHeader->value = Str::Dup(value);
+    if (!newHeader->key || !newHeader->value) {
+        delete[] newHeader->key;
+        delete[] newHeader->value;
+        delete newHeader;
+        return;
+    }
 
     // Add to front of list
     newHeader->next = m_headers;
@@ -98,6 +441,37 @@ const TCHAR* HttpClient::GetLastError() const
     return m_lastError;
 }
 
+void HttpClient::SetError(const TCHAR* message)
+{
+    if (m_lastError) {
+        delete[] m_lastError;
+        m_lastError = NULL;
+    }
+    if (message) {
+        m_lastError = Str::Dup(message);
+    }
+}
+
+bool HttpClient::HasHeader(const TCHAR* key) const
+{
+    for (HttpHeader* h = m_headers; h != NULL; h = h->next) {
+        if (TcharEqualsNoCase(h->key, key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void HttpClient::AppendHeaderLines(Str::Buffer* out) const
+{
+    for (HttpHeader* h = m_headers; h != NULL; h = h->next) {
+        out->Append(h->key);
+        out->Append(TEXT(": "));
+        out->Append(h->value);
+        out->Append(TEXT("\r\n"));
+    }
+}
+
 bool HttpClient::SendRequest(const TCHAR* method, const TCHAR* url, const TCHAR* body, HttpResponse* response)
 {
     if (!response) {
@@ -106,12 +480,15 @@ bool HttpClient::SendRequest(const TCHAR* method, const TCHAR* url, const TCHAR*
     response->statusCode = 0;
     response->body = NULL;
 
+    ScopedLock guard(&m_lock);
+
     // Parse URL
     TCHAR host[256];
     TCHAR path[1024];
     int port;
 
-    if (!ParseUrl(url, host, &port, path)) {
+    if (!ParseUrl(url, host, &port, path, 256, 1024)) {
+        SetError(TEXT("Malformed or oversized URL"));
         return false;
     }
 
@@ -120,105 +497,182 @@ bool HttpClient::SendRequest(const TCHAR* method, const TCHAR* url, const TCHAR*
         return false;
     }
 
-    // Build HTTP request
-    char request[4096];
-    char asciiMethod[16], asciiPath[1024], asciiHost[256];
-
-    // Convert to ASCII
-    for (int i = 0; i < 15 && method[i] != '\0'; i++) {
-        asciiMethod[i] = (char)method[i];
+    // Build the request as text first; it is encoded to UTF-8 in one pass
+    // below, so a body outside US-ASCII reaches the server intact.
+    Str::Buffer request;
+    request.Append(method);
+    request.AppendChar((TCHAR)' ');
+    request.Append(path);
+    request.Append(TEXT(" HTTP/1.1\r\nHost: "));
+    request.Append(host);
+    if (port != 80) {
+        request.AppendChar((TCHAR)':');
+        request.AppendInt(port);
     }
-    asciiMethod[15] = '\0';
+    request.Append(TEXT("\r\n"));
 
-    for (int i = 0; i < 1023 && path[i] != '\0'; i++) {
-        asciiPath[i] = (char)path[i];
+    AppendHeaderLines(&request);
+
+    // Read-to-close is the fallback framing for a reply that carries neither
+    // Content-Length nor chunked encoding, so ask the server to close.
+    if (!HasHeader(TEXT("Connection"))) {
+        request.Append(TEXT("Connection: close\r\n"));
     }
-    asciiPath[1023] = '\0';
 
-    for (int i = 0; i < 255 && host[i] != '\0'; i++) {
-        asciiHost[i] = (char)host[i];
-    }
-    asciiHost[255] = '\0';
-
-    // Build request line
-    sprintf(request, "%s %s HTTP/1.1\r\nHost: %s\r\n", asciiMethod, asciiPath, asciiHost);
-
-    // Add custom headers
-    char headerStr[1024];
-    BuildHeaderString(headerStr, 1024);
-    strcat(request, headerStr);
-
-    // Add body if present
-    if (body && lstrlen(body) > 0) {
-        char asciiBody[2048];
-        int bodyLen = 0;
-        for (int i = 0; i < 2047 && body[i] != '\0'; i++) {
-            asciiBody[i] = (char)body[i];
-            bodyLen++;
+    int bodyBytes = 0;
+    if (body && body[0] != '\0') {
+        bodyBytes = Str::Utf8Size(body) - 1; // Content-Length counts wire bytes
+        request.Append(TEXT("Content-Length: "));
+        request.AppendInt(bodyBytes);
+        request.Append(TEXT("\r\n"));
+        if (!HasHeader(TEXT("Content-Type"))) {
+            request.Append(TEXT("Content-Type: application/json; charset=utf-8\r\n"));
         }
-        asciiBody[bodyLen] = '\0';
-
-        char contentLen[64];
-        sprintf(contentLen, "Content-Length: %d\r\n", bodyLen);
-        strcat(request, contentLen);
-        strcat(request, "Content-Type: application/json\r\n");
-        strcat(request, "\r\n");
-        strcat(request, asciiBody);
-    } else {
-        strcat(request, "\r\n");
+    }
+    request.Append(TEXT("\r\n"));
+    if (bodyBytes > 0) {
+        request.Append(body);
     }
 
-    // Send request
-    int sent = send(m_socket, request, strlen(request), 0);
-    if (sent <= 0) {
+    if (request.Failed()) {
         Disconnect();
+        SetError(TEXT("Out of memory building request"));
         return false;
     }
 
-    // Receive response
-    char recvBuffer[8192];
-    int totalReceived = 0;
-    int received;
+    char* wire = Str::ToUtf8Alloc(request.Get());
+    if (!wire) {
+        Disconnect();
+        SetError(TEXT("Out of memory encoding request"));
+        return false;
+    }
 
-    while ((received = recv(m_socket, recvBuffer + totalReceived, sizeof(recvBuffer) - totalReceived - 1, 0)) > 0) {
-        totalReceived += received;
-        if (totalReceived >= sizeof(recvBuffer) - 1) {
+    // send() is allowed to accept only part of the buffer.
+    int wireLen = (int)strlen(wire);
+    int totalSent = 0;
+    bool sendFailed = false;
+    while (totalSent < wireLen) {
+        int sent = send(m_socket, wire + totalSent, wireLen - totalSent, 0);
+        if (sent <= 0) {
+            sendFailed = true;
             break;
         }
-        // Simple check if response is complete (look for end of headers)
-        if (strstr(recvBuffer, "\r\n\r\n")) {
+        totalSent += sent;
+    }
+    delete[] wire;
+
+    if (sendFailed) {
+        Disconnect();
+        SetError(TEXT("Send failed"));
+        return false;
+    }
+
+    // Receive the response. Headers and body are not guaranteed to arrive in
+    // the same segment, so reading stops only once the framing says the body
+    // is complete (Content-Length satisfied, final chunk seen) or the peer
+    // closes the connection.
+    ByteBuffer raw;
+    char chunk[2048];
+    int headerEnd = -1;
+    long contentLength = -1;
+    bool chunked = false;
+    bool overflow = false;
+
+    for (;;) {
+        if (headerEnd < 0) {
+            headerEnd = FindHeaderEnd(raw.Data(), raw.Length());
+            if (headerEnd >= 0) {
+                ParseFramingHeaders(raw.Data(), headerEnd, &contentLength, &chunked);
+            }
+        }
+        if (headerEnd >= 0) {
+            if (chunked) {
+                if (ScanChunkedBody(raw.Data(), headerEnd, raw.Length(), NULL, NULL) != kChunkIncomplete) {
+                    break;
+                }
+            } else if (contentLength >= 0) {
+                if ((long)(raw.Length() - headerEnd) >= contentLength) {
+                    break;
+                }
+            }
+            // Neither framing header present: read until the peer closes.
+        }
+
+        if (raw.Length() >= kMaxResponseBytes) {
+            overflow = true;
+            break;
+        }
+
+        int received = recv(m_socket, chunk, (int)sizeof(chunk), 0);
+        if (received <= 0) {
+            break; // peer closed, or the receive timeout expired
+        }
+        if (!raw.Append(chunk, received)) {
+            overflow = true;
             break;
         }
     }
 
-    recvBuffer[totalReceived] = '\0';
     Disconnect();
 
-    // No bytes received means the request effectively failed.
-    if (totalReceived == 0) {
+    if (overflow || raw.Failed()) {
+        SetError(TEXT("Response too large"));
+        return false;
+    }
+    if (raw.Length() == 0) {
+        SetError(TEXT("No response received"));
+        return false;
+    }
+
+    if (headerEnd < 0) {
+        headerEnd = FindHeaderEnd(raw.Data(), raw.Length());
+        if (headerEnd >= 0) {
+            ParseFramingHeaders(raw.Data(), headerEnd, &contentLength, &chunked);
+        }
+    }
+    if (headerEnd < 0) {
+        SetError(TEXT("Incomplete response headers"));
         return false;
     }
 
     // Parse status code
-    m_lastStatusCode = 0;
-    if (strncmp(recvBuffer, "HTTP/1.", 7) == 0) {
-        m_lastStatusCode = atoi(recvBuffer + 9);
-    }
+    m_lastStatusCode = ParseStatusLine(raw.Data(), raw.Length());
     response->statusCode = m_lastStatusCode;
 
-    // Find response body (after end-of-headers marker)
-    const char* bodyStart = strstr(recvBuffer, "\r\n\r\n");
-    bodyStart = bodyStart ? (bodyStart + 4) : "";
+    // Resolve the body. A body that stopped short of its declared length is a
+    // failure, not a short JSON document handed to the caller.
+    char* bodyStart = raw.Data() + headerEnd;
+    int available = raw.Length() - headerEnd;
+    int bodyLen;
 
-    // Copy body into a heap buffer owned by the caller (converts ASCII -> TCHAR).
-    int bodyLen = (int)strlen(bodyStart);
-    response->body = new TCHAR[bodyLen + 1];
-    for (int i = 0; i < bodyLen; i++) {
-        response->body[i] = (TCHAR)bodyStart[i];
+    if (chunked) {
+        int decoded = 0;
+        if (ScanChunkedBody(raw.Data(), headerEnd, raw.Length(), bodyStart, &decoded) != kChunkComplete) {
+            SetError(TEXT("Malformed or truncated chunked response"));
+            return false;
+        }
+        bodyLen = decoded;
+    } else if (contentLength >= 0) {
+        if (contentLength > (long)available) {
+            SetError(TEXT("Response body truncated"));
+            return false;
+        }
+        bodyLen = (int)contentLength;
+    } else {
+        bodyLen = available;
     }
-    response->body[bodyLen] = '\0';
 
-    // A response was received; the caller inspects response->statusCode.
+    // Safe: the buffer always keeps one spare byte past Length().
+    bodyStart[bodyLen] = '\0';
+
+    // The wire is UTF-8; hand the caller a decoded, heap-owned TCHAR body.
+    response->body = Str::FromUtf8Alloc(bodyStart);
+    if (!response->body) {
+        SetError(TEXT("Out of memory decoding response"));
+        return false;
+    }
+
+    SetError(NULL);
     return true;
 }
 
@@ -234,11 +688,14 @@ bool HttpClient::SendRequestWinInet(const TCHAR* method, const TCHAR* url, const
     response->statusCode = 0;
     response->body = NULL;
 
+    ScopedLock guard(&m_lock);
+
     // Parse URL into host / port / path.
     TCHAR host[256];
     TCHAR path[1024];
     int port = 0;
-    if (!ParseUrl(url, host, &port, path)) {
+    if (!ParseUrl(url, host, &port, path, 256, 1024)) {
+        SetError(TEXT("Malformed or oversized URL"));
         return false;
     }
 
@@ -250,14 +707,22 @@ bool HttpClient::SendRequestWinInet(const TCHAR* method, const TCHAR* url, const
                                        INTERNET_OPEN_TYPE_DIRECT,
                                        NULL, NULL, 0);
     if (!hInternet) {
+        SetError(TEXT("InternetOpen failed"));
         return false;
     }
+
+    // SetTimeout() must reach the wire on the device too: WinInet ignores the
+    // socket options the WinSock path uses and defaults to minutes-long waits,
+    // which strands the UI thread on a dead GPRS link.
+    DWORD timeout = m_timeoutMs;
+    InternetSetOption(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
 
     // Connect to the target host/port over the HTTP service.
     HINTERNET hConnect = InternetConnect(hInternet, host, (INTERNET_PORT)port,
                                          NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0);
     if (!hConnect) {
         InternetCloseHandle(hInternet);
+        SetError(TEXT("InternetConnect failed"));
         return false;
     }
 
@@ -272,39 +737,46 @@ bool HttpClient::SendRequestWinInet(const TCHAR* method, const TCHAR* url, const
     if (!hRequest) {
         InternetCloseHandle(hConnect);
         InternetCloseHandle(hInternet);
+        SetError(TEXT("HttpOpenRequest failed"));
         return false;
     }
 
+    InternetSetOption(hRequest, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+    InternetSetOption(hRequest, INTERNET_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
+    InternetSetOption(hRequest, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+
     // Add the accumulated custom headers as a single "Key: Value\r\n" block.
-    int headerTotal = 0;
-    for (HttpHeader* h = m_headers; h != NULL; h = h->next) {
-        // key + ": " + value + "\r\n"
-        headerTotal += lstrlen(h->key) + 2 + lstrlen(h->value) + 2;
+    Str::Buffer headerBlock;
+    AppendHeaderLines(&headerBlock);
+    if (body && body[0] != '\0' && !HasHeader(TEXT("Content-Type"))) {
+        headerBlock.Append(TEXT("Content-Type: application/json; charset=utf-8\r\n"));
     }
-    if (headerTotal > 0) {
-        TCHAR* headerBuf = new TCHAR[headerTotal + 1];
-        headerBuf[0] = '\0';
-        for (HttpHeader* h = m_headers; h != NULL; h = h->next) {
-            lstrcat(headerBuf, h->key);
-            lstrcat(headerBuf, TEXT(": "));
-            lstrcat(headerBuf, h->value);
-            lstrcat(headerBuf, TEXT("\r\n"));
-        }
-        HttpAddRequestHeaders(hRequest, headerBuf,
-                              (DWORD)lstrlen(headerBuf), HTTP_ADDREQ_FLAG_ADD);
-        delete[] headerBuf;
+    if (headerBlock.Failed()) {
+        InternetCloseHandle(hRequest);
+        InternetCloseHandle(hConnect);
+        InternetCloseHandle(hInternet);
+        SetError(TEXT("Out of memory building headers"));
+        return false;
+    }
+    if (headerBlock.Length() > 0) {
+        HttpAddRequestHeaders(hRequest, headerBlock.Get(),
+                              (DWORD)headerBlock.Length(), HTTP_ADDREQ_FLAG_ADD);
     }
 
-    // Convert the (Unicode) body to a narrow byte buffer for the wire.
+    // The body goes on the wire as UTF-8; the byte count comes from the
+    // conversion, not from the TCHAR length.
     char* bodyBytes = NULL;
     DWORD bodyByteLen = 0;
-    if (body && lstrlen(body) > 0) {
-        int bl = lstrlen(body);
-        bodyBytes = new char[bl];
-        for (int i = 0; i < bl; i++) {
-            bodyBytes[i] = (char)body[i];
+    if (body && body[0] != '\0') {
+        bodyBytes = Str::ToUtf8Alloc(body);
+        if (!bodyBytes) {
+            InternetCloseHandle(hRequest);
+            InternetCloseHandle(hConnect);
+            InternetCloseHandle(hInternet);
+            SetError(TEXT("Out of memory encoding request"));
+            return false;
         }
-        bodyByteLen = (DWORD)bl;
+        bodyByteLen = (DWORD)strlen(bodyBytes);
     }
 
     BOOL sent = HttpSendRequest(hRequest, NULL, 0, (LPVOID)bodyBytes, bodyByteLen);
@@ -317,6 +789,7 @@ bool HttpClient::SendRequestWinInet(const TCHAR* method, const TCHAR* url, const
         InternetCloseHandle(hRequest);
         InternetCloseHandle(hConnect);
         InternetCloseHandle(hInternet);
+        SetError(TEXT("HttpSendRequest failed"));
         return false;
     }
 
@@ -333,52 +806,49 @@ bool HttpClient::SendRequestWinInet(const TCHAR* method, const TCHAR* url, const
     }
     response->statusCode = m_lastStatusCode;
 
-    // Read the response body into a growable byte buffer.
-    char* data = NULL;
-    int dataLen = 0;
-    int dataCap = 0;
-    char readBuf[4096];
+    // Read the response body. A read error part way through means the body is
+    // incomplete: reporting it as a finished response would hand truncated
+    // JSON to the caller as if the server had sent it.
+    ByteBuffer raw;
+    char readBuf[2048];
     DWORD bytesRead = 0;
-    while (InternetReadFile(hRequest, readBuf, (DWORD)sizeof(readBuf), &bytesRead)) {
+    bool readFailed = false;
+
+    for (;;) {
+        if (!InternetReadFile(hRequest, readBuf, (DWORD)sizeof(readBuf), &bytesRead)) {
+            readFailed = true;
+            break;
+        }
         if (bytesRead == 0) {
             break;
         }
-        if (dataLen + (int)bytesRead > dataCap) {
-            int newCap = (dataCap == 0) ? 8192 : dataCap * 2;
-            while (newCap < dataLen + (int)bytesRead) {
-                newCap *= 2;
-            }
-            char* newData = new char[newCap];
-            for (int i = 0; i < dataLen; i++) {
-                newData[i] = data[i];
-            }
-            if (data) {
-                delete[] data;
-            }
-            data = newData;
-            dataCap = newCap;
+        if (raw.Length() + (int)bytesRead > kMaxResponseBytes) {
+            readFailed = true;
+            break;
         }
-        for (DWORD i = 0; i < bytesRead; i++) {
-            data[dataLen + (int)i] = readBuf[i];
+        if (!raw.Append(readBuf, (int)bytesRead)) {
+            readFailed = true;
+            break;
         }
-        dataLen += (int)bytesRead;
     }
 
-    // Hand the caller a heap TCHAR body (ASCII widen), owned by the caller.
-    response->body = new TCHAR[dataLen + 1];
-    for (int i = 0; i < dataLen; i++) {
-        response->body[i] = (TCHAR)data[i];
-    }
-    response->body[dataLen] = '\0';
-    if (data) {
-        delete[] data;
-    }
-
-    // Close all handles (no leaks) and report that a response was received.
     InternetCloseHandle(hRequest);
     InternetCloseHandle(hConnect);
     InternetCloseHandle(hInternet);
 
+    if (readFailed) {
+        SetError(TEXT("Response read failed or too large"));
+        return false;
+    }
+
+    // WinInet already de-frames chunked transfers, so the bytes are the body.
+    response->body = Str::FromUtf8Alloc(raw.Length() > 0 ? raw.Data() : "");
+    if (!response->body) {
+        SetError(TEXT("Out of memory decoding response"));
+        return false;
+    }
+
+    SetError(NULL);
     return true;
 }
 #endif // HBX_USE_WININET
@@ -391,38 +861,61 @@ bool HttpClient::Connect(const TCHAR* host, int port)
     // Create socket
     m_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (m_socket == INVALID_SOCKET) {
+        SetError(TEXT("Socket creation failed"));
         return false;
     }
 
-    // Set timeout
-    setsockopt(m_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&m_timeoutMs, sizeof(m_timeoutMs));
-    setsockopt(m_socket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&m_timeoutMs, sizeof(m_timeoutMs));
-
-    // Convert host to ASCII for gethostbyname
-    char asciiHost[256];
-    for (int i = 0; i < 255 && host[i] != '\0'; i++) {
-        asciiHost[i] = (char)host[i];
+    // Set timeout. WinSock (device) takes a DWORD of milliseconds; POSIX takes
+    // a struct timeval and rejects the DWORD form outright, which is why the
+    // host build used to run with no timeout at all.
+#if defined(UNDER_CE) || defined(_WIN32) || defined(WIN32)
+    DWORD timeout = m_timeoutMs;
+    int rcvOk = setsockopt(m_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    int sndOk = setsockopt(m_socket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+#else
+    struct timeval tv;
+    tv.tv_sec = (long)(m_timeoutMs / 1000);
+    tv.tv_usec = (long)((m_timeoutMs % 1000) * 1000);
+    int rcvOk = setsockopt(m_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    int sndOk = setsockopt(m_socket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+#endif
+    if (rcvOk == SOCKET_ERROR || sndOk == SOCKET_ERROR) {
+        // Not fatal, but a request can now block for the stack default; record
+        // it so a hung sync has a diagnostic.
+        SetError(TEXT("Socket timeout not applied"));
     }
-    asciiHost[255] = '\0';
+
+    // Host names are ASCII; the UTF-8 encoder keeps the buffer terminated at
+    // the copied length instead of leaving an uninitialised tail.
+    char asciiHost[256];
+    if (!Str::ToUtf8(asciiHost, (int)sizeof(asciiHost), host)) {
+        closesocket(m_socket);
+        m_socket = INVALID_SOCKET;
+        SetError(TEXT("Host name too long"));
+        return false;
+    }
 
     // Resolve hostname
     struct hostent* hostInfo = gethostbyname(asciiHost);
     if (!hostInfo) {
         closesocket(m_socket);
         m_socket = INVALID_SOCKET;
+        SetError(TEXT("Host name could not be resolved"));
         return false;
     }
 
     // Setup address structure
     struct sockaddr_in serverAddr;
+    memset(&serverAddr, 0, sizeof(serverAddr));
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(port);
+    serverAddr.sin_port = htons((unsigned short)port);
     serverAddr.sin_addr = *((struct in_addr*)hostInfo->h_addr);
 
     // Connect
     if (connect(m_socket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
         closesocket(m_socket);
         m_socket = INVALID_SOCKET;
+        SetError(TEXT("Connection failed"));
         return false;
     }
 
@@ -437,9 +930,10 @@ void HttpClient::Disconnect()
     }
 }
 
-bool HttpClient::ParseUrl(const TCHAR* url, TCHAR* host, int* port, TCHAR* path)
+bool HttpClient::ParseUrl(const TCHAR* url, TCHAR* host, int* port, TCHAR* path,
+                          int hostMax, int pathMax)
 {
-    if (!url || !host || !port || !path) {
+    if (!url || !host || !port || !path || hostMax < 2 || pathMax < 2) {
         return false;
     }
 
@@ -463,32 +957,38 @@ bool HttpClient::ParseUrl(const TCHAR* url, TCHAR* host, int* port, TCHAR* path)
     const TCHAR* pathStart = wcschr(start, '/');
     const TCHAR* portStart = wcschr(start, ':');
 
-    // Extract host
-    int hostLen;
+    // Extract host. Truncation is rejected rather than silently accepted: a
+    // shortened host name resolves to a different server, or to nothing.
     if (portStart && (!pathStart || portStart < pathStart)) {
         // Port specified
-        hostLen = (int)(portStart - start);
-        wcsncpy(host, start, hostLen);
-        host[hostLen] = '\0';
+        if (!Str::CopyN(host, hostMax, start, (int)(portStart - start))) {
+            return false;
+        }
 
         // Extract port
-        *port = _wtoi(portStart + 1);
+        int parsedPort = _wtoi(portStart + 1);
+        if (parsedPort <= 0 || parsedPort > 65535) {
+            return false;
+        }
+        *port = parsedPort;
 
         // Find path after port
         pathStart = wcschr(portStart, '/');
     } else if (pathStart) {
         // No port, path specified
-        hostLen = (int)(pathStart - start);
-        wcsncpy(host, start, hostLen);
-        host[hostLen] = '\0';
+        if (!Str::CopyN(host, hostMax, start, (int)(pathStart - start))) {
+            return false;
+        }
     } else {
         // No port, no path
-        lstrcpy(host, start);
+        if (!Str::Copy(host, hostMax, start)) {
+            return false;
+        }
     }
 
-    // Extract path
-    if (pathStart) {
-        lstrcpy(path, pathStart);
+    // Extract path (query string included)
+    if (pathStart && !Str::Copy(path, pathMax, pathStart)) {
+        return false;
     }
 
     return (lstrlen(host) > 0);
@@ -496,6 +996,8 @@ bool HttpClient::ParseUrl(const TCHAR* url, TCHAR* host, int* port, TCHAR* path)
 
 void HttpClient::ClearHeaders()
 {
+    ScopedLock guard(&m_lock);
+
     while (m_headers) {
         HttpHeader* next = m_headers->next;
         if (m_headers->key) {
@@ -506,33 +1008,6 @@ void HttpClient::ClearHeaders()
         }
         delete m_headers;
         m_headers = next;
-    }
-}
-
-void HttpClient::BuildHeaderString(char* buffer, int maxLen)
-{
-    buffer[0] = '\0';
-    int pos = 0;
-
-    HttpHeader* current = m_headers;
-    while (current && pos < maxLen - 100) {
-        // Convert key and value to ASCII
-        char asciiKey[128], asciiValue[512];
-
-        for (int i = 0; i < 127 && current->key[i] != '\0'; i++) {
-            asciiKey[i] = (char)current->key[i];
-        }
-        asciiKey[127] = '\0';
-
-        for (int i = 0; i < 511 && current->value[i] != '\0'; i++) {
-            asciiValue[i] = (char)current->value[i];
-        }
-        asciiValue[511] = '\0';
-
-        // Add header to buffer
-        pos += sprintf(buffer + pos, "%s: %s\r\n", asciiKey, asciiValue);
-
-        current = current->next;
     }
 }
 

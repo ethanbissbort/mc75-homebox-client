@@ -1,13 +1,201 @@
 #include "../../include/Models/JsonLite.hpp"
+#include "../../include/StrUtil.hpp"
 #include <wchar.h>
+#include <limits.h>
 
 namespace HBX {
 namespace Models {
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Number scanning
+//
+// The MC75 CRT has no swscanf/strtod for TCHAR text worth linking in, so the
+// numeric token stored by ParseValue is decoded by hand. It must accept
+// everything ParseValue accepts -- including the exponent -- or the accessors
+// silently disagree with the parser.
+// ---------------------------------------------------------------------------
+
+bool IsDigit(TCHAR c)
+{
+    return c >= (TCHAR)'0' && c <= (TCHAR)'9';
+}
+
+double ScalePow10(double value, int exponent)
+{
+    // A JSON exponent may have any number of digits; clamp before looping so a
+    // hostile "1e99999999" cannot spin the UI thread.
+    if (exponent > 400) {
+        exponent = 400;
+    } else if (exponent < -400) {
+        exponent = -400;
+    }
+
+    while (exponent > 0) {
+        value *= 10.0;
+        exponent--;
+    }
+    while (exponent < 0) {
+        value /= 10.0;
+        exponent++;
+    }
+
+    return value;
+}
+
+bool ParseNumberToken(const TCHAR* s, double* out)
+{
+    if (!s || !out) {
+        return false;
+    }
+
+    const TCHAR* p = s;
+    bool negative = false;
+
+    if (*p == (TCHAR)'-') {
+        negative = true;
+        p++;
+    } else if (*p == (TCHAR)'+') {
+        p++;
+    }
+
+    bool anyDigit = false;
+    double value = 0.0;
+
+    while (IsDigit(*p)) {
+        value = value * 10.0 + (double)(*p - (TCHAR)'0');
+        p++;
+        anyDigit = true;
+    }
+
+    if (*p == (TCHAR)'.') {
+        p++;
+        double scale = 0.1;
+        while (IsDigit(*p)) {
+            value += (double)(*p - (TCHAR)'0') * scale;
+            scale *= 0.1;
+            p++;
+            anyDigit = true;
+        }
+    }
+
+    if (!anyDigit) {
+        return false;
+    }
+
+    if (*p == (TCHAR)'e' || *p == (TCHAR)'E') {
+        p++;
+        bool exponentNegative = false;
+        if (*p == (TCHAR)'-') {
+            exponentNegative = true;
+            p++;
+        } else if (*p == (TCHAR)'+') {
+            p++;
+        }
+
+        int exponent = 0;
+        bool anyExponentDigit = false;
+        while (IsDigit(*p)) {
+            if (exponent < 100000) {
+                exponent = exponent * 10 + (int)(*p - (TCHAR)'0');
+            }
+            p++;
+            anyExponentDigit = true;
+        }
+
+        if (!anyExponentDigit) {
+            return false;
+        }
+
+        value = ScalePow10(value, exponentNegative ? -exponent : exponent);
+    }
+
+    *out = negative ? -value : value;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// String escape decoding
+// ---------------------------------------------------------------------------
+
+bool HexDigit(TCHAR c, unsigned long* out)
+{
+    if (c >= (TCHAR)'0' && c <= (TCHAR)'9') {
+        *out = (unsigned long)(c - (TCHAR)'0');
+        return true;
+    }
+    if (c >= (TCHAR)'a' && c <= (TCHAR)'f') {
+        *out = (unsigned long)(c - (TCHAR)'a') + 10UL;
+        return true;
+    }
+    if (c >= (TCHAR)'A' && c <= (TCHAR)'F') {
+        *out = (unsigned long)(c - (TCHAR)'A') + 10UL;
+        return true;
+    }
+    return false;
+}
+
+// Reads exactly four hex digits at `p`, which must stay below `end`.
+bool ReadHex4(const TCHAR* p, const TCHAR* end, unsigned long* out)
+{
+    if (p + 4 > end) {
+        return false;
+    }
+
+    unsigned long value = 0;
+    for (int i = 0; i < 4; i++) {
+        unsigned long digit;
+        if (!HexDigit(p[i], &digit)) {
+            return false;
+        }
+        value = (value << 4) | digit;
+    }
+
+    *out = value;
+    return true;
+}
+
+// Writes one Unicode scalar in whatever encoding a TCHAR uses on this build:
+// UTF-16 code units on the device, UTF-8 bytes on the host (where the rest of
+// the codebase already treats TCHAR text as UTF-8 bytes).
+void EmitScalar(TCHAR* out, int* pos, unsigned long scalar)
+{
+    if (sizeof(TCHAR) > 1) {
+        if (scalar > 0xFFFFUL) {
+            unsigned long v = scalar - 0x10000UL;
+            out[(*pos)++] = (TCHAR)(unsigned short)(0xD800UL + (v >> 10));
+            out[(*pos)++] = (TCHAR)(unsigned short)(0xDC00UL + (v & 0x3FFUL));
+        } else {
+            out[(*pos)++] = (TCHAR)(unsigned short)scalar;
+        }
+        return;
+    }
+
+    if (scalar < 0x80UL) {
+        out[(*pos)++] = (TCHAR)(unsigned char)scalar;
+    } else if (scalar < 0x800UL) {
+        out[(*pos)++] = (TCHAR)(unsigned char)(0xC0UL | (scalar >> 6));
+        out[(*pos)++] = (TCHAR)(unsigned char)(0x80UL | (scalar & 0x3FUL));
+    } else if (scalar < 0x10000UL) {
+        out[(*pos)++] = (TCHAR)(unsigned char)(0xE0UL | (scalar >> 12));
+        out[(*pos)++] = (TCHAR)(unsigned char)(0x80UL | ((scalar >> 6) & 0x3FUL));
+        out[(*pos)++] = (TCHAR)(unsigned char)(0x80UL | (scalar & 0x3FUL));
+    } else {
+        out[(*pos)++] = (TCHAR)(unsigned char)(0xF0UL | (scalar >> 18));
+        out[(*pos)++] = (TCHAR)(unsigned char)(0x80UL | ((scalar >> 12) & 0x3FUL));
+        out[(*pos)++] = (TCHAR)(unsigned char)(0x80UL | ((scalar >> 6) & 0x3FUL));
+        out[(*pos)++] = (TCHAR)(unsigned char)(0x80UL | (scalar & 0x3FUL));
+    }
+}
+
+} // namespace
 
 JsonLite::JsonLite()
     : m_root(NULL)
     , m_parseBuffer(NULL)
     , m_borrowedRoot(false)
+    , m_depth(0)
 {
 }
 
@@ -25,14 +213,16 @@ bool JsonLite::Parse(const TCHAR* jsonString)
     Clear();
 
     // Create a copy of the JSON string for parsing
-    int len = lstrlen(jsonString);
-    m_parseBuffer = new TCHAR[len + 1];
-    lstrcpy(m_parseBuffer, jsonString);
+    m_parseBuffer = Str::Dup(jsonString);
+    if (!m_parseBuffer) {
+        return false;
+    }
 
     // Create root node
     m_root = CreateNode();
 
     // Parse the root value
+    m_depth = 0;
     const TCHAR* ptr = m_parseBuffer;
     return ParseValue(&ptr, m_root);
 }
@@ -48,18 +238,23 @@ bool JsonLite::GetString(const TCHAR* key, TCHAR* value, DWORD maxLen) const
         return false;
     }
 
-    // Copy value to output buffer
-    int len = lstrlen(node->value);
-    if (len >= (int)maxLen) {
-        len = maxLen - 1;
+    // Truncation is a failure, not a success: a shortened value that reads as
+    // "extracted fine" ends up written back over the server's full field.
+    return Str::Copy(value, (int)maxLen, node->value);
+}
+
+TCHAR* JsonLite::GetStringAlloc(const TCHAR* key) const
+{
+    if (!key) {
+        return NULL;
     }
 
-    for (int i = 0; i < len; i++) {
-        value[i] = node->value[i];
+    Node* node = FindKey(key);
+    if (!node || node->type != Node::TYPE_STRING || !node->value) {
+        return NULL;
     }
-    value[len] = '\0';
 
-    return true;
+    return Str::Dup(node->value);
 }
 
 bool JsonLite::GetInt(const TCHAR* key, int* value) const
@@ -73,23 +268,19 @@ bool JsonLite::GetInt(const TCHAR* key, int* value) const
         return false;
     }
 
-    // Convert string to int
-    *value = 0;
-    bool negative = false;
-    const TCHAR* ptr = node->value;
-
-    if (*ptr == '-') {
-        negative = true;
-        ptr++;
+    double parsed = 0.0;
+    if (!ParseNumberToken(node->value, &parsed)) {
+        return false;
     }
 
-    while (*ptr >= '0' && *ptr <= '9') {
-        *value = (*value * 10) + (*ptr - '0');
-        ptr++;
-    }
-
-    if (negative) {
-        *value = -*value;
+    // Saturate rather than wrap: an out-of-range quantity from the server must
+    // not turn into a small negative number on the device.
+    if (parsed >= (double)INT_MAX) {
+        *value = INT_MAX;
+    } else if (parsed <= (double)INT_MIN) {
+        *value = INT_MIN;
+    } else {
+        *value = (int)parsed;
     }
 
     return true;
@@ -121,38 +312,7 @@ bool JsonLite::GetDouble(const TCHAR* key, double* value) const
         return false;
     }
 
-    // Simple double parsing
-    *value = 0.0;
-    bool negative = false;
-    const TCHAR* ptr = node->value;
-
-    if (*ptr == '-') {
-        negative = true;
-        ptr++;
-    }
-
-    // Integer part
-    while (*ptr >= '0' && *ptr <= '9') {
-        *value = (*value * 10.0) + (*ptr - '0');
-        ptr++;
-    }
-
-    // Fractional part
-    if (*ptr == '.') {
-        ptr++;
-        double fraction = 0.1;
-        while (*ptr >= '0' && *ptr <= '9') {
-            *value += (*ptr - '0') * fraction;
-            fraction *= 0.1;
-            ptr++;
-        }
-    }
-
-    if (negative) {
-        *value = -*value;
-    }
-
-    return true;
+    return ParseNumberToken(node->value, value);
 }
 
 bool JsonLite::HasKey(const TCHAR* key) const
@@ -251,17 +411,9 @@ void JsonLite::AddString(const TCHAR* key, const TCHAR* value)
 
     Node* newNode = CreateNode();
     newNode->type = Node::TYPE_STRING;
-
-    // Set key
-    int keyLen = lstrlen(key) + 1;
-    newNode->key = new TCHAR[keyLen];
-    lstrcpy(newNode->key, key);
-
-    // Set value
+    newNode->key = Str::Dup(key);
     if (value) {
-        int valueLen = lstrlen(value) + 1;
-        newNode->value = new TCHAR[valueLen];
-        lstrcpy(newNode->value, value);
+        newNode->value = Str::Dup(value);
     }
 
     // Add to children list
@@ -284,15 +436,12 @@ void JsonLite::AddInt(const TCHAR* key, int value)
 
     Node* newNode = CreateNode();
     newNode->type = Node::TYPE_INT;
+    newNode->key = Str::Dup(key);
 
-    // Set key
-    int keyLen = lstrlen(key) + 1;
-    newNode->key = new TCHAR[keyLen];
-    lstrcpy(newNode->key, key);
-
-    // Set value (convert int to string)
-    newNode->value = new TCHAR[32];
-    wsprintf(newNode->value, TEXT("%d"), value);
+    TCHAR text[32];
+    text[0] = 0;
+    Str::AppendInt(text, 32, value);
+    newNode->value = Str::Dup(text);
 
     // Add to children list
     if (!m_root->child) {
@@ -314,15 +463,8 @@ void JsonLite::AddBool(const TCHAR* key, bool value)
 
     Node* newNode = CreateNode();
     newNode->type = Node::TYPE_BOOL;
-
-    // Set key
-    int keyLen = lstrlen(key) + 1;
-    newNode->key = new TCHAR[keyLen];
-    lstrcpy(newNode->key, key);
-
-    // Set value
-    newNode->value = new TCHAR[6];
-    lstrcpy(newNode->value, value ? TEXT("true") : TEXT("false"));
+    newNode->key = Str::Dup(key);
+    newNode->value = Str::Dup(value ? TEXT("true") : TEXT("false"));
 
     // Add to children list
     if (!m_root->child) {
@@ -344,20 +486,41 @@ void JsonLite::AddDouble(const TCHAR* key, double value)
 
     Node* newNode = CreateNode();
     newNode->type = Node::TYPE_DOUBLE;
+    newNode->key = Str::Dup(key);
 
-    // Set key
-    int keyLen = lstrlen(key) + 1;
-    newNode->key = new TCHAR[keyLen];
-    lstrcpy(newNode->key, key);
+    // The CE CRT's wsprintf has no floating point conversion at all, so the
+    // fixed six-decimal form is assembled by hand. The sign has to be carried
+    // separately: for -1 < value < 0 the integer part is 0 and would otherwise
+    // lose it.
+    bool negative = (value < 0.0);
+    double magnitude = negative ? -value : value;
 
-    // Set value (convert double to string)
-    newNode->value = new TCHAR[64];
-    // Simple double formatting (Windows Mobile doesn't have swprintf for doubles)
-    int intPart = (int)value;
-    double fracPart = value - intPart;
-    if (fracPart < 0) fracPart = -fracPart;
-    int fracDigits = (int)(fracPart * 1000000) % 1000000;
-    wsprintf(newNode->value, TEXT("%d.%06d"), intPart, fracDigits);
+    // Values at or beyond the 32-bit range have no representable integer part
+    // here; clamp instead of invoking undefined behaviour in the cast.
+    if (magnitude >= 2147483647.0) {
+        magnitude = 2147483647.0;
+    }
+
+    long intPart = (long)magnitude;
+    long fracDigits = (long)((magnitude - (double)intPart) * 1000000.0 + 0.5);
+    if (fracDigits >= 1000000) {
+        // Rounding carried into the integer part (e.g. 0.9999999).
+        fracDigits = 0;
+        intPart++;
+    }
+
+    TCHAR text[64];
+    text[0] = 0;
+    if (negative) {
+        Str::Append(text, 64, TEXT("-"));
+    }
+    Str::AppendInt(text, 64, intPart);
+    Str::Append(text, 64, TEXT("."));
+    for (long divisor = 100000; divisor > 0; divisor /= 10) {
+        Str::AppendChar(text, 64, (TCHAR)('0' + (int)((fracDigits / divisor) % 10)));
+    }
+
+    newNode->value = Str::Dup(text);
 
     // Add to children list
     if (!m_root->child) {
@@ -377,13 +540,16 @@ TCHAR* JsonLite::ToString() const
         return NULL;
     }
 
-    // Allocate buffer for output
-    TCHAR* buffer = new TCHAR[8192];
-    int pos = 0;
+    // Growable, so a large document is serialized in full rather than cut off
+    // mid-token at a fixed size and handed back as success.
+    Str::Buffer out;
+    BuildString(m_root, out);
 
-    BuildString(m_root, &buffer, &pos, 8192);
+    if (out.Failed()) {
+        return NULL;
+    }
 
-    return buffer;
+    return out.Detach();
 }
 
 void JsonLite::Clear()
@@ -395,6 +561,7 @@ void JsonLite::Clear()
         m_root = NULL;
     }
     m_borrowedRoot = false;
+    m_depth = 0;
     if (m_parseBuffer) {
         delete[] m_parseBuffer;
         m_parseBuffer = NULL;
@@ -414,14 +581,21 @@ JsonLite::Node* JsonLite::CreateNode()
 
 void JsonLite::FreeNode(Node* node)
 {
-    if (!node) return;
-    
-    if (node->key) delete[] node->key;
-    if (node->value) delete[] node->value;
-    if (node->next) FreeNode(node->next);
-    if (node->child) FreeNode(node->child);
-    
-    delete node;
+    // Siblings are walked iteratively: recursing once per sibling would make
+    // the teardown depth equal to the number of elements in an array, and a
+    // flat response of a few hundred items is enough to exhaust the MC75
+    // stack. Recursion only follows nesting, which Parse() caps at
+    // MAX_PARSE_DEPTH.
+    while (node) {
+        Node* next = node->next;
+
+        if (node->key) delete[] node->key;
+        if (node->value) delete[] node->value;
+        if (node->child) FreeNode(node->child);
+
+        delete node;
+        node = next;
+    }
 }
 
 JsonLite::Node* JsonLite::FindKey(const TCHAR* key) const
@@ -456,27 +630,31 @@ bool JsonLite::ParseValue(const TCHAR** ptr, Node* node)
         node->type = Node::TYPE_STRING;
         return ParseString(ptr, &node->value);
     }
-    else if (**ptr == '{') {
-        // Object
-        node->type = Node::TYPE_OBJECT;
-        return ParseObject(ptr, node);
-    }
-    else if (**ptr == '[') {
-        // Array
-        node->type = Node::TYPE_ARRAY;
-        return ParseArray(ptr, node);
+    else if (**ptr == '{' || **ptr == '[') {
+        // Object / array. The descent is bounded so a deeply nested (or
+        // hostile) payload cannot exhaust the device stack.
+        bool isObject = (**ptr == '{');
+        node->type = isObject ? Node::TYPE_OBJECT : Node::TYPE_ARRAY;
+
+        if (m_depth >= MAX_PARSE_DEPTH) {
+            return false;
+        }
+
+        m_depth++;
+        bool ok = isObject ? ParseObject(ptr, node) : ParseArray(ptr, node);
+        m_depth--;
+
+        return ok;
     }
     else if (**ptr == 't' || **ptr == 'f') {
         // Boolean
         node->type = Node::TYPE_BOOL;
         if (wcsncmp(*ptr, TEXT("true"), 4) == 0) {
-            node->value = new TCHAR[5];
-            lstrcpy(node->value, TEXT("true"));
+            node->value = Str::Dup(TEXT("true"));
             *ptr += 4;
             return true;
         } else if (wcsncmp(*ptr, TEXT("false"), 5) == 0) {
-            node->value = new TCHAR[6];
-            lstrcpy(node->value, TEXT("false"));
+            node->value = Str::Dup(TEXT("false"));
             *ptr += 5;
             return true;
         }
@@ -513,12 +691,7 @@ bool JsonLite::ParseValue(const TCHAR** ptr, Node* node)
         }
 
         // Extract number string
-        int len = *ptr - start;
-        node->value = new TCHAR[len + 1];
-        for (int i = 0; i < len; i++) {
-            node->value[i] = start[i];
-        }
-        node->value[len] = '\0';
+        node->value = Str::DupN(start, (int)(*ptr - start));
 
         node->type = isDouble ? Node::TYPE_DOUBLE : Node::TYPE_INT;
         return true;
@@ -661,6 +834,114 @@ bool JsonLite::ParseArray(const TCHAR** ptr, Node* node)
     return false; // Unexpected end
 }
 
+bool JsonLite::DecodeStringLiteral(const TCHAR** ptr, TCHAR** out)
+{
+    if (!ptr || !*ptr || !out) {
+        return false;
+    }
+
+    *out = NULL;
+
+    if (**ptr != '"') {
+        return false;
+    }
+    (*ptr)++; // Skip opening quote
+
+    // Locate the closing quote, honouring backslash escapes.
+    const TCHAR* start = *ptr;
+    const TCHAR* end = start;
+
+    while (*end && *end != '"') {
+        if (*end == '\\' && *(end + 1)) {
+            end++; // an escaped quote does not close the string
+        }
+        end++;
+    }
+
+    if (*end != '"') {
+        return false; // No closing quote
+    }
+
+    // The decoded form is never longer than the raw span: every escape
+    // sequence shrinks (\uXXXX is six source characters and at most three
+    // UTF-8 bytes, a surrogate pair twelve source characters and four).
+    int span = (int)(end - start);
+    TCHAR* result = new TCHAR[span + 1];
+    if (!result) {
+        return false;
+    }
+
+    int outPos = 0;
+    const TCHAR* current = start;
+    bool ok = true;
+
+    while (current < end) {
+        if (*current != '\\') {
+            result[outPos++] = *current++;
+            continue;
+        }
+
+        if (current + 1 >= end) {
+            ok = false; // trailing backslash before the closing quote
+            break;
+        }
+        current++; // step onto the escape character
+
+        switch (*current) {
+        case 'n': result[outPos++] = (TCHAR)'\n'; current++; break;
+        case 'r': result[outPos++] = (TCHAR)'\r'; current++; break;
+        case 't': result[outPos++] = (TCHAR)'\t'; current++; break;
+        case 'b': result[outPos++] = (TCHAR)'\b'; current++; break;
+        case 'f': result[outPos++] = (TCHAR)'\f'; current++; break;
+        case 'u': {
+            unsigned long scalar = 0;
+            if (!ReadHex4(current + 1, end, &scalar)) {
+                ok = false;
+                break;
+            }
+            current += 5; // 'u' plus four hex digits
+
+            if (scalar >= 0xD800UL && scalar <= 0xDBFFUL &&
+                current + 6 <= end && current[0] == '\\' && current[1] == 'u') {
+                unsigned long low = 0;
+                if (ReadHex4(current + 2, end, &low) &&
+                    low >= 0xDC00UL && low <= 0xDFFFUL) {
+                    scalar = 0x10000UL + ((scalar - 0xD800UL) << 10) + (low - 0xDC00UL);
+                    current += 6;
+                }
+            }
+
+            if (scalar >= 0xD800UL && scalar <= 0xDFFFUL) {
+                scalar = 0xFFFDUL; // unpaired surrogate
+            }
+
+            EmitScalar(result, &outPos, scalar);
+            break;
+        }
+        default:
+            // '"', '\\', '/' and anything else: keep the character as written
+            // rather than failing a whole response over one stray backslash.
+            result[outPos++] = *current++;
+            break;
+        }
+
+        if (!ok) {
+            break;
+        }
+    }
+
+    if (!ok) {
+        delete[] result;
+        return false;
+    }
+
+    result[outPos] = '\0';
+
+    *out = result;
+    *ptr = end + 1; // Skip closing quote
+    return true;
+}
+
 bool JsonLite::ParseString(const TCHAR** ptr, TCHAR** out)
 {
     if (!ptr || !*ptr || !out) {
@@ -669,54 +950,7 @@ bool JsonLite::ParseString(const TCHAR** ptr, TCHAR** out)
 
     SkipWhitespace(ptr);
 
-    if (**ptr != '"') {
-        return false;
-    }
-    (*ptr)++; // Skip opening quote
-
-    // Find closing quote and calculate length
-    const TCHAR* start = *ptr;
-    const TCHAR* end = start;
-    int len = 0;
-
-    while (*end && *end != '"') {
-        if (*end == '\\' && *(end + 1)) {
-            end++; // Skip escaped character
-        }
-        end++;
-        len++;
-    }
-
-    if (*end != '"') {
-        return false; // No closing quote
-    }
-
-    // Allocate and copy string
-    *out = new TCHAR[len + 1];
-    int outPos = 0;
-    const TCHAR* current = start;
-
-    while (current < end) {
-        if (*current == '\\' && current + 1 < end) {
-            current++; // Skip backslash
-            // Handle escape sequences
-            switch (*current) {
-                case 'n': (*out)[outPos++] = '\n'; break;
-                case 'r': (*out)[outPos++] = '\r'; break;
-                case 't': (*out)[outPos++] = '\t'; break;
-                case '"': (*out)[outPos++] = '"'; break;
-                case '\\': (*out)[outPos++] = '\\'; break;
-                default: (*out)[outPos++] = *current; break;
-            }
-        } else {
-            (*out)[outPos++] = *current;
-        }
-        current++;
-    }
-    (*out)[outPos] = '\0';
-
-    *ptr = end + 1; // Skip closing quote
-    return true;
+    return DecodeStringLiteral(ptr, out);
 }
 
 void JsonLite::SkipWhitespace(const TCHAR** ptr)
@@ -726,99 +960,68 @@ void JsonLite::SkipWhitespace(const TCHAR** ptr)
     }
 }
 
-void JsonLite::BuildString(const Node* node, TCHAR** buffer, int* pos, int maxLen) const
+void JsonLite::BuildString(const Node* node, Str::Buffer& out) const
 {
-    if (!node || !buffer || !*buffer || !pos) {
+    if (!node) {
         return;
     }
 
-    TCHAR* buf = *buffer;
-
     switch (node->type) {
-        case Node::TYPE_OBJECT:
-            if (*pos < maxLen) buf[(*pos)++] = '{';
-            {
-                Node* child = node->child;
-                bool first = true;
-                while (child) {
-                    if (!first && *pos < maxLen) {
-                        buf[(*pos)++] = ',';
-                    }
-                    first = false;
-
-                    // Add key
-                    if (child->key && *pos < maxLen - 2) {
-                        buf[(*pos)++] = '"';
-                        int keyLen = lstrlen(child->key);
-                        for (int i = 0; i < keyLen && *pos < maxLen; i++) {
-                            buf[(*pos)++] = child->key[i];
-                        }
-                        if (*pos < maxLen) buf[(*pos)++] = '"';
-                        if (*pos < maxLen) buf[(*pos)++] = ':';
-                    }
-
-                    // Add value
-                    BuildString(child, buffer, pos, maxLen);
-
-                    child = child->next;
+        case Node::TYPE_OBJECT: {
+            out.AppendChar((TCHAR)'{');
+            Node* child = node->child;
+            bool first = true;
+            while (child) {
+                if (!first) {
+                    out.AppendChar((TCHAR)',');
                 }
-            }
-            if (*pos < maxLen) buf[(*pos)++] = '}';
-            break;
+                first = false;
 
-        case Node::TYPE_ARRAY:
-            if (*pos < maxLen) buf[(*pos)++] = '[';
-            {
-                Node* child = node->child;
-                bool first = true;
-                while (child) {
-                    if (!first && *pos < maxLen) {
-                        buf[(*pos)++] = ',';
-                    }
-                    first = false;
-
-                    BuildString(child, buffer, pos, maxLen);
-
-                    child = child->next;
+                if (child->key) {
+                    out.AppendJsonString(child->key);
+                    out.AppendChar((TCHAR)':');
                 }
+
+                BuildString(child, out);
+                child = child->next;
             }
-            if (*pos < maxLen) buf[(*pos)++] = ']';
+            out.AppendChar((TCHAR)'}');
             break;
+        }
+
+        case Node::TYPE_ARRAY: {
+            out.AppendChar((TCHAR)'[');
+            Node* child = node->child;
+            bool first = true;
+            while (child) {
+                if (!first) {
+                    out.AppendChar((TCHAR)',');
+                }
+                first = false;
+
+                BuildString(child, out);
+                child = child->next;
+            }
+            out.AppendChar((TCHAR)']');
+            break;
+        }
 
         case Node::TYPE_STRING:
-            if (*pos < maxLen) buf[(*pos)++] = '"';
-            if (node->value) {
-                int valueLen = lstrlen(node->value);
-                for (int i = 0; i < valueLen && *pos < maxLen; i++) {
-                    buf[(*pos)++] = node->value[i];
-                }
-            }
-            if (*pos < maxLen) buf[(*pos)++] = '"';
+            // Escaped on the way out, so a value holding a quote, a backslash
+            // or a newline still yields a document the server can parse and
+            // the line-oriented journal can queue.
+            out.AppendJsonString(node->value);
             break;
 
         case Node::TYPE_INT:
         case Node::TYPE_DOUBLE:
         case Node::TYPE_BOOL:
-            if (node->value) {
-                int valueLen = lstrlen(node->value);
-                for (int i = 0; i < valueLen && *pos < maxLen; i++) {
-                    buf[(*pos)++] = node->value[i];
-                }
-            }
+            out.Append(node->value ? node->value : TEXT("null"));
             break;
 
         case Node::TYPE_NULL:
-            if (*pos < maxLen - 4) {
-                buf[(*pos)++] = 'n';
-                buf[(*pos)++] = 'u';
-                buf[(*pos)++] = 'l';
-                buf[(*pos)++] = 'l';
-            }
+            out.Append(TEXT("null"));
             break;
-    }
-
-    if (*pos < maxLen) {
-        buf[*pos] = '\0';
     }
 }
 

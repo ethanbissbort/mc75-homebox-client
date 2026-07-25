@@ -28,7 +28,7 @@
 			<Tool Name="VCMIDLTool"/>
 			<Tool Name="VCCLCompilerTool"
 				Optimization="0"
-				AdditionalIncludeDirectories="..\include;C:\Program Files\Windows Mobile 6.5 SDK\PocketPC\Include\Armv4i;C:\Program Files\Zebra EMDK\C\Include"
+				AdditionalIncludeDirectories="..\include;$(WINDOWSMOBILE65SDK)\PocketPC\Include\Armv4i;$(ZEBRAEMDK)\Include"
 				PreprocessorDefinitions="WIN32;_WIN32_WCE=0x0600;UNDER_CE;WIN32_PLATFORM_PSPC;_DEBUG;HBX_USE_WININET;HBX_USE_EMDK"
 				RuntimeLibrary="3"
 				UsePrecompiledHeader="0"
@@ -36,7 +36,7 @@
 				DebugInformationFormat="3"/>
 			<Tool Name="VCLinkerTool"
 				AdditionalDependencies="coredll.lib aygshell.lib commctrl.lib ole32.lib oleaut32.lib winsock.lib wininet.lib ScanAPIWM.lib"
-				AdditionalLibraryDirectories="C:\Program Files\Windows Mobile 6.5 SDK\PocketPC\Lib\Armv4i;C:\Program Files\Zebra EMDK\C\Lib\ARMV4I"
+				AdditionalLibraryDirectories="$(WINDOWSMOBILE65SDK)\PocketPC\Lib\Armv4i;$(ZEBRAEMDK)\Lib\ARMV4I"
 				SubSystem="8"
 				EntryPointSymbol="WinMainCRTStartup"
 				GenerateDebugInformation="true"/>
@@ -67,7 +67,7 @@
 				EnableIntrinsicFunctions="true"
 				FavorSizeOrSpeed="1"
 				OmitFramePointers="true"
-				AdditionalIncludeDirectories="..\include;C:\Program Files\Windows Mobile 6.5 SDK\PocketPC\Include\Armv4i;C:\Program Files\Zebra EMDK\C\Include"
+				AdditionalIncludeDirectories="..\include;$(WINDOWSMOBILE65SDK)\PocketPC\Include\Armv4i;$(ZEBRAEMDK)\Include"
 				PreprocessorDefinitions="WIN32;_WIN32_WCE=0x0600;UNDER_CE;WIN32_PLATFORM_PSPC;NDEBUG;HBX_USE_WININET;HBX_USE_EMDK"
 				RuntimeLibrary="2"
 				UsePrecompiledHeader="0"
@@ -75,7 +75,7 @@
 				DebugInformationFormat="3"/>
 			<Tool Name="VCLinkerTool"
 				AdditionalDependencies="coredll.lib aygshell.lib commctrl.lib ole32.lib oleaut32.lib winsock.lib wininet.lib ScanAPIWM.lib"
-				AdditionalLibraryDirectories="C:\Program Files\Windows Mobile 6.5 SDK\PocketPC\Lib\Armv4i;C:\Program Files\Zebra EMDK\C\Lib\ARMV4I"
+				AdditionalLibraryDirectories="$(WINDOWSMOBILE65SDK)\PocketPC\Lib\Armv4i;$(ZEBRAEMDK)\Lib\ARMV4I"
 				SubSystem="8"
 				EntryPointSymbol="WinMainCRTStartup"
 				GenerateDebugInformation="false"/>

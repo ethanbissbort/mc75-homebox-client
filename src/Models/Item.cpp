@@ -1,8 +1,42 @@
 #include "../../include/Models/Item.hpp"
 #include "../../include/Models/JsonLite.hpp"
+#include "../../include/StrUtil.hpp"
 
 namespace HBX {
 namespace Models {
+
+namespace {
+
+// Appends `"key":"escaped value"` to an object under construction, inserting
+// the separating comma only when something has already been written.
+void AppendField(Str::Buffer& out, bool* first, const TCHAR* key, const TCHAR* value)
+{
+    if (!value) {
+        return;
+    }
+    if (!*first) {
+        out.AppendChar((TCHAR)',');
+    }
+    *first = false;
+    out.AppendJsonPair(key, value);
+}
+
+// Reads one string field at its full length. Extracting through a shared fixed
+// buffer would cap every field, and the queue round-trip (GetItem, offline
+// edit, UpdateItem) would then write the shortened text back over the server's
+// full value.
+void AssignField(const JsonLite& parser, const TCHAR* key, Item* item,
+                 void (Item::*setter)(const TCHAR*))
+{
+    TCHAR* value = parser.GetStringAlloc(key);
+    if (!value) {
+        return;
+    }
+    (item->*setter)(value);
+    delete[] value;
+}
+
+} // namespace
 
 Item::Item()
     : m_id(NULL)
@@ -120,31 +154,12 @@ bool Item::FromJson(const TCHAR* json)
     }
 
     // Extract fields
-    TCHAR buffer[512];
-
-    if (parser.GetString(TEXT("id"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
-        SetId(buffer);
-    }
-
-    if (parser.GetString(TEXT("barcode"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
-        SetBarcode(buffer);
-    }
-
-    if (parser.GetString(TEXT("name"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
-        SetName(buffer);
-    }
-
-    if (parser.GetString(TEXT("description"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
-        SetDescription(buffer);
-    }
-
-    if (parser.GetString(TEXT("locationId"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
-        SetLocationId(buffer);
-    }
-
-    if (parser.GetString(TEXT("category"), buffer, sizeof(buffer) / sizeof(TCHAR))) {
-        SetCategory(buffer);
-    }
+    AssignField(parser, TEXT("id"),          this, &Item::SetId);
+    AssignField(parser, TEXT("barcode"),     this, &Item::SetBarcode);
+    AssignField(parser, TEXT("name"),        this, &Item::SetName);
+    AssignField(parser, TEXT("description"), this, &Item::SetDescription);
+    AssignField(parser, TEXT("locationId"),  this, &Item::SetLocationId);
+    AssignField(parser, TEXT("category"),    this, &Item::SetCategory);
 
     int quantity = 0;
     if (parser.GetInt(TEXT("quantity"), &quantity)) {
@@ -156,57 +171,35 @@ bool Item::FromJson(const TCHAR* json)
 
 TCHAR* Item::ToJson() const
 {
-    // Build JSON string manually
-    TCHAR* json = new TCHAR[2048];
-    int pos = 0;
+    // Fields are caller-sized (a scanned description has no length limit) and
+    // may contain quotes, backslashes or newlines, so the document is built in
+    // a growable buffer with every value escaped. Escaping the newline matters
+    // beyond JSON validity: the journal queue is line-oriented, so a raw
+    // newline in a payload would split one queued transaction into two
+    // unreplayable lines.
+    Str::Buffer out;
+    out.AppendChar((TCHAR)'{');
 
-    // Helper lambda for adding strings (manual implementation for C++03)
-    json[pos++] = '{';
+    bool first = true;
+    AppendField(out, &first, TEXT("id"),          m_id);
+    AppendField(out, &first, TEXT("barcode"),     m_barcode);
+    AppendField(out, &first, TEXT("name"),        m_name);
+    AppendField(out, &first, TEXT("description"), m_description);
+    AppendField(out, &first, TEXT("locationId"),  m_locationId);
+    AppendField(out, &first, TEXT("category"),    m_category);
 
-    // Add id
-    if (m_id) {
-        wsprintf(json + pos, TEXT("\"id\":\"%s\","), m_id);
-        pos = lstrlen(json);
+    // Quantity is always present, so it closes the object.
+    if (!first) {
+        out.AppendChar((TCHAR)',');
+    }
+    out.AppendJsonInt(TEXT("quantity"), m_quantity);
+    out.AppendChar((TCHAR)'}');
+
+    if (out.Failed()) {
+        return NULL;
     }
 
-    // Add barcode
-    if (m_barcode) {
-        wsprintf(json + pos, TEXT("\"barcode\":\"%s\","), m_barcode);
-        pos = lstrlen(json);
-    }
-
-    // Add name
-    if (m_name) {
-        wsprintf(json + pos, TEXT("\"name\":\"%s\","), m_name);
-        pos = lstrlen(json);
-    }
-
-    // Add description
-    if (m_description) {
-        wsprintf(json + pos, TEXT("\"description\":\"%s\","), m_description);
-        pos = lstrlen(json);
-    }
-
-    // Add locationId
-    if (m_locationId) {
-        wsprintf(json + pos, TEXT("\"locationId\":\"%s\","), m_locationId);
-        pos = lstrlen(json);
-    }
-
-    // Add category
-    if (m_category) {
-        wsprintf(json + pos, TEXT("\"category\":\"%s\","), m_category);
-        pos = lstrlen(json);
-    }
-
-    // Add quantity
-    wsprintf(json + pos, TEXT("\"quantity\":%d"), m_quantity);
-    pos = lstrlen(json);
-
-    json[pos++] = '}';
-    json[pos] = '\0';
-
-    return json;
+    return out.Detach();
 }
 
 bool Item::IsValid() const

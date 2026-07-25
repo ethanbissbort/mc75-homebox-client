@@ -421,10 +421,18 @@ typedef struct _LOGFONT {
 /* Window messages */
 #define WM_CREATE       0x0001
 #define WM_DESTROY      0x0002
+#define WM_ACTIVATE     0x0006
 #define WM_SIZE         0x0005
 #define WM_CLOSE        0x0010
+#define WM_SETTINGCHANGE 0x001A
 #define WM_COMMAND      0x0111
+#define WM_TIMER        0x0113
 #define WM_NOTIFY       0x004E
+#define WM_HIBERNATE    0x03FF
+#define WM_APP          0x8000
+#define WA_INACTIVE     0
+#define EM_LIMITTEXT    0x00C5
+#define ERROR_ALREADY_EXISTS 183
 /* Get/SetWindowLong indexes */
 #define GWL_WNDPROC     (-4)
 #define GWL_USERDATA    (-21)
@@ -480,5 +488,17 @@ inline HGDIOBJ GetStockObject(int)                      { return (HGDIOBJ)0; }
 inline HFONT   CreateFontIndirect(const LOGFONT*)       { return (HFONT)0; }
 inline BOOL    DeleteObject(HGDIOBJ)                    { return TRUE; }
 inline LRESULT SendMessage(HWND, UINT, WPARAM, LPARAM)  { return 0; }
+inline BOOL    PostMessage(HWND, UINT, WPARAM, LPARAM)  { return TRUE; }
+
+/* Timers, the single-instance mutex and the last-error channel. The UI layer
+ * uses these for auto-sync, for marshalling a scan off the EMDK thread, and for
+ * refusing a second launch; they are inert here but keep that code compiling. */
+inline UINT_PTR SetTimer(HWND, UINT_PTR id, UINT, void*) { return id; }
+inline BOOL     KillTimer(HWND, UINT_PTR)                { return TRUE; }
+inline HANDLE   CreateMutex(void*, BOOL, const TCHAR*)   { return (HANDLE)(intptr_t)0x2000; }
+inline BOOL     ReleaseMutex(HANDLE)                     { return TRUE; }
+inline DWORD    GetLastError()                           { return 0; }
+inline HWND     FindWindow(const TCHAR*, const TCHAR*)   { return (HWND)0; }
+inline BOOL     SetForegroundWindow(HWND)                { return TRUE; }
 
 #endif /* HBX_SHIM_WINDOWS_H */

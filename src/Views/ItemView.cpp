@@ -1,4 +1,6 @@
 #include "../../include/Views/ItemView.hpp"
+#include "../../include/Views/ViewHelpers.hpp"
+#include "../../include/StrUtil.hpp"
 
 namespace HBX {
 namespace Views {
@@ -16,14 +18,21 @@ ItemView::ItemView()
     , m_hInstance(NULL)
     , m_editable(false)
     , m_hasChanges(false)
+    , m_itemId(NULL)
     , m_saveCallback(NULL)
     , m_callbackUserData(NULL)
+    , m_cancelCallback(NULL)
+    , m_cancelUserData(NULL)
 {
+    for (int i = 0; i < FIELD_COUNT; i++) {
+        m_labels[i] = NULL;
+    }
 }
 
 ItemView::~ItemView()
 {
     Destroy();
+    SetItemId(NULL);
 }
 
 bool ItemView::Create(HWND parentWnd, HINSTANCE hInstance)
@@ -58,68 +67,55 @@ bool ItemView::Create(HWND parentWnd, HINSTANCE hInstance)
         return false;
     }
 
-    int yPos = 10;
-    int labelHeight = 20;
-    int editHeight = 25;
-    int spacing = 5;
+    // Controls are created at nominal positions and then placed by
+    // LayoutControls, which is also what runs on every WM_SIZE.
+    static const TCHAR* const kLabels[FIELD_COUNT] = {
+        TEXT("Barcode:"), TEXT("Name:"), TEXT("Description:"),
+        TEXT("Location:"), TEXT("Quantity:"), TEXT("Category:")
+    };
 
-    // Barcode label and edit
-    CreateWindow(TEXT("STATIC"), TEXT("Barcode:"),
-        WS_CHILD | WS_VISIBLE, 10, yPos, 80, labelHeight, m_hwnd, NULL, hInstance, NULL);
+    for (int i = 0; i < FIELD_COUNT; i++) {
+        m_labels[i] = CreateWindow(TEXT("STATIC"), kLabels[i],
+            WS_CHILD | WS_VISIBLE, 10, 10, 80, 20, m_hwnd, NULL, hInstance, NULL);
+    }
+
     m_barcodeEdit = CreateWindow(TEXT("EDIT"), TEXT(""),
         WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-        100, yPos, 130, editHeight, m_hwnd, (HMENU)2001, hInstance, NULL);
-    yPos += editHeight + spacing;
+        100, 10, 130, 25, m_hwnd, (HMENU)2001, hInstance, NULL);
 
-    // Name label and edit
-    CreateWindow(TEXT("STATIC"), TEXT("Name:"),
-        WS_CHILD | WS_VISIBLE, 10, yPos, 80, labelHeight, m_hwnd, NULL, hInstance, NULL);
     m_nameEdit = CreateWindow(TEXT("EDIT"), TEXT(""),
         WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-        100, yPos, 130, editHeight, m_hwnd, (HMENU)2002, hInstance, NULL);
-    yPos += editHeight + spacing;
+        100, 10, 130, 25, m_hwnd, (HMENU)2002, hInstance, NULL);
 
-    // Description label and edit
-    CreateWindow(TEXT("STATIC"), TEXT("Description:"),
-        WS_CHILD | WS_VISIBLE, 10, yPos, 80, labelHeight, m_hwnd, NULL, hInstance, NULL);
     m_descEdit = CreateWindow(TEXT("EDIT"), TEXT(""),
         WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL,
-        100, yPos, 130, 50, m_hwnd, (HMENU)2003, hInstance, NULL);
-    yPos += 50 + spacing;
+        100, 10, 130, 50, m_hwnd, (HMENU)2003, hInstance, NULL);
 
-    // Location label and edit
-    CreateWindow(TEXT("STATIC"), TEXT("Location:"),
-        WS_CHILD | WS_VISIBLE, 10, yPos, 80, labelHeight, m_hwnd, NULL, hInstance, NULL);
     m_locationEdit = CreateWindow(TEXT("EDIT"), TEXT(""),
         WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-        100, yPos, 130, editHeight, m_hwnd, (HMENU)2004, hInstance, NULL);
-    yPos += editHeight + spacing;
+        100, 10, 130, 25, m_hwnd, (HMENU)2004, hInstance, NULL);
 
-    // Quantity label and edit
-    CreateWindow(TEXT("STATIC"), TEXT("Quantity:"),
-        WS_CHILD | WS_VISIBLE, 10, yPos, 80, labelHeight, m_hwnd, NULL, hInstance, NULL);
     m_quantityEdit = CreateWindow(TEXT("EDIT"), TEXT("0"),
         WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER,
-        100, yPos, 130, editHeight, m_hwnd, (HMENU)2005, hInstance, NULL);
-    yPos += editHeight + spacing;
+        100, 10, 130, 25, m_hwnd, (HMENU)2005, hInstance, NULL);
 
-    // Category label and edit
-    CreateWindow(TEXT("STATIC"), TEXT("Category:"),
-        WS_CHILD | WS_VISIBLE, 10, yPos, 80, labelHeight, m_hwnd, NULL, hInstance, NULL);
     m_categoryEdit = CreateWindow(TEXT("EDIT"), TEXT(""),
         WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-        100, yPos, 130, editHeight, m_hwnd, (HMENU)2006, hInstance, NULL);
-    yPos += editHeight + 15;
+        100, 10, 130, 25, m_hwnd, (HMENU)2006, hInstance, NULL);
 
-    // Save button
+    // ES_NUMBER only restricts the characters, not how many of them: cap the
+    // digit count so a leaned-on keypad cannot push the parse past INT_MAX.
+    if (m_quantityEdit) {
+        SendMessage(m_quantityEdit, EM_LIMITTEXT, (WPARAM)MAX_QUANTITY_DIGITS, 0);
+    }
+
     m_saveButton = CreateWindow(TEXT("BUTTON"), TEXT("Save"),
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        30, yPos, 80, 35, m_hwnd, (HMENU)2007, hInstance, NULL);
+        30, 250, 80, 35, m_hwnd, (HMENU)2007, hInstance, NULL);
 
-    // Cancel button
     m_cancelButton = CreateWindow(TEXT("BUTTON"), TEXT("Cancel"),
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        130, yPos, 80, 35, m_hwnd, (HMENU)2008, hInstance, NULL);
+        130, 250, 80, 35, m_hwnd, (HMENU)2008, hInstance, NULL);
 
     LayoutControls();
 
@@ -146,6 +142,17 @@ HWND ItemView::GetHandle() const
     return m_hwnd;
 }
 
+void ItemView::SetItemId(const TCHAR* id)
+{
+    if (m_itemId) {
+        delete[] m_itemId;
+        m_itemId = NULL;
+    }
+    if (id && lstrlen(id) > 0) {
+        m_itemId = Str::Dup(id);
+    }
+}
+
 void ItemView::DisplayItem(const Models::Item* item)
 {
     if (!item) {
@@ -153,32 +160,46 @@ void ItemView::DisplayItem(const Models::Item* item)
         return;
     }
 
-    if (m_barcodeEdit && item->GetBarcode()) {
-        SetWindowText(m_barcodeEdit, item->GetBarcode());
+    // The id has no field of its own on this cramped screen, but it decides
+    // whether a save updates or creates, so keep it alongside the form.
+    SetItemId(item->GetId());
+
+    if (m_barcodeEdit) {
+        SetWindowText(m_barcodeEdit, item->GetBarcode() ? item->GetBarcode() : TEXT(""));
     }
 
-    if (m_nameEdit && item->GetName()) {
-        SetWindowText(m_nameEdit, item->GetName());
+    if (m_nameEdit) {
+        SetWindowText(m_nameEdit, item->GetName() ? item->GetName() : TEXT(""));
     }
 
-    if (m_descEdit && item->GetDescription()) {
-        SetWindowText(m_descEdit, item->GetDescription());
+    if (m_descEdit) {
+        SetWindowText(m_descEdit, item->GetDescription() ? item->GetDescription() : TEXT(""));
     }
 
-    if (m_locationEdit && item->GetLocationId()) {
-        SetWindowText(m_locationEdit, item->GetLocationId());
+    if (m_locationEdit) {
+        SetWindowText(m_locationEdit, item->GetLocationId() ? item->GetLocationId() : TEXT(""));
     }
 
     if (m_quantityEdit) {
         TCHAR buffer[32];
-        wsprintf(buffer, TEXT("%d"), item->GetQuantity());
+        buffer[0] = 0;
+        Str::AppendInt(buffer, (int)(sizeof(buffer) / sizeof(TCHAR)), item->GetQuantity());
         SetWindowText(m_quantityEdit, buffer);
     }
 
-    if (m_categoryEdit && item->GetCategory()) {
-        SetWindowText(m_categoryEdit, item->GetCategory());
+    if (m_categoryEdit) {
+        SetWindowText(m_categoryEdit, item->GetCategory() ? item->GetCategory() : TEXT(""));
     }
 
+    m_hasChanges = false;
+}
+
+void ItemView::DisplayNewItem(const TCHAR* barcode)
+{
+    Clear();
+    if (m_barcodeEdit && barcode) {
+        SetWindowText(m_barcodeEdit, barcode);
+    }
     m_hasChanges = false;
 }
 
@@ -188,46 +209,48 @@ bool ItemView::GetItemData(Models::Item* item) const
         return false;
     }
 
-    TCHAR buffer[512];
+    TCHAR buffer[MAX_FIELD_CHARS];
 
-    // Get barcode
+    // Carry the displayed record's id back out, so an edit of an existing item
+    // is pushed as an update instead of creating a second copy of it.
+    if (m_itemId) {
+        item->SetId(m_itemId);
+    }
+
     if (m_barcodeEdit) {
-        GetWindowText(m_barcodeEdit, buffer, sizeof(buffer) / sizeof(TCHAR));
+        GetWindowText(m_barcodeEdit, buffer, MAX_FIELD_CHARS);
         item->SetBarcode(buffer);
     }
 
-    // Get name
     if (m_nameEdit) {
-        GetWindowText(m_nameEdit, buffer, sizeof(buffer) / sizeof(TCHAR));
+        GetWindowText(m_nameEdit, buffer, MAX_FIELD_CHARS);
         item->SetName(buffer);
     }
 
-    // Get description
     if (m_descEdit) {
-        GetWindowText(m_descEdit, buffer, sizeof(buffer) / sizeof(TCHAR));
+        GetWindowText(m_descEdit, buffer, MAX_FIELD_CHARS);
         item->SetDescription(buffer);
     }
 
-    // Get location
     if (m_locationEdit) {
-        GetWindowText(m_locationEdit, buffer, sizeof(buffer) / sizeof(TCHAR));
+        GetWindowText(m_locationEdit, buffer, MAX_FIELD_CHARS);
         item->SetLocationId(buffer);
     }
 
-    // Get quantity
     if (m_quantityEdit) {
-        GetWindowText(m_quantityEdit, buffer, sizeof(buffer) / sizeof(TCHAR));
+        GetWindowText(m_quantityEdit, buffer, MAX_FIELD_CHARS);
         int quantity = 0;
-        // Simple string to int conversion
-        for (int i = 0; buffer[i] >= '0' && buffer[i] <= '9'; i++) {
-            quantity = quantity * 10 + (buffer[i] - '0');
+        if (lstrlen(buffer) > 0 && !Str::ParseInt(buffer, &quantity)) {
+            return false;   // not a number at all: reject rather than save 0
+        }
+        if (quantity < 0) {
+            quantity = 0;
         }
         item->SetQuantity(quantity);
     }
 
-    // Get category
     if (m_categoryEdit) {
-        GetWindowText(m_categoryEdit, buffer, sizeof(buffer) / sizeof(TCHAR));
+        GetWindowText(m_categoryEdit, buffer, MAX_FIELD_CHARS);
         item->SetCategory(buffer);
     }
 
@@ -236,6 +259,8 @@ bool ItemView::GetItemData(Models::Item* item) const
 
 void ItemView::Clear()
 {
+    SetItemId(NULL);
+
     if (m_barcodeEdit) SetWindowText(m_barcodeEdit, TEXT(""));
     if (m_nameEdit) SetWindowText(m_nameEdit, TEXT(""));
     if (m_descEdit) SetWindowText(m_descEdit, TEXT(""));
@@ -266,6 +291,12 @@ void ItemView::SetSaveCallback(SaveCallback callback, void* userData)
 {
     m_saveCallback = callback;
     m_callbackUserData = userData;
+}
+
+void ItemView::SetCancelCallback(CancelCallback callback, void* userData)
+{
+    m_cancelCallback = callback;
+    m_cancelUserData = userData;
 }
 
 LRESULT CALLBACK ItemView::WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -328,9 +359,21 @@ void ItemView::OnSaveClick()
 
 void ItemView::OnCancelClick()
 {
-    // Just clear the changes flag and optionally close the view
+    if (m_hasChanges) {
+        if (!ViewHelpers::ShowConfirm(m_hwnd, TEXT("Discard changes"),
+                                      TEXT("Discard the changes to this item?"))) {
+            return;
+        }
+    }
+
     m_hasChanges = false;
     Clear();
+
+    // Hand control back so the user lands on a usable screen; without this the
+    // editor stays up with an empty form and no way out.
+    if (m_cancelCallback) {
+        m_cancelCallback(m_cancelUserData);
+    }
 }
 
 void ItemView::OnTextChanged()
@@ -340,10 +383,69 @@ void ItemView::OnTextChanged()
 
 void ItemView::LayoutControls()
 {
-    // Controls are positioned with fixed coordinates at creation time. This
-    // hook exists for symmetry with the other views and as the place to add
-    // dynamic reflow (MoveWindow per row on WM_SIZE) if the form ever needs to
-    // adapt to orientation changes; today it intentionally does nothing.
+    if (!m_hwnd) {
+        return;
+    }
+
+    RECT clientRect;
+    GetClientRect(m_hwnd, &clientRect);
+
+    int width = clientRect.right - clientRect.left;
+    int height = clientRect.bottom - clientRect.top;
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    const int margin = 8;
+    const int labelWidth = 78;
+    const int gap = 4;
+    const int rowHeight = 24;
+    const int descHeight = 44;
+    const int buttonHeight = 32;
+
+    int editX = margin + labelWidth + gap;
+    int editWidth = width - editX - margin;
+    if (editWidth < 60) {
+        editWidth = 60;
+    }
+
+    HWND edits[FIELD_COUNT] = {
+        m_barcodeEdit, m_nameEdit, m_descEdit,
+        m_locationEdit, m_quantityEdit, m_categoryEdit
+    };
+
+    int y = margin;
+    for (int i = 0; i < FIELD_COUNT; i++) {
+        int h = (i == DESCRIPTION_ROW) ? descHeight : rowHeight;
+        if (m_labels[i]) {
+            MoveWindow(m_labels[i], margin, y + 3, labelWidth, rowHeight - 4, TRUE);
+        }
+        if (edits[i]) {
+            MoveWindow(edits[i], editX, y, editWidth, h, TRUE);
+        }
+        y += h + gap;
+    }
+
+    // Bottom-anchored: the soft-key menu bar and the navigation bar leave the
+    // MC75 barely 268 px of client height, so fixed button coordinates taken
+    // from a nominal 320 px form fall off the screen.
+    int buttonY = height - buttonHeight - margin;
+    if (buttonY < y) {
+        buttonY = y;    // very short client area: let the form scroll off instead
+    }
+
+    int buttonWidth = (width - (3 * margin)) / 2;
+    if (buttonWidth < 50) {
+        buttonWidth = 50;
+    }
+
+    if (m_saveButton) {
+        MoveWindow(m_saveButton, margin, buttonY, buttonWidth, buttonHeight, TRUE);
+    }
+    if (m_cancelButton) {
+        MoveWindow(m_cancelButton, margin + buttonWidth + margin, buttonY,
+                   buttonWidth, buttonHeight, TRUE);
+    }
 }
 
 void ItemView::EnableControls(bool enabled)

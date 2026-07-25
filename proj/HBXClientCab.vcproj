@@ -17,8 +17,6 @@
 				DefaultInstallDir="\Program Files\HBXClient\"/>
 			<DeploymentFiles>
 				<DeployFile Name="..\bin\Debug\HBXClient.exe" DestinationDir="\Program Files\HBXClient\"/>
-				<DeployFile Name="..\resources\strings.rc" DestinationDir="\Program Files\HBXClient\"/>
-				<DeployFile Name="..\resources\layout.rc" DestinationDir="\Program Files\HBXClient\"/>
 				<DeployFile Name="..\hb_conf.json" DestinationDir="\Program Files\HBXClient\" Condition="IfExists"/>
 			</DeploymentFiles>
 		</Configuration>
