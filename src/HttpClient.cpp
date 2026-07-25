@@ -959,39 +959,46 @@ bool HttpClient::ParseUrl(const TCHAR* url, TCHAR* host, int* port, TCHAR* path,
 
     // Extract host. Truncation is rejected rather than silently accepted: a
     // shortened host name resolves to a different server, or to nothing.
+    // Every failure path below clears the outputs before returning, so a caller
+    // that neglects to check the result gets an empty host that fails fast
+    // rather than a plausible-looking wrong one.
+    bool ok = true;
+
     if (portStart && (!pathStart || portStart < pathStart)) {
         // Port specified
-        if (!Str::CopyN(host, hostMax, start, (int)(portStart - start))) {
-            return false;
-        }
+        ok = Str::CopyN(host, hostMax, start, (int)(portStart - start));
 
-        // Extract port
-        int parsedPort = _wtoi(portStart + 1);
-        if (parsedPort <= 0 || parsedPort > 65535) {
-            return false;
+        if (ok) {
+            int parsedPort = _wtoi(portStart + 1);
+            if (parsedPort <= 0 || parsedPort > 65535) {
+                ok = false;
+            } else {
+                *port = parsedPort;
+                // Find path after port
+                pathStart = wcschr(portStart, '/');
+            }
         }
-        *port = parsedPort;
-
-        // Find path after port
-        pathStart = wcschr(portStart, '/');
     } else if (pathStart) {
         // No port, path specified
-        if (!Str::CopyN(host, hostMax, start, (int)(pathStart - start))) {
-            return false;
-        }
+        ok = Str::CopyN(host, hostMax, start, (int)(pathStart - start));
     } else {
         // No port, no path
-        if (!Str::Copy(host, hostMax, start)) {
-            return false;
-        }
+        ok = Str::Copy(host, hostMax, start);
     }
 
     // Extract path (query string included)
-    if (pathStart && !Str::Copy(path, pathMax, pathStart)) {
+    if (ok && pathStart) {
+        ok = Str::Copy(path, pathMax, pathStart);
+    }
+
+    if (!ok || lstrlen(host) == 0) {
+        host[0] = '\0';
+        path[0] = '/';
+        path[1] = '\0';
         return false;
     }
 
-    return (lstrlen(host) > 0);
+    return true;
 }
 
 void HttpClient::ClearHeaders()
