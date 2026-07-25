@@ -27,18 +27,24 @@ BIN   := $(BUILD)/hbx_host_tests
 # and <wchar.h> resolve to the shims instead of any real system header.
 CXXFLAGS := -std=c++03 -D_GNU_SOURCE \
             -I$(SHIM) -I$(INC) -I$(HOST) \
-            -Wall -Wextra -g -O0 \
+            -Wall -Wextra -g -O0 -pthread \
             -Wno-deprecated-declarations -Wno-sign-compare -Wno-unused-parameter
 
 # Platform-independent production sources exercised by the tests.
+#
+# SyncEngine belongs here even though it talks to HbClient: its queue/replay
+# logic is the part of the app most likely to break silently, and leaving it
+# out meant the entire offline pipeline was compile-checked but never run.
 CORE_SRC := \
+    $(ROOT)/src/StrUtil.cpp \
     $(ROOT)/src/Models/JsonLite.cpp \
     $(ROOT)/src/Models/Item.cpp \
     $(ROOT)/src/Models/Location.cpp \
     $(ROOT)/src/Config.cpp \
     $(ROOT)/src/Journal.cpp \
     $(ROOT)/src/HttpClient.cpp \
-    $(ROOT)/src/HbClient.cpp
+    $(ROOT)/src/HbClient.cpp \
+    $(ROOT)/src/SyncEngine.cpp
 
 # Every production source, including the GUI / scanner / controller layer.
 # These are syntax-checked (not run) against the shim as a full-codebase build
@@ -58,6 +64,7 @@ DEVICE_GATE_FLAGS := $(GATE_FLAGS) -DHBX_USE_EMDK -DHBX_USE_WININET
 
 # Test sources + runner entry point.
 TEST_SRC := \
+    $(ROOT)/tests/unit/test_strutil.cpp \
     $(ROOT)/tests/unit/test_json.cpp \
     $(ROOT)/tests/unit/test_journal.cpp \
     $(ROOT)/tests/unit/test_http.cpp \

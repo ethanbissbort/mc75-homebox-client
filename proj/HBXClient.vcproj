@@ -98,6 +98,7 @@
 		<File RelativePath="..\src\Journal.cpp"/>
 		<File RelativePath="..\src\SyncEngine.cpp"/>
 		<File RelativePath="..\src\Config.cpp"/>
+		<File RelativePath="..\src\StrUtil.cpp"/>
 		<File RelativePath="..\src\ScannerHAL.cpp"/>
 		<Filter Name="Views">
 			<File RelativePath="..\src\Views\ScanView.cpp"/>
@@ -120,6 +121,7 @@
 			<File RelativePath="..\include\Journal.hpp"/>
 			<File RelativePath="..\include\SyncEngine.hpp"/>
 			<File RelativePath="..\include\Config.hpp"/>
+			<File RelativePath="..\include\StrUtil.hpp"/>
 			<File RelativePath="..\include\ScannerHAL.hpp"/>
 			<File RelativePath="..\include\Models\Models.hpp"/>
 			<File RelativePath="..\include\Models\Item.hpp"/>

@@ -31,6 +31,7 @@
 #include <ctime>
 #include <fcntl.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/stat.h>
 
 /* ------------------------------------------------------------------ types */
@@ -124,13 +125,26 @@ inline TCHAR* wcsncpy(TCHAR* d, const TCHAR* s, size_t n)       { return std::st
 inline int   _wtoi(const TCHAR* s)                              { return std::atoi(s); }
 inline long  wcstol(const TCHAR* s, TCHAR** end, int base)      { return std::strtol(s, end, base); }
 
-/* wsprintf: Win32 has no size argument; vsprintf mirrors that behaviour. */
+/* wsprintf: Win32 has no size argument, but wsprintfW *does* stop after 1024
+ * characters including the NUL. Reproducing that cap here matters: without it
+ * the host build would happily write past a length the device silently
+ * truncates, so a buffer defect would present completely differently on the
+ * two targets. vsnprintf with the same limit gives identical semantics. */
+#define HBX_WSPRINTF_MAX 1024
 inline int wsprintf(TCHAR* buffer, const TCHAR* format, ...)
 {
     va_list args;
     va_start(args, format);
-    int n = std::vsprintf(buffer, format, args);
+    int n = std::vsnprintf(buffer, HBX_WSPRINTF_MAX, format, args);
     va_end(args);
+    /* Win32 returns the number of characters actually written. */
+    if (n < 0) {
+        buffer[0] = 0;
+        return 0;
+    }
+    if (n >= HBX_WSPRINTF_MAX) {
+        n = HBX_WSPRINTF_MAX - 1;
+    }
     return n;
 }
 
@@ -257,6 +271,36 @@ inline HANDLE CreateThread(void* /*sec*/, DWORD /*stack*/, LPTHREAD_START_ROUTIN
     return (HANDLE)(intptr_t)0x1000;
 }
 inline DWORD WaitForSingleObject(HANDLE /*h*/, DWORD /*ms*/) { return 0; }
+
+/* ------------------------------------------------ critical sections (real)
+ * Backed by a real recursive pthread mutex rather than a no-op. The device
+ * code takes these locks on the EMDK scanner thread and the UI thread, and a
+ * no-op here would let a recursive-acquire or unbalanced-release bug compile
+ * and "pass" on the host while deadlocking on the MC75. */
+typedef struct _CRITICAL_SECTION {
+    pthread_mutex_t mutex;
+} CRITICAL_SECTION, *LPCRITICAL_SECTION;
+
+inline void InitializeCriticalSection(LPCRITICAL_SECTION cs)
+{
+    pthread_mutexattr_t attr;
+    ::pthread_mutexattr_init(&attr);
+    ::pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    ::pthread_mutex_init(&cs->mutex, &attr);
+    ::pthread_mutexattr_destroy(&attr);
+}
+inline void DeleteCriticalSection(LPCRITICAL_SECTION cs)  { ::pthread_mutex_destroy(&cs->mutex); }
+inline void EnterCriticalSection(LPCRITICAL_SECTION cs)   { ::pthread_mutex_lock(&cs->mutex); }
+inline void LeaveCriticalSection(LPCRITICAL_SECTION cs)   { ::pthread_mutex_unlock(&cs->mutex); }
+
+/* ---------------------------------------------------------- interlocked ops
+ * GCC's __sync builtins give the same full-barrier semantics WinCE provides. */
+inline LONG InterlockedIncrement(LONG volatile* target) { return __sync_add_and_fetch(target, 1); }
+inline LONG InterlockedDecrement(LONG volatile* target) { return __sync_sub_and_fetch(target, 1); }
+inline LONG InterlockedExchange(LONG volatile* target, LONG value)
+{
+    return __sync_lock_test_and_set(target, value);
+}
 
 /* ============================================================= GUI shim ===
  * The types/constants/functions below let the Win32/WinCE GUI translation
