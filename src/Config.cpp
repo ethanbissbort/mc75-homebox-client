@@ -131,6 +131,217 @@ bool ReadBool(const JsonLite* parser, const TCHAR* json, const TCHAR* key, bool*
 }
 
 // ---------------------------------------------------------------------------
+// File reading
+// ---------------------------------------------------------------------------
+
+enum ReadResult {
+    READ_OK,      // *out holds the decoded document; caller delete[]s it
+    READ_ABSENT,  // nothing deployed at that path, or an empty file
+    READ_FAILED   // a file is there but could not be read or decoded
+};
+
+/**
+ * Reads `path` and decodes it from UTF-8 into TCHAR text. `maxBytes` of 0
+ * accepts any size; a larger file is reported as READ_FAILED rather than
+ * allocated.
+ */
+ReadResult ReadConfigFile(const TCHAR* path, DWORD maxBytes, TCHAR** out)
+{
+    *out = NULL;
+
+    HANDLE hFile = CreateFile(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return READ_ABSENT;
+    }
+
+    DWORD fileSize = GetFileSize(hFile, NULL);
+    if (fileSize == 0 || fileSize == INVALID_FILE_SIZE) {
+        CloseHandle(hFile);
+        return READ_ABSENT;
+    }
+
+    if (maxBytes != 0 && fileSize > maxBytes) {
+        CloseHandle(hFile);
+        return READ_FAILED;
+    }
+
+    char* buffer = new char[fileSize + 1];
+    if (!buffer) {
+        CloseHandle(hFile);
+        return READ_FAILED;
+    }
+
+    DWORD bytesRead = 0;
+    BOOL success = ReadFile(hFile, buffer, fileSize, &bytesRead, NULL);
+    CloseHandle(hFile);
+
+    if (!success || bytesRead == 0) {
+        delete[] buffer;
+        return READ_FAILED;
+    }
+
+    buffer[bytesRead] = '\0';
+
+    // The file is UTF-8 (docs/API_NOTES.md: "Character Encoding: UTF-8"), so it
+    // is decoded rather than byte-truncated into TCHARs.
+    TCHAR* text = Str::FromUtf8Alloc(buffer);
+    delete[] buffer;
+
+    if (!text) {
+        return READ_FAILED;
+    }
+
+    *out = text;
+    return READ_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Foreign keys
+//
+// Save() rewrites the document from the fields this class owns, so any other
+// top-level key - a site marker an installer drops in, the annotated _readme
+// block shipped with the template - would be deleted the first time the file is
+// written. Everything not named below is carried through instead.
+//
+// "offlineMode" is listed even though Save() never writes it: it is the older
+// spelling of offlineModeEnabled and Load() still honours it, so carrying it
+// through would leave two keys claiming one setting, with the stale one winning
+// on any reader that looks at it first.
+// ---------------------------------------------------------------------------
+
+const TCHAR* const kKnownKeys[] = {
+    TEXT("activeBackend"),
+    TEXT("homeboxInstanceId"),
+    TEXT("apiBaseUrl"),
+    TEXT("deviceId"),
+    TEXT("apiKey"),
+    TEXT("authToken"),
+    TEXT("netboxInstanceId"),
+    TEXT("netboxBaseUrl"),
+    TEXT("netboxToken"),
+    TEXT("netboxAuthScheme"),
+    TEXT("allowInsecureTls"),
+    TEXT("syncIntervalSeconds"),
+    TEXT("journalPath"),
+    TEXT("logLevel"),
+    TEXT("scannerBeepEnabled"),
+    TEXT("scannerVibrateEnabled"),
+    TEXT("offlineModeEnabled"),
+    TEXT("offlineMode")
+};
+
+// A file this large was not written by an operator, and Save() runs on the
+// authentication path - re-reading and re-parsing it there is not worth an
+// allocation the device may not be able to make.
+const DWORD kMaxPreservedFileBytes = 256UL * 1024UL;
+
+bool IsKnownKey(const TCHAR* key)
+{
+    if (!key) {
+        return true; // nothing addressable, so nothing to carry through
+    }
+
+    const int count = (int)(sizeof(kKnownKeys) / sizeof(kKnownKeys[0]));
+    for (int i = 0; i < count; i++) {
+        if (lstrcmp(key, kKnownKeys[i]) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * The keys of an existing document that Config does not own, held as name plus
+ * already-serialized value until the replacement document is assembled. The
+ * values are serialized up front because how many of them survive decides where
+ * the last comma goes, and a half-written list would be invalid JSON.
+ */
+class ForeignKeys {
+public:
+    ForeignKeys() : m_names(NULL), m_values(NULL), m_count(0) {}
+    ~ForeignKeys() { Release(); }
+
+    /**
+     * `parser` must outlive this collection: the names point into its tree
+     * rather than being copied, which keeps a large _readme block from being
+     * duplicated in memory on a device that has little of it.
+     */
+    void Collect(const JsonLite& parser);
+
+    int Count() const { return m_count; }
+    const TCHAR* Name(int index) const { return m_names[index]; }
+    const TCHAR* Value(int index) const { return m_values[index]; }
+
+private:
+    void Release();
+
+    const TCHAR** m_names;
+    TCHAR** m_values;
+    int m_count;
+
+    // Not copyable: the class owns raw allocations.
+    ForeignKeys(const ForeignKeys&);
+    ForeignKeys& operator=(const ForeignKeys&);
+};
+
+void ForeignKeys::Collect(const JsonLite& parser)
+{
+    Release();
+
+    int members = parser.GetMemberCount();
+    if (members <= 0) {
+        return;
+    }
+
+    m_names = new const TCHAR*[members];
+    m_values = new TCHAR*[members];
+    if (!m_names || !m_values) {
+        Release();
+        return;
+    }
+
+    for (int i = 0; i < members; i++) {
+        const TCHAR* name = parser.GetMemberName(i);
+        if (IsKnownKey(name)) {
+            continue;
+        }
+
+        TCHAR* value = parser.GetMemberJson(i);
+        if (!value) {
+            // One value that will not serialize costs that key, not the file.
+            continue;
+        }
+
+        m_names[m_count] = name;
+        m_values[m_count] = value;
+        m_count++;
+    }
+}
+
+void ForeignKeys::Release()
+{
+    for (int i = 0; i < m_count; i++) {
+        delete[] m_values[i];
+    }
+
+    delete[] m_names;
+    delete[] m_values;
+    m_names = NULL;
+    m_values = NULL;
+    m_count = 0;
+}
+
+// ---------------------------------------------------------------------------
 // Serialization helpers
 // ---------------------------------------------------------------------------
 
@@ -158,6 +369,16 @@ void AppendBoolLine(Str::Buffer& out, const TCHAR* key, bool value, bool last)
     out.AppendJsonString(key);
     out.Append(TEXT(": "));
     out.Append(value ? TEXT("true") : TEXT("false"));
+    out.Append(last ? TEXT("\n") : TEXT(",\n"));
+}
+
+// `valueJson` is already JSON text and is emitted exactly as it was read.
+void AppendRawLine(Str::Buffer& out, const TCHAR* key, const TCHAR* valueJson, bool last)
+{
+    out.Append(TEXT("  "));
+    out.AppendJsonString(key);
+    out.Append(TEXT(": "));
+    out.Append(valueJson);
     out.Append(last ? TEXT("\n") : TEXT(",\n"));
 }
 
@@ -258,47 +479,15 @@ bool Config::Load(const TCHAR* configPath)
     InitDefaults();
     Assign(&m_configPath, configPath);
 
-    // Try to open config file
-    HANDLE hFile = CreateFile(
-        configPath,
-        GENERIC_READ,
-        FILE_SHARE_READ,
-        NULL,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL
-    );
-
-    if (hFile == INVALID_HANDLE_VALUE) {
+    // No size limit here: whatever is deployed has to be readable, and a key
+    // this class needs may sit past any bound worth guessing.
+    TCHAR* jsonContent = NULL;
+    ReadResult status = ReadConfigFile(configPath, 0, &jsonContent);
+    if (status == READ_ABSENT) {
         // File doesn't exist, use defaults
         return true;
     }
-
-    // Get file size
-    DWORD fileSize = GetFileSize(hFile, NULL);
-    if (fileSize == 0 || fileSize == INVALID_FILE_SIZE) {
-        CloseHandle(hFile);
-        return true;
-    }
-
-    // Read file content
-    char* buffer = new char[fileSize + 1];
-    DWORD bytesRead = 0;
-    BOOL success = ReadFile(hFile, buffer, fileSize, &bytesRead, NULL);
-    CloseHandle(hFile);
-
-    if (!success || bytesRead == 0) {
-        delete[] buffer;
-        return false;
-    }
-
-    buffer[bytesRead] = '\0';
-
-    // The file is UTF-8 (docs/API_NOTES.md: "Character Encoding: UTF-8"), so it
-    // is decoded rather than byte-truncated into TCHARs.
-    TCHAR* jsonContent = Str::FromUtf8Alloc(buffer);
-    delete[] buffer;
-    if (!jsonContent) {
+    if (status != READ_OK) {
         return false;
     }
 
@@ -452,15 +641,47 @@ bool Config::Save(const TCHAR* configPath)
         return false;
     }
 
+    // Save() rewrites the whole document from the fields it knows, and
+    // Controller::PersistAuthToken calls it on the first successful
+    // authentication of every run - so anything the new document omits is off
+    // the device on day one, without anyone having opened a settings screen.
+    // Two things follow from that: every key Load() understands must be written
+    // back, and every key it does not understand must be carried through.
+    //
+    // Carrying keys through is best-effort by design. A file that is absent,
+    // larger than kMaxPreservedFileBytes, or too broken to parse (one
+    // hand-edited trailing comma is enough, and the tolerant scanner Load()
+    // falls back to can only find keys it already knows the names of) leaves
+    // nothing to carry, and the save then goes ahead with the known fields
+    // alone: losing the operator's settings because a foreign key could not be
+    // recovered would be the worse failure of the two.
+    //
+    // `parser` is declared before `foreign` so it is destroyed after it - the
+    // collected names point into its tree.
+    TCHAR* existing = NULL;
+    JsonLite parser;
+    ForeignKeys foreign;
+    if (ReadConfigFile(configPath, kMaxPreservedFileBytes, &existing) == READ_OK) {
+        // Parse() keeps its own copy of the text, so the decode buffer goes
+        // back straight away rather than being held for the whole save.
+        bool parsed = parser.Parse(existing);
+        delete[] existing;
+
+        if (parsed && parser.IsObject()) {
+            foreign.Collect(parser);
+        }
+    }
+
     // Values are escaped and the buffer grows. Both matter here: a Windows path
     // is full of backslashes, and a JWT auth token runs well past a thousand
     // characters, so a fixed buffer with raw values makes the file unreadable.
     //
-    // Every key Load() understands must be written back. Save() rewrites the
-    // whole file from the fields it knows, and Controller::PersistAuthToken
-    // calls it on the first successful authentication of every run - so a key
-    // that is loaded but not saved is wiped off the device the first time the
-    // operator authenticates.
+    // Known keys keep their fixed order and foreign ones follow, rather than
+    // being put back where they were found: with both blocks in a stable order,
+    // the file a device writes differs from the previous one only where a
+    // setting actually changed.
+    const bool haveForeign = (foreign.Count() > 0);
+
     Str::Buffer json;
     json.Append(TEXT("{\n"));
     AppendStringLine(json, TEXT("activeBackend"), m_activeBackendId, false);
@@ -479,7 +700,13 @@ bool Config::Save(const TCHAR* configPath)
     AppendStringLine(json, TEXT("logLevel"), m_logLevel, false);
     AppendBoolLine(json, TEXT("scannerBeepEnabled"), m_scannerBeepEnabled, false);
     AppendBoolLine(json, TEXT("scannerVibrateEnabled"), m_scannerVibrateEnabled, false);
-    AppendBoolLine(json, TEXT("offlineModeEnabled"), m_offlineModeEnabled, true);
+    AppendBoolLine(json, TEXT("offlineModeEnabled"), m_offlineModeEnabled, !haveForeign);
+
+    for (int i = 0; i < foreign.Count(); i++) {
+        AppendRawLine(json, foreign.Name(i), foreign.Value(i),
+                      i == foreign.Count() - 1);
+    }
+
     json.Append(TEXT("}\n"));
 
     if (json.Failed()) {

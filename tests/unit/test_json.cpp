@@ -206,6 +206,89 @@ TEST_CASE("JsonLite round-trips a built object back through Parse")
     CHECK_EQ_INT(qty, 7);
 }
 
+/* ------------------------------------------------------ member enumeration */
+
+TEST_CASE("JsonLite walks an object's members in document order")
+{
+    JsonLite j;
+    CHECK(j.Parse(TEXT("{\"name\":\"Widget\",\"quantity\":42,\"price\":9.99,")
+                  TEXT("\"active\":true,\"gone\":null,")
+                  TEXT("\"site\":{\"id\":2,\"name\":\"Nord\"},")
+                  TEXT("\"tags\":[\"a\",\"b\"]}")));
+
+    CHECK_EQ_INT(j.GetMemberCount(), 7);
+
+    CHECK_EQ_STR(j.GetMemberName(0), TEXT("name"));
+    CHECK_EQ_STR(j.GetMemberName(3), TEXT("active"));
+    CHECK_EQ_STR(j.GetMemberName(6), TEXT("tags"));
+
+    /* Out of range in either direction is NULL, not a wrapped index. */
+    CHECK(j.GetMemberName(7) == NULL);
+    CHECK(j.GetMemberName(-1) == NULL);
+    CHECK(j.GetMemberJson(7) == NULL);
+    CHECK(j.GetMemberJson(-1) == NULL);
+
+    /* Every member comes back as JSON text of its own type, ready to be
+       re-emitted into another document without knowing what it holds. */
+    struct { int index; const TCHAR* json; } expected[] = {
+        { 0, TEXT("\"Widget\"") },
+        { 1, TEXT("42") },
+        { 2, TEXT("9.99") },
+        { 3, TEXT("true") },
+        { 4, TEXT("null") },
+        { 5, TEXT("{\"id\":2,\"name\":\"Nord\"}") },
+        { 6, TEXT("[\"a\",\"b\"]") }
+    };
+
+    for (int i = 0; i < 7; i++) {
+        TCHAR* text = j.GetMemberJson(expected[i].index);
+        CHECK(text != NULL);
+        CHECK_EQ_STR(text, expected[i].json);
+        delete[] text;
+    }
+
+    /* A member can also be borrowed by position, under GetObject's rules. */
+    JsonLite site;
+    CHECK(j.GetMemberValue(5, &site));
+    CHECK(site.IsObject());
+    CHECK_EQ_INT(site.GetMemberCount(), 2);
+    CHECK_EQ_STR(site.GetMemberName(1), TEXT("name"));
+
+    JsonLite tags;
+    CHECK(j.GetMemberValue(6, &tags));
+    CHECK(tags.IsArray());
+    CHECK_EQ_INT(tags.GetArrayLength(), 2);
+
+    CHECK_FALSE(j.GetMemberValue(7, &tags));
+
+    /* Borrowing into the parser that owns the tree is refused here too. */
+    CHECK_FALSE(site.GetMemberValue(0, &j));
+    CHECK_EQ_INT(j.GetMemberCount(), 7);
+}
+
+TEST_CASE("JsonLite enumerates nothing for a non-object document")
+{
+    JsonLite arr;
+    CHECK(arr.Parse(TEXT("[1,2,3]")));
+
+    /* GetArrayLength answers for an array; member enumeration is object-only,
+       so a caller cannot mistake element 0 for a named member. */
+    CHECK_EQ_INT(arr.GetArrayLength(), 3);
+    CHECK_EQ_INT(arr.GetMemberCount(), 0);
+    CHECK(arr.GetMemberName(0) == NULL);
+    CHECK(arr.GetMemberJson(0) == NULL);
+
+    JsonLite fresh;
+    CHECK_EQ_INT(fresh.GetMemberCount(), 0);
+    CHECK(fresh.GetMemberName(0) == NULL);
+    CHECK(fresh.GetMemberJson(0) == NULL);
+
+    JsonLite empty;
+    CHECK(empty.Parse(TEXT("{}")));
+    CHECK_EQ_INT(empty.GetMemberCount(), 0);
+    CHECK(empty.GetMemberName(0) == NULL);
+}
+
 /* ---------------------------------------------------------- edge cases */
 
 TEST_CASE("JsonLite rejects a NULL input and reports no type before parse")
@@ -582,4 +665,64 @@ TEST_CASE("JsonLite borrowed views free nothing, whatever the order")
     int n = 0;
     CHECK(orphan.GetInt(TEXT("n"), &n));
     CHECK_EQ_INT(n, 7);
+}
+
+TEST_CASE("JsonLite re-emits an enumerated value that parses back identically")
+{
+    JsonLite env;
+    CHECK(env.Parse(kDeviceListJson));
+
+    /* Enumeration works through a borrowed view, which is how a caller reaches
+       anything below the root. */
+    JsonLite results;
+    CHECK(env.GetArray(TEXT("results"), &results));
+
+    JsonLite dev;
+    CHECK(results.GetArrayElement(0, &dev));
+    CHECK_EQ_STR(dev.GetMemberName(0), TEXT("id"));
+
+    /* A whole sub-object survives the trip out to text and back, escapes and
+       non-ASCII included: this is what lets a writer carry a key it does not
+       understand through a rewrite of the document. */
+    int siteIndex = -1;
+    int members = dev.GetMemberCount();
+    for (int i = 0; i < members; i++) {
+        if (lstrcmp(dev.GetMemberName(i), TEXT("site")) == 0) {
+            siteIndex = i;
+        }
+    }
+    CHECK(siteIndex >= 0);
+
+    TCHAR* siteJson = dev.GetMemberJson(siteIndex);
+    CHECK(siteJson != NULL);
+
+    JsonLite reparsed;
+    CHECK(reparsed.Parse(siteJson));
+    delete[] siteJson;
+
+    TCHAR buf[64];
+    CHECK(reparsed.GetString(TEXT("name"), buf, 64));
+    CHECK_EQ_STR(buf, TEXT("Zürich-Nord"));
+
+    int id = 0;
+    CHECK(reparsed.GetInt(TEXT("id"), &id));
+    CHECK_EQ_INT(id, 2);
+
+    /* A string holding JSON metacharacters is re-escaped on the way out, not
+       emitted raw, so the text is safe to drop into another document. */
+    JsonLite meta;
+    CHECK(meta.Parse(TEXT("{\"k\":\"a\\\"b\\\\c\\nd\"}")));
+
+    TCHAR* text = meta.GetMemberJson(0);
+    CHECK(text != NULL);
+    CHECK_EQ_STR(text, TEXT("\"a\\\"b\\\\c\\nd\""));
+
+    const TCHAR* cursor = text;
+    TCHAR* decoded = NULL;
+    CHECK(JsonLite::DecodeStringLiteral(&cursor, &decoded));
+    CHECK(decoded != NULL);
+    CHECK_EQ_STR(decoded, TEXT("a\"b\\c\nd"));
+
+    delete[] decoded;
+    delete[] text;
 }

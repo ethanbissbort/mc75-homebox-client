@@ -426,6 +426,58 @@ bool JsonLite::GetNestedInt(const TCHAR* key, const TCHAR* subKey, int* value) c
     return child.GetInt(subKey, value);
 }
 
+int JsonLite::GetMemberCount() const
+{
+    if (!m_root || m_root->type != Node::TYPE_OBJECT) {
+        return 0;
+    }
+
+    int count = 0;
+    Node* current = m_root->child;
+    while (current) {
+        count++;
+        current = current->next;
+    }
+
+    return count;
+}
+
+const TCHAR* JsonLite::GetMemberName(int index) const
+{
+    Node* node = MemberAt(index);
+    return node ? node->key : NULL;
+}
+
+TCHAR* JsonLite::GetMemberJson(int index) const
+{
+    Node* node = MemberAt(index);
+    if (!node) {
+        return NULL;
+    }
+
+    // The same growable serializer ToString() uses, run over one member instead
+    // of the whole document: a value of any shape comes back as text that parses
+    // to what was read, without this having to know the shape.
+    Str::Buffer out;
+    BuildString(node, out);
+
+    if (out.Failed()) {
+        return NULL;
+    }
+
+    return out.Detach();
+}
+
+bool JsonLite::GetMemberValue(int index, JsonLite* out) const
+{
+    Node* node = MemberAt(index);
+    if (!node) {
+        return false;
+    }
+
+    return BorrowNode(node, out);
+}
+
 void JsonLite::BeginObject()
 {
     Clear();
@@ -663,6 +715,23 @@ JsonLite::Node* JsonLite::FindKey(const TCHAR* key) const
     }
 
     return NULL;
+}
+
+JsonLite::Node* JsonLite::MemberAt(int index) const
+{
+    if (index < 0 || !m_root || m_root->type != Node::TYPE_OBJECT) {
+        return NULL;
+    }
+
+    Node* current = m_root->child;
+    int currentIndex = 0;
+
+    while (current && currentIndex < index) {
+        current = current->next;
+        currentIndex++;
+    }
+
+    return current;
 }
 
 bool JsonLite::ContainsNode(const Node* root, const Node* node)

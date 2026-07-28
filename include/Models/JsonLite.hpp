@@ -98,6 +98,36 @@ public:
      */
     bool GetNestedInt(const TCHAR* key, const TCHAR* subKey, int* value) const;
 
+    // ---- member enumeration ----------------------------------------------
+    //
+    // The accessors above all address a member by name, which is enough for a
+    // reader that knows the schema. Walking an object is for the writer that
+    // does not: Config rewrites hb_conf.json from the fields it owns, and has to
+    // carry every other key in the file through untouched rather than delete it.
+
+    /** Members of this object, in document order; 0 if this is not an object. */
+    int GetMemberCount() const;
+
+    /**
+     * Name of member `index`, or NULL when the index is out of range or this is
+     * not an object. The pointer belongs to this parser's tree, so it follows
+     * the same rule as a borrowed view: it must not be read after the parser is
+     * cleared, re-parsed or destroyed. Copy it if it has to outlive that.
+     */
+    const TCHAR* GetMemberName(int index) const;
+
+    /**
+     * Member `index`'s value serialized back to JSON text -- quotes, escapes,
+     * and the whole subtree for a nested object or array -- so a caller can
+     * re-emit a value whose type it does not know. Caller must delete[]. NULL
+     * when the index is out of range, this is not an object, or serialization
+     * ran out of memory.
+     */
+    TCHAR* GetMemberJson(int index) const;
+
+    /** As GetObject, addressing the member by position instead of by name. */
+    bool GetMemberValue(int index, JsonLite* out) const;
+
     // Building JSON
     void BeginObject();
     void EndObject();
@@ -142,6 +172,7 @@ private:
     Node* CreateNode();
     void FreeNode(Node* node);
     Node* FindKey(const TCHAR* key) const;
+    Node* MemberAt(int index) const;
     // Points `out` at a node of this tree without transferring ownership.
     bool BorrowNode(Node* node, JsonLite* out) const;
     static bool ContainsNode(const Node* root, const Node* node);

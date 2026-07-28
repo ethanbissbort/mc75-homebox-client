@@ -10,7 +10,8 @@
  *   Scenario B  SyncEngine queue ops   -- per-entry removal, clearing, and the
  *                                        auto-sync trigger the UI timer polls.
  *   Scenario C  Config                 -- persistence round-trip, documented
- *                                        keys, and the missing-file fallback.
+ *                                        keys, keys the app does not own, and
+ *                                        the missing-file fallback.
  *   Scenario D  Backend routing        -- an entry for a backend that is not
  *                                        configured is skipped, not failed.
  *   Scenario E  Legacy records         -- an untagged entry written before
@@ -40,6 +41,7 @@
 #include "Journal.hpp"
 #include "Config.hpp"
 #include "StrUtil.hpp"
+#include "Models/JsonLite.hpp"
 #include "SyncEngine.hpp"
 #include "InventoryBackend.hpp"
 #include "HbClient.hpp"
@@ -84,6 +86,31 @@ static bool WriteTextFile(const TCHAR* path, const char* utf8)
     CloseHandle(h);
 
     return (ok != FALSE) && (written == length);
+}
+
+// Reads a whole file back as the UTF-8 bytes on disk, so a test can inspect
+// what Config::Save actually wrote instead of only what Config::Load makes of
+// it -- a key that is silently dropped reloads as a default and looks fine.
+static bool ReadTextFile(const TCHAR* path, char* out, int cap)
+{
+    out[0] = '\0';
+
+    HANDLE h = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    DWORD read = 0;
+    BOOL ok = ReadFile(h, out, (DWORD)(cap - 1), &read, NULL);
+    CloseHandle(h);
+
+    if (ok == FALSE) {
+        return false;
+    }
+
+    out[read] = '\0';
+    return true;
 }
 
 static int QueueDepth(const SyncEngine& engine)
@@ -389,6 +416,176 @@ TEST_CASE("Config: a file without backend keys still selects HomeBox")
     // And nothing invents a NetBox that was never configured.
     CHECK_EQ_STR(c.GetNetboxBaseUrl(), TEXT(""));
     CHECK_EQ_STR(c.GetNetboxToken(), TEXT(""));
+
+    DeleteFile(path);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Scenario C3 - a save must not delete the keys the app does not own
+ * ------------------------------------------------------------------------- */
+TEST_CASE("Config: keys the app does not own survive a save")
+{
+    const TCHAR* path = TEXT("/tmp/hbx_it_config_foreign.json");
+    DeleteFile(path);
+
+    // A deployed hb_conf.json the way an installer or a site admin leaves it:
+    // the keys the app knows, plus a scalar of their own, a nested object, and
+    // the annotated _readme array the shipped template carries. The legacy
+    // offlineMode spelling is in there too, because Load still honours it.
+    static const char* const kDeployedJson =
+        "{\n"
+        "  \"apiBaseUrl\": \"http://server:9000/api\",\n"
+        "  \"deviceId\": \"MC75-XYZ\",\n"
+        "  \"siteCode\": \"AKR-07\",\n"
+        "  \"authToken\": \"\",\n"
+        "  \"offlineModeEnabled\": true,\n"
+        "  \"offlineMode\": false,\n"
+        "  \"provisioning\": {\"wave\": 3, \"owner\": \"depot \\\"north\\\"\", \"pilot\": false},\n"
+        "  \"_readme\": [\"Template for \\\\Program Files\\\\HBXClient.\", \"Line two.\"]\n"
+        "}\n";
+    CHECK(WriteTextFile(path, kDeployedJson));
+
+    Config c;
+    CHECK(c.Load(path));
+    CHECK_EQ_STR(c.GetApiBaseUrl(), TEXT("http://server:9000/api"));
+    CHECK(c.IsOfflineModeEnabled());
+
+    // Exactly what Controller::PersistAuthToken does on the first successful
+    // authentication of a run: no settings screen, no warning, whole file
+    // rewritten.
+    c.SetAuthToken(TEXT("tok-from-homebox"));
+    CHECK(c.Save(path));
+
+    char raw[4096];
+    CHECK(ReadTextFile(path, raw, 4096));
+
+    TCHAR* text = Str::FromUtf8Alloc(raw);
+    CHECK(text != NULL);
+
+    Models::JsonLite doc;
+    CHECK(doc.Parse(text)); // what was written is still strict JSON
+    delete[] text;
+
+    // Known keys are written from the live fields...
+    TCHAR buf[128];
+    CHECK(doc.GetString(TEXT("authToken"), buf, 128));
+    CHECK_EQ_STR(buf, TEXT("tok-from-homebox"));
+    CHECK(doc.GetString(TEXT("apiBaseUrl"), buf, 128));
+    CHECK_EQ_STR(buf, TEXT("http://server:9000/api"));
+
+    // ...and an unknown scalar is carried through untouched.
+    CHECK(doc.GetString(TEXT("siteCode"), buf, 128));
+    CHECK_EQ_STR(buf, TEXT("AKR-07"));
+
+    // An unknown nested object keeps its members and their types, escapes and
+    // all -- it is re-emitted, not flattened to a string.
+    int wave = 0;
+    CHECK(doc.GetNestedInt(TEXT("provisioning"), TEXT("wave"), &wave));
+    CHECK_EQ_INT(wave, 3);
+    CHECK(doc.GetNestedString(TEXT("provisioning"), TEXT("owner"), buf, 128));
+    CHECK_EQ_STR(buf, TEXT("depot \"north\""));
+
+    Models::JsonLite provisioning;
+    CHECK(doc.GetObject(TEXT("provisioning"), &provisioning));
+    bool pilot = true;
+    CHECK(provisioning.GetBool(TEXT("pilot"), &pilot));
+    CHECK_FALSE(pilot);
+
+    // The _readme array comes back with the same strings in the same order,
+    // backslashes included. This is the block the shipped template documents
+    // the file with, so nothing about it may be normalised away.
+    int readmeIndex = -1;
+    int members = doc.GetMemberCount();
+    for (int i = 0; i < members; i++) {
+        if (lstrcmp(doc.GetMemberName(i), TEXT("_readme")) == 0) {
+            readmeIndex = i;
+        }
+    }
+    CHECK(readmeIndex >= 0);
+
+    TCHAR* readmeJson = doc.GetMemberJson(readmeIndex);
+    CHECK(readmeJson != NULL);
+    CHECK_EQ_STR(readmeJson,
+        TEXT("[\"Template for \\\\Program Files\\\\HBXClient.\",\"Line two.\"]"));
+    delete[] readmeJson;
+
+    Models::JsonLite readme;
+    CHECK(doc.GetArray(TEXT("_readme"), &readme));
+    CHECK_EQ_INT(readme.GetArrayLength(), 2);
+
+    // The legacy alias is owned by Config, so it is rewritten in the canonical
+    // spelling rather than preserved: two keys claiming one setting would let
+    // the stale one win on whichever reader looks at it first.
+    CHECK_FALSE(doc.HasKey(TEXT("offlineMode")));
+    bool offline = false;
+    CHECK(doc.GetBool(TEXT("offlineModeEnabled"), &offline));
+    CHECK(offline);
+
+    // Saving again changes nothing, so a device that authenticates every
+    // morning does not rewrite the file differently every morning.
+    char again[4096];
+    CHECK(c.Save(path));
+    CHECK(ReadTextFile(path, again, 4096));
+    CHECK_EQ_STR(again, raw);
+
+    // And a plain reload still sees the settings it did before.
+    Config reloaded;
+    CHECK(reloaded.Load(path));
+    CHECK_EQ_STR(reloaded.GetDeviceId(), TEXT("MC75-XYZ"));
+    CHECK_EQ_STR(reloaded.GetAuthToken(), TEXT("tok-from-homebox"));
+    CHECK(reloaded.IsOfflineModeEnabled());
+
+    DeleteFile(path);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Scenario C4 - a file too broken to parse still saves as a valid config
+ * ------------------------------------------------------------------------- */
+TEST_CASE("Config: saving over an unparseable file still writes a valid config")
+{
+    const TCHAR* path = TEXT("/tmp/hbx_it_config_broken.json");
+    DeleteFile(path);
+
+    // Hand-edited on the device and left with a trailing comma, which is enough
+    // to fail a strict parse. Load falls back to its tolerant scanner.
+    static const char* const kBrokenJson =
+        "{\n"
+        "  \"apiBaseUrl\": \"http://server:9000/api\",\n"
+        "  \"deviceId\": \"MC75-XYZ\",\n"
+        "  \"siteCode\": \"AKR-07\",\n"
+        "  \"syncIntervalSeconds\": 120,\n"
+        "}\n";
+    CHECK(WriteTextFile(path, kBrokenJson));
+
+    Config c;
+    CHECK(c.Load(path));
+    CHECK_EQ_STR(c.GetApiBaseUrl(), TEXT("http://server:9000/api"));
+    CHECK_EQ_INT(c.GetSyncIntervalSeconds(), 120);
+
+    c.SetAuthToken(TEXT("tok-from-homebox"));
+    CHECK(c.Save(path));
+
+    char raw[2048];
+    CHECK(ReadTextFile(path, raw, 2048));
+
+    TCHAR* text = Str::FromUtf8Alloc(raw);
+    CHECK(text != NULL);
+
+    Models::JsonLite doc;
+    CHECK(doc.Parse(text)); // the replacement parses strictly again
+    delete[] text;
+
+    // Nothing could be enumerated out of the broken file, so the foreign key is
+    // gone -- the deliberate trade: dropping siteCode costs an annotation,
+    // refusing to save would cost the operator's settings.
+    CHECK_FALSE(doc.HasKey(TEXT("siteCode")));
+
+    Config reloaded;
+    CHECK(reloaded.Load(path));
+    CHECK_EQ_STR(reloaded.GetApiBaseUrl(), TEXT("http://server:9000/api"));
+    CHECK_EQ_STR(reloaded.GetDeviceId(), TEXT("MC75-XYZ"));
+    CHECK_EQ_INT(reloaded.GetSyncIntervalSeconds(), 120);
+    CHECK_EQ_STR(reloaded.GetAuthToken(), TEXT("tok-from-homebox"));
 
     DeleteFile(path);
 }
