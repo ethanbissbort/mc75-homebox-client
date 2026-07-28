@@ -529,6 +529,74 @@ TCHAR* FromUtf8Alloc(const char* src)
 }
 
 // ---------------------------------------------------------------------------
+// URLs
+// ---------------------------------------------------------------------------
+
+// RFC 3986 2.3 unreserved set. Everything else is escaped, which is stricter
+// than strictly necessary for a query value but is the one encoding that is
+// simultaneously safe in a path segment, so callers never have to pick.
+static bool IsUnreserved(unsigned long c)
+{
+    return (c >= (unsigned long)'a' && c <= (unsigned long)'z') ||
+           (c >= (unsigned long)'A' && c <= (unsigned long)'Z') ||
+           (c >= (unsigned long)'0' && c <= (unsigned long)'9') ||
+           c == (unsigned long)'-' || c == (unsigned long)'.' ||
+           c == (unsigned long)'_' || c == (unsigned long)'~';
+}
+
+bool UrlEncode(TCHAR* dst, int cap, const TCHAR* src)
+{
+    static const char kHex[] = "0123456789ABCDEF";
+
+    if (!dst || cap <= 0) {
+        return false;
+    }
+
+    dst[0] = 0;
+    if (!src) {
+        return true;
+    }
+
+    int pos = 0;
+    int i = 0;
+
+    while (src[i] != 0) {
+        unsigned long c = NextScalar(src, &i);
+        int size = EncodedSize(c);
+        char bytes[4];
+        Encode(bytes, c, size);
+
+        // Measure the whole character before writing any of it: splitting a
+        // multi-byte sequence across the capacity limit would leave a percent
+        // escape the server decodes as invalid UTF-8 rather than as a short
+        // value.
+        int width = 0;
+        for (int m = 0; m < size; m++) {
+            width += IsUnreserved((unsigned long)(unsigned char)bytes[m]) ? 1 : 3;
+        }
+
+        if (pos + width > cap - 1) {
+            dst[pos] = 0;
+            return false;
+        }
+
+        for (int b = 0; b < size; b++) {
+            unsigned char byte = (unsigned char)bytes[b];
+            if (IsUnreserved((unsigned long)byte)) {
+                dst[pos++] = (TCHAR)byte;
+            } else {
+                dst[pos++] = (TCHAR)'%';
+                dst[pos++] = (TCHAR)kHex[(byte >> 4) & 0x0F];
+                dst[pos++] = (TCHAR)kHex[byte & 0x0F];
+            }
+        }
+    }
+
+    dst[pos] = 0;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Buffer
 // ---------------------------------------------------------------------------
 

@@ -97,11 +97,10 @@ bool Controller::Initialize(HINSTANCE hInstance)
         return false;
     }
 
-    // Configure API client. The timeout matters as much as the URL here: the
-    // transport's own default would block a scan handler for half a minute on a
-    // link that has gone away.
-    m_hbClient->SetBaseUrl(m_config->GetApiBaseUrl());
-    m_hbClient->SetRequestTimeout((DWORD)REQUEST_TIMEOUT_MS);
+    // Configure the API clients and decide which one takes new work. The
+    // timeout matters as much as the URL here: the transport's own default
+    // would block a scan handler for half a minute on a link that has gone away.
+    ConfigureBackends();
 
     // Initialize scanner
     if (m_scanner->Initialize()) {
@@ -250,6 +249,11 @@ HbClient* Controller::GetHbClient()
     return m_hbClient;
 }
 
+InventoryBackend* Controller::GetActiveBackend()
+{
+    return m_syncEngine ? m_syncEngine->GetActiveBackend() : NULL;
+}
+
 SyncEngine* Controller::GetSyncEngine()
 {
     return m_syncEngine;
@@ -335,6 +339,41 @@ void Controller::OnActivate(bool active)
         m_scanner->EnableScanner();
     } else {
         m_scanner->DisableScanner();
+    }
+}
+
+void Controller::ConfigureBackends()
+{
+    if (!m_config || !m_syncEngine || !m_journal || !m_hbClient) {
+        return;
+    }
+
+    m_hbClient->SetBaseUrl(m_config->GetApiBaseUrl());
+    m_hbClient->SetRequestTimeout((DWORD)REQUEST_TIMEOUT_MS);
+
+    // The registry keys on the id a backend reports and that id is written into
+    // every queue record, so the configured one has to reach the client before
+    // anything is queued. An id that cannot survive a queue record is refused
+    // rather than applied: registration would then drop the backend altogether
+    // and the device would stop queueing anything at all.
+    const TCHAR* homeboxId = m_config->GetHomeboxInstanceId();
+    if (SyncEngine::IsValidInstanceId(homeboxId)) {
+        m_hbClient->SetInstanceId(homeboxId);
+    } else {
+        m_journal->LogError(TEXT("BACKEND_ID_INVALID"),
+                            TEXT("homeboxInstanceId is unusable in a queue record; keeping the default"));
+    }
+
+    // Registration is idempotent, so this also covers a configuration reload.
+    m_syncEngine->RegisterBackend(m_hbClient);
+
+    // Exactly one backend takes new work. An activeBackend that names something
+    // which is not configured must not quietly send scans to another server, so
+    // fall back to HomeBox and leave a record of why.
+    if (!m_syncEngine->SetActiveBackend(m_config->GetActiveBackendId())) {
+        m_syncEngine->SetActiveBackend(m_hbClient->GetInstanceId());
+        m_journal->LogError(TEXT("BACKEND_UNKNOWN"),
+                            TEXT("activeBackend in hb_conf.json is not configured; using HomeBox"));
     }
 }
 
@@ -661,7 +700,7 @@ void Controller::OnConfigChanged()
 {
     // Reload configuration
     m_config->LoadFromDefaultLocations();
-    m_hbClient->SetBaseUrl(m_config->GetApiBaseUrl());
+    ConfigureBackends();
 
     // The base URL and credentials may both have moved, so the current session
     // is worthless; get a new one against the new server.

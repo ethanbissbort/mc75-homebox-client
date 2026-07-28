@@ -11,11 +11,19 @@
  *                                        auto-sync trigger the UI timer polls.
  *   Scenario C  Config                 -- persistence round-trip, documented
  *                                        keys, and the missing-file fallback.
+ *   Scenario D  Backend routing        -- an entry for a backend that is not
+ *                                        configured is skipped, not failed.
+ *   Scenario E  Legacy records         -- an untagged entry written before
+ *                                        backend tagging still replays.
+ *   Scenario F  Backend isolation      -- switching backends never replays one
+ *                                        backend's work against the other.
+ *   Scenario G  Replay outcomes        -- a transient failure keeps its entry.
  *
- * The HbClient here points at an unresolvable host, so the engine is genuinely
- * offline for the whole run -- which is exactly the state these tests care
- * about. Replaying against a live server needs a server and belongs in a
- * device-side test, not here.
+ * The HbClient in scenarios A and B points at an unresolvable host, so the
+ * engine is genuinely offline for the whole run -- which is exactly the state
+ * those tests care about. Scenarios D-G need replay to actually happen, so they
+ * drive the engine through recording backends on a host that resolves; sending
+ * anything to a real server needs a server and belongs in a device-side test.
  *
  * Host build notes (see tests/host/shim/windows.h):
  *   - TCHAR is `char`, so TEXT("x") is a narrow "x". All literals handed to the
@@ -31,8 +39,12 @@
 #include <windows.h>       // shim: TCHAR, TEXT, DeleteFile, HANDLE, ...
 #include "Journal.hpp"
 #include "Config.hpp"
+#include "StrUtil.hpp"
 #include "SyncEngine.hpp"
+#include "InventoryBackend.hpp"
 #include "HbClient.hpp"
+
+#include <cstring>
 
 using namespace HBX;
 
@@ -40,6 +52,10 @@ using namespace HBX;
 // without waiting on a real DNS server.
 static const TCHAR* const kUnreachable =
     TEXT("http://mc75-offline.invalid:8080/api");
+
+// A host name that always resolves without touching a network, so the engine
+// gets past its connectivity gate and the routing under test actually runs.
+static const TCHAR* const kResolvable = TEXT("http://localhost:8080/api");
 
 static void FreePending(TCHAR** arr, int n)
 {
@@ -50,6 +66,24 @@ static void FreePending(TCHAR** arr, int n)
         delete[] arr[i];
     }
     delete[] arr;
+}
+
+// Writes a UTF-8 configuration file the way a deployment or a hand edit would,
+// so Config::Load is exercised on bytes it did not write itself.
+static bool WriteTextFile(const TCHAR* path, const char* utf8)
+{
+    HANDLE h = CreateFile(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                          FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    DWORD length = (DWORD)std::strlen(utf8);
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, utf8, length, &written, NULL);
+    CloseHandle(h);
+
+    return (ok != FALSE) && (written == length);
 }
 
 static int QueueDepth(const SyncEngine& engine)
@@ -250,6 +284,13 @@ TEST_CASE("Config: save/load round-trip and missing-file defaults")
     w.SetAuthToken(TEXT("tok123"));
     w.SetApiKey(TEXT("key-\"quoted\"-and\\slashed"));
     w.SetJournalPath(TEXT("\\Storage Card\\hbx.journal"));
+    w.SetHomeboxInstanceId(TEXT("hb-prod"));
+    w.SetNetboxInstanceId(TEXT("nb-prod"));
+    w.SetActiveBackendId(TEXT("nb-prod"));
+    w.SetNetboxBaseUrl(TEXT("http://netbox.warehouse.lan/api"));
+    w.SetNetboxToken(TEXT("0123456789abcdef0123456789abcdef01234567"));
+    w.SetNetboxAuthScheme(TEXT("Bearer"));
+    w.SetAllowInsecureTls(true);
     CHECK(w.Save(path));
 
     // --- Load it back into a fresh instance and verify every field. ---------
@@ -266,6 +307,32 @@ TEST_CASE("Config: save/load round-trip and missing-file defaults")
     CHECK_EQ_STR(r.GetApiKey(), TEXT("key-\"quoted\"-and\\slashed"));
     CHECK_EQ_STR(r.GetJournalPath(), TEXT("\\Storage Card\\hbx.journal"));
 
+    // Second-backend settings have to survive the same trip. Save() rewrites
+    // the file from the fields it knows, so a key it does not write is gone.
+    CHECK_EQ_STR(r.GetHomeboxInstanceId(), TEXT("hb-prod"));
+    CHECK_EQ_STR(r.GetNetboxInstanceId(), TEXT("nb-prod"));
+    CHECK_EQ_STR(r.GetActiveBackendId(), TEXT("nb-prod"));
+    CHECK_EQ_STR(r.GetNetboxBaseUrl(), TEXT("http://netbox.warehouse.lan/api"));
+    CHECK_EQ_STR(r.GetNetboxToken(), TEXT("0123456789abcdef0123456789abcdef01234567"));
+    CHECK_EQ_STR(r.GetNetboxAuthScheme(), TEXT("Bearer"));
+    CHECK(r.IsInsecureTlsAllowed());
+
+    // --- The token-persist path must not wipe the other backend. ------------
+    // Controller::PersistAuthToken saves the whole file on the first successful
+    // authentication of every run, so a NetBox deployment would lose its server
+    // and token the first time an operator authenticated against HomeBox.
+    r.SetAuthToken(TEXT("fresh-token"));
+    CHECK(r.Save(path));
+
+    Config after;
+    CHECK(after.Load(path));
+    CHECK_EQ_STR(after.GetAuthToken(), TEXT("fresh-token"));
+    CHECK_EQ_STR(after.GetNetboxBaseUrl(), TEXT("http://netbox.warehouse.lan/api"));
+    CHECK_EQ_STR(after.GetNetboxToken(), TEXT("0123456789abcdef0123456789abcdef01234567"));
+    CHECK_EQ_STR(after.GetNetboxAuthScheme(), TEXT("Bearer"));
+    CHECK_EQ_STR(after.GetActiveBackendId(), TEXT("nb-prod"));
+    CHECK(after.IsInsecureTlsAllowed());
+
     // --- Loading a non-existent path succeeds and yields defaults. ----------
     DeleteFile(missing);
     Config d;
@@ -280,6 +347,314 @@ TEST_CASE("Config: save/load round-trip and missing-file defaults")
     CHECK(d.GetJournalPath() != NULL);
     CHECK(d.GetJournalPath()[0] != 0);
 
+    // HomeBox is the backend a device gets when the file says nothing, and its
+    // default id matches the tag on records written before entries carried one.
+    CHECK_EQ_STR(d.GetActiveBackendId(), TEXT("hb"));
+    CHECK_EQ_STR(d.GetHomeboxInstanceId(), TEXT("hb"));
+    CHECK_EQ_STR(d.GetNetboxInstanceId(), TEXT("nb"));
+    CHECK_EQ_STR(d.GetNetboxAuthScheme(), TEXT("Token"));
+    CHECK_EQ_STR(d.GetNetboxBaseUrl(), TEXT(""));
+    CHECK_FALSE(d.IsInsecureTlsAllowed());
+
     DeleteFile(path);
     DeleteFile(missing);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Scenario C2 - an hb_conf.json written before the second backend existed
+ * ------------------------------------------------------------------------- */
+TEST_CASE("Config: a file without backend keys still selects HomeBox")
+{
+    const TCHAR* path = TEXT("/tmp/hbx_it_config_legacy.json");
+    DeleteFile(path);
+
+    // Exactly what is deployed on a device in the field today: no activeBackend,
+    // no NetBox keys, and a HomeBox instance id the operator has renamed.
+    static const char* const kLegacyJson =
+        "{\n"
+        "  \"apiBaseUrl\": \"http://server:9000/api\",\n"
+        "  \"homeboxInstanceId\": \"hb-prod\",\n"
+        "  \"deviceId\": \"MC75-XYZ\"\n"
+        "}\n";
+    CHECK(WriteTextFile(path, kLegacyJson));
+
+    Config c;
+    CHECK(c.Load(path));
+
+    // activeBackend is absent, so it has to follow whatever HomeBox is called
+    // here -- defaulting to the literal "hb" would name nothing that exists.
+    CHECK_EQ_STR(c.GetActiveBackendId(), TEXT("hb-prod"));
+    CHECK_EQ_STR(c.GetApiBaseUrl(), TEXT("http://server:9000/api"));
+
+    // And nothing invents a NetBox that was never configured.
+    CHECK_EQ_STR(c.GetNetboxBaseUrl(), TEXT(""));
+    CHECK_EQ_STR(c.GetNetboxToken(), TEXT(""));
+
+    DeleteFile(path);
+}
+
+/* ------------------------------------------------------------------------- *
+ * A backend that records what it was asked to replay.
+ *
+ * What is under test in scenarios D-G is routing -- which backend a queued
+ * entry reaches -- so nothing here leaves the process. The base URL points at a
+ * name that always resolves, because the engine refuses to replay an entry
+ * whose backend it cannot reach and the batch would otherwise stop before any
+ * routing happened.
+ * ------------------------------------------------------------------------- */
+class RecordingBackend : public InventoryBackend {
+public:
+    enum {
+        KIND_CAP = 8,
+        ID_CAP   = 32,
+        URL_CAP  = 128,
+        TYPE_CAP = 64,
+        DATA_CAP = 256
+    };
+
+    RecordingBackend(const TCHAR* kind, const TCHAR* instanceId)
+        : m_replayCount(0)
+        , m_result(REPLAY_SENT)
+    {
+        Str::Copy(m_kind, KIND_CAP, kind);
+        Str::Copy(m_instanceId, ID_CAP, instanceId);
+        Str::Copy(m_baseUrl, URL_CAP, kResolvable);
+        m_lastType[0] = 0;
+        m_lastData[0] = 0;
+    }
+
+    // ---- test inspection -----------------------------------------------
+    int ReplayCount() const { return m_replayCount; }
+    const TCHAR* LastType() const { return m_lastType; }
+    const TCHAR* LastData() const { return m_lastData; }
+    void SetReplayResult(ReplayResult result) { m_result = result; }
+
+    // ---- InventoryBackend ----------------------------------------------
+    const TCHAR* GetKind() const { return m_kind; }
+    const TCHAR* GetInstanceId() const { return m_instanceId; }
+    const TCHAR* GetDisplayName() const { return m_instanceId; }
+
+    void SetBaseUrl(const TCHAR* baseUrl) { Str::Copy(m_baseUrl, URL_CAP, baseUrl ? baseUrl : TEXT("")); }
+    const TCHAR* GetBaseUrl() const { return m_baseUrl; }
+    void SetRequestTimeout(DWORD) {}
+
+    bool IsAuthenticated() const { return true; }
+    int GetLastStatusCode() const { return 200; }
+    bool SessionIsRenewable() const { return false; }
+    bool Authenticate() { return true; }
+
+    bool LookupByCode(const TCHAR*, Models::AssetSummary*) { return false; }
+    int GetMatchCount() const { return 0; }
+    bool GetMatch(int, Models::AssetSummary*) { return false; }
+
+    bool SupportsStatus() const { return false; }
+    int GetStatusChoiceCount() const { return 0; }
+    const TCHAR* GetStatusChoice(int) const { return NULL; }
+
+    ReplayResult Replay(const TCHAR* type, const TCHAR* data)
+    {
+        m_replayCount++;
+        Str::Copy(m_lastType, TYPE_CAP, type ? type : TEXT(""));
+        Str::Copy(m_lastData, DATA_CAP, data ? data : TEXT(""));
+        return m_result;
+    }
+
+private:
+    TCHAR m_kind[KIND_CAP];
+    TCHAR m_instanceId[ID_CAP];
+    TCHAR m_baseUrl[URL_CAP];
+    TCHAR m_lastType[TYPE_CAP];
+    TCHAR m_lastData[DATA_CAP];
+    int m_replayCount;
+    ReplayResult m_result;
+};
+
+/* ------------------------------------------------------------------------- *
+ * Scenario D - an entry for a backend nobody configured
+ * ------------------------------------------------------------------------- */
+TEST_CASE("Backends: an entry for an unregistered backend is skipped, not failed")
+{
+    const TCHAR* path = TEXT("/tmp/hbx_it_backend_skip.dat");
+    DeleteFile(path);
+
+    Journal journal;
+    CHECK(journal.Initialize(path));
+
+    RecordingBackend homebox(TEXT("hb"), TEXT("hb"));
+    SyncEngine engine(&homebox, &journal);
+
+    // The one-argument-plus-journal form still registers and activates.
+    CHECK(engine.GetActiveBackend() == &homebox);
+    CHECK_EQ_INT(engine.GetBackendCount(), 1);
+
+    CHECK(engine.QueueScan(TEXT("ITEM-1"), NULL));
+
+    // Work left behind by a NetBox that has since been taken out of the
+    // configuration. The type is already qualified, so it is stored as-is.
+    CHECK(engine.QueueTransaction(TEXT("nb-retired.DEVICE_MOVE"),
+                                  TEXT("MOVE:42:rack-17")));
+    CHECK_EQ_INT(engine.GetQueuedTransactionCount(), 2);
+
+    CHECK(engine.Sync());
+
+    // The orphan must not drag the whole sync down with it: an operator whose
+    // status line says "failed" after every sync stops believing the queue.
+    CHECK(engine.GetSyncStatus() == SyncEngine::SYNC_SUCCESS);
+    CHECK_EQ_INT(engine.GetSkippedCount(), 1);
+
+    // The addressable entry went; the orphan is still there.
+    CHECK_EQ_INT(homebox.ReplayCount(), 1);
+    CHECK_EQ_STR(homebox.LastType(), TEXT("ITEM_SCAN"));
+    CHECK_EQ_STR(homebox.LastData(), TEXT("SCAN:ITEM-1"));
+    CHECK_EQ_INT(engine.GetQueuedTransactionCount(), 1);
+    CHECK_EQ_INT(QueueDepth(engine), 1);
+
+    // Repeat syncs keep skipping it instead of degrading into a failure, and
+    // never replay it against the backend that happens to be active.
+    CHECK(engine.Sync());
+    CHECK(engine.GetSyncStatus() == SyncEngine::SYNC_SUCCESS);
+    CHECK_EQ_INT(engine.GetSkippedCount(), 1);
+    CHECK_EQ_INT(engine.GetQueuedTransactionCount(), 1);
+    CHECK_EQ_INT(homebox.ReplayCount(), 1);
+
+    // Nothing was lost: configure that backend again and the entry drains.
+    RecordingBackend netbox(TEXT("nb"), TEXT("nb-retired"));
+    engine.RegisterBackend(&netbox);
+    CHECK_EQ_INT(engine.GetBackendCount(), 2);
+
+    CHECK(engine.Sync());
+    CHECK_EQ_INT(engine.GetSkippedCount(), 0);
+    CHECK_EQ_INT(netbox.ReplayCount(), 1);
+    CHECK_EQ_STR(netbox.LastType(), TEXT("DEVICE_MOVE"));
+    CHECK_EQ_STR(netbox.LastData(), TEXT("MOVE:42:rack-17"));
+    CHECK_EQ_INT(engine.GetQueuedTransactionCount(), 0);
+
+    DeleteFile(path);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Scenario E - a queue written before entries carried a backend tag
+ * ------------------------------------------------------------------------- */
+TEST_CASE("Backends: an untagged legacy record still replays against HomeBox")
+{
+    const TCHAR* path = TEXT("/tmp/hbx_it_backend_legacy.dat");
+    DeleteFile(path);
+
+    Journal journal;
+    CHECK(journal.Initialize(path));
+
+    // Exactly what an installed build left in the journal before backend tags
+    // existed: "[tick] TYPE: DATA" with no instance id in front of the type.
+    CHECK(journal.QueueTransaction(TEXT("[51234] ITEM_SCAN: SCAN:LEGACY-1"), NULL));
+    CHECK(journal.QueueTransaction(
+        TEXT("[51290] ITEM_UPDATE: UPDATE:{\"barcode\":\"LEGACY-2\",\"quantity\":3}"), NULL));
+
+    // NetBox is registered first, so it is the active backend, and HomeBox is
+    // deliberately not called "hb" -- an untagged record has to be routed by
+    // what a backend *is*, not by what it was named or by what happens to be
+    // active, or upgrading a renamed installation strands its whole queue.
+    RecordingBackend netbox(TEXT("nb"), TEXT("nb-prod"));
+    RecordingBackend homebox(TEXT("hb"), TEXT("hb-prod"));
+
+    SyncEngine engine(&netbox, &journal);
+    engine.RegisterBackend(&homebox);
+    CHECK(engine.GetActiveBackend() == &netbox);
+
+    CHECK(engine.Sync());
+
+    CHECK_EQ_INT(netbox.ReplayCount(), 0);
+    CHECK_EQ_INT(homebox.ReplayCount(), 2);
+    CHECK_EQ_STR(homebox.LastType(), TEXT("ITEM_UPDATE"));
+    CHECK_EQ_STR(homebox.LastData(),
+                 TEXT("UPDATE:{\"barcode\":\"LEGACY-2\",\"quantity\":3}"));
+    CHECK_EQ_INT(engine.GetSkippedCount(), 0);
+    CHECK_EQ_INT(engine.GetQueuedTransactionCount(), 0);
+
+    DeleteFile(path);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Scenario F - switching the active backend
+ * ------------------------------------------------------------------------- */
+TEST_CASE("Backends: switching backends never replays one queue against the other")
+{
+    const TCHAR* path = TEXT("/tmp/hbx_it_backend_switch.dat");
+    DeleteFile(path);
+
+    Journal journal;
+    CHECK(journal.Initialize(path));
+
+    RecordingBackend homebox(TEXT("hb"), TEXT("hb"));
+    RecordingBackend netbox(TEXT("nb"), TEXT("nb-prod"));
+
+    SyncEngine engine(&homebox, &journal);
+    engine.RegisterBackend(&netbox);
+
+    // Scanned while HomeBox was selected.
+    CHECK(engine.QueueScan(TEXT("ITEM-1"), TEXT("LOC-A2")));
+
+    // The operator switches systems. The queue does not drain on the way out.
+    CHECK(engine.SetActiveBackend(TEXT("nb-prod")));
+    CHECK(engine.GetActiveBackend() == &netbox);
+    CHECK(engine.QueueTransaction(TEXT("DEVICE_MOVE"), TEXT("MOVE:9:rack-3")));
+
+    // An id nobody registered must not fall back to whatever is active: sending
+    // a move to the wrong instance succeeds and moves the wrong device.
+    CHECK_FALSE(engine.SetActiveBackend(TEXT("nb-staging")));
+    CHECK(engine.GetActiveBackend() == &netbox);
+    CHECK(engine.FindBackend(TEXT("nb-staging")) == NULL);
+    CHECK(engine.FindBackend(TEXT("hb")) == &homebox);
+
+    CHECK_EQ_INT(engine.GetQueuedTransactionCount(), 2);
+    CHECK(engine.Sync());
+
+    // Each entry went home, and only home.
+    CHECK_EQ_INT(homebox.ReplayCount(), 1);
+    CHECK_EQ_STR(homebox.LastType(), TEXT("ITEM_SCAN"));
+    CHECK_EQ_STR(homebox.LastData(), TEXT("SCANLOC:6:ITEM-1LOC-A2"));
+
+    CHECK_EQ_INT(netbox.ReplayCount(), 1);
+    CHECK_EQ_STR(netbox.LastType(), TEXT("DEVICE_MOVE"));
+    CHECK_EQ_STR(netbox.LastData(), TEXT("MOVE:9:rack-3"));
+
+    CHECK_EQ_INT(engine.GetSkippedCount(), 0);
+    CHECK_EQ_INT(engine.GetQueuedTransactionCount(), 0);
+
+    DeleteFile(path);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Scenario G - the three replay outcomes are not two
+ * ------------------------------------------------------------------------- */
+TEST_CASE("Backends: a transient replay failure keeps its entry queued")
+{
+    const TCHAR* path = TEXT("/tmp/hbx_it_backend_retry.dat");
+    DeleteFile(path);
+
+    Journal journal;
+    CHECK(journal.Initialize(path));
+
+    RecordingBackend homebox(TEXT("hb"), TEXT("hb"));
+    SyncEngine engine(&homebox, &journal);
+
+    CHECK(engine.QueueScan(TEXT("ITEM-1"), NULL));
+
+    // The server was reached and refused the write - unlike a skip, this is
+    // worth retrying, and unlike a skip it is a real failure.
+    homebox.SetReplayResult(REPLAY_RETRY);
+    CHECK_FALSE(engine.Sync());
+    CHECK(engine.GetSyncStatus() == SyncEngine::SYNC_FAILED);
+    CHECK_EQ_INT(engine.GetSkippedCount(), 0);
+    CHECK_EQ_INT(engine.GetQueuedTransactionCount(), 1);
+    CHECK_EQ_INT(homebox.ReplayCount(), 1);
+
+    // When it clears, the same entry goes through untouched.
+    homebox.SetReplayResult(REPLAY_SENT);
+    CHECK(engine.Sync());
+    CHECK(engine.GetSyncStatus() == SyncEngine::SYNC_SUCCESS);
+    CHECK_EQ_INT(homebox.ReplayCount(), 2);
+    CHECK_EQ_STR(homebox.LastData(), TEXT("SCAN:ITEM-1"));
+    CHECK_EQ_INT(engine.GetQueuedTransactionCount(), 0);
+
+    DeleteFile(path);
 }

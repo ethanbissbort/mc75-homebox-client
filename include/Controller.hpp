@@ -43,6 +43,13 @@ public:
     // Component accessors
     Config* GetConfig();
     HbClient* GetHbClient();
+
+    /**
+     * The backend new work goes to. Everything that is not HomeBox-specific
+     * should go through this rather than through GetHbClient().
+     */
+    InventoryBackend* GetActiveBackend();
+
     SyncEngine* GetSyncEngine();
     Journal* GetJournal();
     ScannerHAL* GetScanner();
@@ -128,6 +135,18 @@ private:
     void OnActivate(bool active);
 
     // Server access
+
+    /**
+     * Points every configured backend at the servers named in hb_conf.json,
+     * registers them with the sync engine and selects the active one. Safe to
+     * call again after the configuration is reloaded.
+     *
+     * Registration is deliberately wider than selection: only one backend takes
+     * new work, but the queue can still hold entries for another one, and those
+     * only replay if their backend is registered.
+     */
+    void ConfigureBackends();
+
     bool EnsureAuthenticated(bool force);
 
     /** Writes the client's current token to hb_conf.json so it survives a restart. */

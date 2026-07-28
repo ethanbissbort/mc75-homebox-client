@@ -12,6 +12,17 @@ namespace {
 // to reach the caller as a bare false.
 const int kHttpUnauthorized = 401;
 
+// Stable token written into queue records and matched when they are routed
+// back. Distinct from the instance id, which the operator sets per server.
+const TCHAR* const kBackendKind = TEXT("hb");
+
+// Shown in the title bar and against queued entries in the queue view.
+const TCHAR* const kBackendDisplayName = TEXT("HomeBox");
+
+// The id a client carries until it is configured. It doubles as the id an
+// untagged queue record from an older build resolves to, so it must stay "hb".
+const TCHAR* const kDefaultInstanceId = TEXT("hb");
+
 /**
  * Builds "<prefix><id><suffix>" into a bounded buffer.
  *
@@ -93,9 +104,12 @@ HbClient::HbClient()
     , m_baseUrl(NULL)
     , m_authToken(NULL)
     , m_deviceId(NULL)
+    , m_apiKey(NULL)
     , m_authenticated(false)
     , m_lastStatusCode(0)
+    , m_matchCount(0)
 {
+    Str::Copy(m_instanceId, INSTANCE_ID_MAX, kDefaultInstanceId);
     m_httpClient = new HttpClient();
 }
 
@@ -113,11 +127,86 @@ HbClient::~HbClient()
     if (m_deviceId) {
         delete[] m_deviceId;
     }
+    if (m_apiKey) {
+        delete[] m_apiKey;
+    }
+}
+
+const TCHAR* HbClient::GetKind() const
+{
+    return kBackendKind;
+}
+
+const TCHAR* HbClient::GetDisplayName() const
+{
+    return kBackendDisplayName;
+}
+
+const TCHAR* HbClient::GetInstanceId() const
+{
+    return m_instanceId;
+}
+
+void HbClient::SetInstanceId(const TCHAR* instanceId)
+{
+    if (!instanceId || instanceId[0] == (TCHAR)'\0') {
+        // Never leave the id empty: an empty tag would make every queue record
+        // this client writes unroutable.
+        Str::Copy(m_instanceId, INSTANCE_ID_MAX, kDefaultInstanceId);
+        return;
+    }
+
+    Str::Copy(m_instanceId, INSTANCE_ID_MAX, instanceId);
+}
+
+bool HbClient::SetCredentials(const TCHAR* deviceId, const TCHAR* apiKey)
+{
+    if (!deviceId || !apiKey) {
+        return false;
+    }
+
+    // Both copies are taken before either old value is released: on a device
+    // this short of heap, failing half way through would leave the client
+    // holding one half of a credential pair it can never authenticate with.
+    TCHAR* deviceCopy = Str::Dup(deviceId);
+    if (!deviceCopy) {
+        return false;
+    }
+
+    TCHAR* keyCopy = Str::Dup(apiKey);
+    if (!keyCopy) {
+        delete[] deviceCopy;
+        return false;
+    }
+
+    if (m_deviceId) {
+        delete[] m_deviceId;
+    }
+    m_deviceId = deviceCopy;
+
+    if (m_apiKey) {
+        delete[] m_apiKey;
+    }
+    m_apiKey = keyCopy;
+
+    return true;
 }
 
 bool HbClient::Authenticate(const TCHAR* deviceId, const TCHAR* apiKey)
 {
-    if (!deviceId || !apiKey) {
+    // Copy first, then authenticate from the copies. Handing the caller's
+    // pointers straight through would break the moment the caller passed
+    // m_deviceId back in, which is exactly what the no-argument form does.
+    if (!SetCredentials(deviceId, apiKey)) {
+        return false;
+    }
+
+    return Authenticate();
+}
+
+bool HbClient::Authenticate()
+{
+    if (!m_deviceId || !m_apiKey) {
         return false;
     }
 
@@ -129,23 +218,14 @@ bool HbClient::Authenticate(const TCHAR* deviceId, const TCHAR* apiKey)
         m_authToken = NULL;
     }
 
-    // Remember the device id so later requests (e.g. sync) can identify us.
-    if (m_deviceId) {
-        delete[] m_deviceId;
-    }
-    m_deviceId = Str::Dup(deviceId);
-    if (!m_deviceId) {
-        return false;
-    }
-
     // Build authentication request body. Both values are JSON-escaped and the
     // buffer grows to fit: hb_conf.json allows credentials several hundred
     // characters long, which no longer has to match a fixed request buffer.
     Str::Buffer requestBody;
     requestBody.AppendChar((TCHAR)'{');
-    requestBody.AppendJsonPair(TEXT("deviceId"), deviceId);
+    requestBody.AppendJsonPair(TEXT("deviceId"), m_deviceId);
     requestBody.AppendChar((TCHAR)',');
-    requestBody.AppendJsonPair(TEXT("apiKey"), apiKey);
+    requestBody.AppendJsonPair(TEXT("apiKey"), m_apiKey);
     requestBody.AppendChar((TCHAR)'}');
     if (requestBody.Failed()) {
         return false;
@@ -175,8 +255,19 @@ bool HbClient::IsAuthenticated() const
     return m_authenticated;
 }
 
+bool HbClient::SessionIsRenewable() const
+{
+    // The token is minted from credentials this client holds, so a 401 means
+    // "expired", not "misconfigured" -- one re-authenticate and retry is worth
+    // the round trip.
+    return true;
+}
+
 void HbClient::Logout()
 {
+    // The recorded credentials are deliberately kept: this ends a session, it
+    // does not unconfigure the client, and Authenticate() has to be able to
+    // mint a new token afterwards without the caller re-supplying them.
     m_authenticated = false;
     if (m_authToken) {
         delete[] m_authToken;
@@ -236,6 +327,205 @@ void HbClient::SetAuthToken(const TCHAR* deviceId, const TCHAR* token)
 int HbClient::GetLastStatusCode() const
 {
     return m_lastStatusCode;
+}
+
+void HbClient::SummarizeItem(const Models::Item* item, Models::AssetSummary* out)
+{
+    if (!out) {
+        return;
+    }
+
+    out->Clear();
+    if (!item) {
+        return;
+    }
+
+    out->SetSource(kBackendDisplayName);
+    out->SetId(item->GetId());
+    out->SetTitle(item->GetName());
+    out->SetSubtitle(item->GetCategory());
+    out->SetCode(item->GetBarcode());
+
+    // Left empty on purpose, and SupportsStatus() reports false to match: a
+    // HomeBox item has no status field, so the UI hides the status action
+    // rather than offering one that cannot be applied.
+    out->SetStatus(TEXT(""));
+
+    TCHAR quantity[24];
+    quantity[0] = 0;
+    Str::AppendInt(quantity, (int)(sizeof(quantity) / sizeof(TCHAR)), item->GetQuantity());
+
+    // Row order is the order the operator reads them in: the barcode confirms
+    // the right record came back from the scan, then the quantity (the field a
+    // stock count actually changes), then where it lives, then the prose.
+    //
+    // Empty fields still get a row. A blank Location means "this item is not
+    // placed anywhere", which is a finding the operator is looking for; omitting
+    // the row would make it look like the screen had merely run out of detail.
+    //
+    // Location is the raw HomeBox location id, not a resolved name: turning it
+    // into a name costs a second request per scan, and on a GPRS link that is a
+    // visible pause on the hot path.
+    out->AddField(TEXT("Barcode"), item->GetBarcode());
+    out->AddField(TEXT("Quantity"), quantity);
+    out->AddField(TEXT("Location"), item->GetLocationId());
+    out->AddField(TEXT("Description"), item->GetDescription());
+}
+
+bool HbClient::LookupByCode(const TCHAR* code, Models::AssetSummary* out)
+{
+    // Cleared first so a caller that reads GetMatchCount() after a failed
+    // lookup cannot pick up the count from the previous scan.
+    m_matchCount = 0;
+
+    if (!code || !out) {
+        return false;
+    }
+
+    Models::Item item;
+    if (!GetItem(code, &item)) {
+        return false;
+    }
+
+    SummarizeItem(&item, &m_lastMatch);
+    m_matchCount = 1;
+
+    *out = m_lastMatch;
+    return true;
+}
+
+int HbClient::GetMatchCount() const
+{
+    return m_matchCount;
+}
+
+bool HbClient::GetMatch(int index, Models::AssetSummary* out)
+{
+    if (!out || index < 0 || index >= m_matchCount) {
+        return false;
+    }
+
+    *out = m_lastMatch;
+    return true;
+}
+
+bool HbClient::SupportsStatus() const
+{
+    return false;
+}
+
+int HbClient::GetStatusChoiceCount() const
+{
+    return 0;
+}
+
+const TCHAR* HbClient::GetStatusChoice(int index) const
+{
+    // No choices exist, so every index is out of range.
+    (void)index;
+    return NULL;
+}
+
+ReplayResult HbClient::Replay(const TCHAR* type, const TCHAR* data)
+{
+    if (!type) {
+        return REPLAY_SKIPPED;
+    }
+    if (!data) {
+        data = TEXT("");
+    }
+
+    if (wcscmp(type, TEXT("ITEM_SCAN")) == 0) {
+        return ReplayScan(data);
+    }
+    if (wcscmp(type, TEXT("ITEM_UPDATE")) == 0) {
+        return ReplayUpdate(data);
+    }
+
+    // Addressed to some other inventory system. Reporting it as a failure would
+    // pin the sync status at "failed" for as long as the entry sits there.
+    return REPLAY_SKIPPED;
+}
+
+ReplayResult HbClient::ReplayScan(const TCHAR* data)
+{
+    // DATA is "SCAN:<barcode>" or "SCANLOC:<barcodeLength>:<barcode><locationId>".
+    // A barcode can legally contain ':' (Code 128 and QR both encode it), so the
+    // location-carrying form states the barcode length instead of relying on a
+    // delimiter the barcode content could collide with.
+    const TCHAR* barcode = NULL;
+    const TCHAR* locationId = NULL;
+    TCHAR* barcodeCopy = NULL; // only the length-prefixed form needs one
+
+    if (wcsncmp(data, TEXT("SCANLOC:"), 8) == 0) {
+        const TCHAR* lenStart = data + 8;
+        const TCHAR* lenEnd = wcschr(lenStart, (TCHAR)':');
+        if (!lenEnd) {
+            return REPLAY_RETRY;
+        }
+
+        TCHAR lenText[12];
+        int barcodeLen = 0;
+        if (!Str::CopyN(lenText, 12, lenStart, (int)(lenEnd - lenStart)) ||
+            !Str::ParseInt(lenText, &barcodeLen)) {
+            return REPLAY_RETRY;
+        }
+
+        const TCHAR* body = lenEnd + 1;
+        if (barcodeLen <= 0 || barcodeLen > Str::Length(body)) {
+            return REPLAY_RETRY;
+        }
+
+        barcodeCopy = Str::DupN(body, barcodeLen);
+        if (!barcodeCopy) {
+            return REPLAY_RETRY;
+        }
+        barcode = barcodeCopy;
+        locationId = body + barcodeLen;
+    } else if (wcsncmp(data, TEXT("SCAN:"), 5) == 0) {
+        barcode = data + 5;
+    } else {
+        return REPLAY_RETRY;
+    }
+
+    if (barcode[0] == (TCHAR)'\0') {
+        delete[] barcodeCopy;
+        return REPLAY_RETRY;
+    }
+
+    // Only a real success clears the entry from the queue; anything else leaves
+    // it queued to be retried on the next Sync().
+    Models::Item item;
+    bool ok = GetItem(barcode, &item);
+
+    // If a location was captured with the scan, push the move too.
+    if (ok && locationId && locationId[0] != (TCHAR)'\0') {
+        ok = UpdateItemLocation(barcode, locationId);
+    }
+
+    delete[] barcodeCopy;
+    return ok ? REPLAY_SENT : REPLAY_RETRY;
+}
+
+ReplayResult HbClient::ReplayUpdate(const TCHAR* data)
+{
+    // DATA format: "UPDATE:<json>" where <json> is a complete Item JSON object,
+    // e.g. UPDATE:{"id":"42","barcode":"123","name":"Widget","quantity":3}
+    if (wcsncmp(data, TEXT("UPDATE:"), 7) != 0) {
+        return REPLAY_RETRY;
+    }
+
+    const TCHAR* json = data + 7;
+    if (*json == (TCHAR)'\0') {
+        return REPLAY_RETRY;
+    }
+
+    Models::Item item;
+    if (!item.FromJson(json)) {
+        return REPLAY_RETRY;
+    }
+
+    return UpdateItem(&item) ? REPLAY_SENT : REPLAY_RETRY;
 }
 
 bool HbClient::GetItem(const TCHAR* barcode, Models::Item* item)

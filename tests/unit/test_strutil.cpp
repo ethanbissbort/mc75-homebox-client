@@ -200,6 +200,88 @@ TEST_CASE("Str: UTF-8 round-trips and never emits a partial sequence")
     CHECK_EQ_INT((int)std::strlen(utf8), 0);
 }
 
+TEST_CASE("Str: UrlEncode escapes everything outside the unreserved set")
+{
+    TCHAR buf[64];
+
+    // The unreserved set passes through untouched.
+    CHECK(Str::UrlEncode(buf, 64, TEXT("ACME-004821")));
+    CHECK_EQ_STR(buf, TEXT("ACME-004821"));
+
+    CHECK(Str::UrlEncode(buf, 64, TEXT("aZ0-._~")));
+    CHECK_EQ_STR(buf, TEXT("aZ0-._~"));
+
+    // What real asset tags and serials actually contain. An unencoded '#'
+    // truncates the request at the server and an unencoded '&' appends a query
+    // parameter of the operator's choosing.
+    CHECK(Str::UrlEncode(buf, 64, TEXT("A/B+C#D E")));
+    CHECK_EQ_STR(buf, TEXT("A%2FB%2BC%23D%20E"));
+
+    CHECK(Str::UrlEncode(buf, 64, TEXT("a&b=c?d")));
+    CHECK_EQ_STR(buf, TEXT("a%26b%3Dc%3Fd"));
+
+    // A space is %20, never '+': the same encoding has to be valid in a path
+    // segment, where '+' means a literal plus.
+    CHECK(Str::UrlEncode(buf, 64, TEXT("R 201")));
+    CHECK_EQ_STR(buf, TEXT("R%20201"));
+
+    // The escape character itself, and hex digits are upper case.
+    CHECK(Str::UrlEncode(buf, 64, TEXT("100%")));
+    CHECK_EQ_STR(buf, TEXT("100%25"));
+
+    CHECK(Str::UrlEncode(buf, 64, TEXT("")));
+    CHECK_EQ_STR(buf, TEXT(""));
+}
+
+TEST_CASE("Str: UrlEncode escapes the UTF-8 bytes, not the code units")
+{
+    TCHAR buf[64];
+    TCHAR src[8];
+
+    // "cafe" with U+00E9. On the host TCHAR is a byte and the text is already
+    // UTF-8, so this is the two-byte encoding written out; on the device it is
+    // one WCHAR that Str::ToUtf8 expands to the same two bytes. Either way the
+    // escaped form is identical, which is the property under test.
+    src[0] = (TCHAR)'c';
+    src[1] = (TCHAR)'a';
+    src[2] = (TCHAR)'f';
+    src[3] = (TCHAR)0xC3;
+    src[4] = (TCHAR)0xA9;
+    src[5] = 0;
+
+    CHECK(Str::UrlEncode(buf, 64, src));
+    CHECK_EQ_STR(buf, TEXT("caf%C3%A9"));
+}
+
+TEST_CASE("Str: UrlEncode is bounded and always terminates")
+{
+    TCHAR buf[16];
+
+    // 'a' fits; the escaped space needs three more and does not, so the whole
+    // character is dropped rather than half-written.
+    Poison(buf, 16);
+    CHECK_FALSE(Str::UrlEncode(buf, 4, TEXT("a b")));
+    CHECK_EQ_STR(buf, TEXT("a"));
+    CHECK(buf[4] == (TCHAR)'#'); // nothing written past cap
+
+    // Exact fit is not truncation: "a%20b" is five characters plus the NUL.
+    Poison(buf, 16);
+    CHECK(Str::UrlEncode(buf, 6, TEXT("a b")));
+    CHECK_EQ_STR(buf, TEXT("a%20b"));
+    CHECK(buf[6] == (TCHAR)'#');
+
+    // One short of that fit.
+    Poison(buf, 16);
+    CHECK_FALSE(Str::UrlEncode(buf, 5, TEXT("a b")));
+    CHECK_EQ_STR(buf, TEXT("a%20"));
+
+    // Degenerate inputs must not crash.
+    CHECK_FALSE(Str::UrlEncode(NULL, 16, TEXT("abc")));
+    CHECK_FALSE(Str::UrlEncode(buf, 0, TEXT("abc")));
+    CHECK(Str::UrlEncode(buf, 16, NULL));
+    CHECK_EQ_STR(buf, TEXT(""));
+}
+
 TEST_CASE("Str: Buffer grows past any fixed size and builds valid JSON")
 {
     // Regression: ToJson used a fixed new TCHAR[2048] and HttpClient a fixed

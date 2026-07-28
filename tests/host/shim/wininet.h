@@ -31,6 +31,24 @@ typedef uintptr_t DWORD_PTR;
 /* HttpOpenRequest dwFlags */
 #define INTERNET_FLAG_SECURE        0x00800000
 #define INTERNET_FLAG_RELOAD        0x80000000
+/* Suppresses the cookie jar: NetBox's session auth is listed ahead of token
+ * auth, so a replayed sessionid cookie turns on CSRF checking and every write
+ * fails 403. */
+#define INTERNET_FLAG_NO_COOKIES    0x00080000
+/* NetBox answers 301 for a URL missing its trailing slash; following that would
+ * re-issue a PATCH as a GET. */
+#define INTERNET_FLAG_NO_AUTO_REDIRECT 0x00200000
+/* No modal dialogs -- requests run on the sync thread. */
+#define INTERNET_FLAG_NO_UI         0x00000200
+/* Opt-in certificate relaxation (HttpClient::SetIgnoreCertificateErrors). */
+#define INTERNET_FLAG_IGNORE_CERT_CN_INVALID   0x00001000
+#define INTERNET_FLAG_IGNORE_CERT_DATE_INVALID 0x00002000
+/* INTERNET_OPTION_SECURITY_FLAGS bits. An untrusted CA has no HttpOpenRequest
+ * flag; it can only be waived here. */
+#define SECURITY_FLAG_IGNORE_UNKNOWN_CA        0x00000100
+#define SECURITY_FLAG_IGNORE_WRONG_USAGE       0x00000200
+#define SECURITY_FLAG_IGNORE_CERT_CN_INVALID   0x00001000
+#define SECURITY_FLAG_IGNORE_CERT_DATE_INVALID 0x00002000
 /* HttpAddRequestHeaders dwModifiers */
 #define HTTP_ADDREQ_FLAG_ADD        0x20000000
 /* HttpQueryInfo dwInfoLevel */
@@ -40,6 +58,7 @@ typedef uintptr_t DWORD_PTR;
 #define INTERNET_OPTION_CONNECT_TIMEOUT 2
 #define INTERNET_OPTION_SEND_TIMEOUT    5
 #define INTERNET_OPTION_RECEIVE_TIMEOUT 6
+#define INTERNET_OPTION_SECURITY_FLAGS  31
 
 /* -------------------------------------------------------------- functions -- */
 inline HINTERNET InternetOpen(LPCTSTR /*agent*/, DWORD /*accessType*/,
@@ -99,6 +118,16 @@ inline BOOL InternetReadFile(HINTERNET /*file*/, LPVOID /*buffer*/,
 inline BOOL InternetSetOption(HINTERNET /*handle*/, DWORD /*option*/,
                               LPVOID /*buffer*/, DWORD /*bufferLength*/)
 {
+    return TRUE;
+}
+
+inline BOOL InternetQueryOption(HINTERNET /*handle*/, DWORD /*option*/,
+                                LPVOID buffer, LPDWORD bufferLength)
+{
+    /* Report an empty flag set if the caller passed a DWORD-sized buffer. */
+    if (buffer && bufferLength && *bufferLength >= sizeof(DWORD)) {
+        *(DWORD*)buffer = 0;
+    }
     return TRUE;
 }
 

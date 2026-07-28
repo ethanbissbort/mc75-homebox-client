@@ -55,6 +55,49 @@ public:
     int GetArrayLength() const;
     bool GetArrayElement(int index, JsonLite* element) const;
 
+    /**
+     * Borrows the object stored under `key` into `out`.
+     *
+     * Nested reads are unavoidable for NetBox: every foreign key comes back as
+     * a sub-object (`site`, `location`, `rack`, `device_type`, `role`,
+     * `primary_ip`), `status` and `face` arrive as {"value","label"} pairs, and
+     * a list response wraps everything in {"count","next","results":[...]}.
+     *
+     * `out` points into this parser's tree and never owns nodes, exactly like
+     * GetArrayElement: the two objects may be destroyed in either order, but
+     * `out` must not be *read* after this parser is cleared, re-parsed or
+     * destroyed. A borrowed view can be descended into further, so
+     * device -> device_type -> manufacturer -> name is three chained calls.
+     *
+     * Returns false when the key is missing or is not an object -- notably for
+     * `"rack": null`, which is what an unracked device carries. `out` must be a
+     * fresh or already-borrowing view: descending into this instance, or into
+     * the parser that owns the tree, is refused rather than freeing the node
+     * being handed over.
+     */
+    bool GetObject(const TCHAR* key, JsonLite* out) const;
+
+    /** As GetObject, for an array member such as the `results` envelope. */
+    bool GetArray(const TCHAR* key, JsonLite* out) const;
+
+    /**
+     * Copies `key`->`subKey` (e.g. site->name, status->value) into `out`.
+     * Returns false -- leaving `out` untouched -- if either level is missing,
+     * is null, or the value did not fit, so an unracked device reads as "no
+     * rack name" rather than as a stale one.
+     */
+    bool GetNestedString(const TCHAR* key, const TCHAR* subKey, TCHAR* out, int outMax) const;
+
+    /** Heap copy of `key`->`subKey`, or NULL. Caller must delete[]. */
+    TCHAR* GetNestedStringAlloc(const TCHAR* key, const TCHAR* subKey) const;
+
+    /**
+     * Reads `key`->`subKey` as an integer, for the ids a write path needs:
+     * a PATCH addresses related objects by bare id, while a read only ever
+     * returns them nested.
+     */
+    bool GetNestedInt(const TCHAR* key, const TCHAR* subKey, int* value) const;
+
     // Building JSON
     void BeginObject();
     void EndObject();
@@ -99,6 +142,9 @@ private:
     Node* CreateNode();
     void FreeNode(Node* node);
     Node* FindKey(const TCHAR* key) const;
+    // Points `out` at a node of this tree without transferring ownership.
+    bool BorrowNode(Node* node, JsonLite* out) const;
+    static bool ContainsNode(const Node* root, const Node* node);
     bool ParseValue(const TCHAR** ptr, Node* node);
     bool ParseObject(const TCHAR** ptr, Node* node);
     bool ParseArray(const TCHAR** ptr, Node* node);

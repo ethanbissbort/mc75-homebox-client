@@ -104,6 +104,30 @@ char* ToUtf8Alloc(const TCHAR* src);
 TCHAR* FromUtf8Alloc(const char* src);
 
 // ---------------------------------------------------------------------------
+// URLs
+// ---------------------------------------------------------------------------
+
+/**
+ * Percent-encodes `src` into `dst` for use as a query-string value or a path
+ * segment. Everything outside the RFC 3986 unreserved set
+ * (ALPHA / DIGIT / "-" / "." / "_" / "~") is escaped, including space -- as
+ * %20, never '+', so the same encoding is valid in a path as in a query.
+ *
+ * This is not theoretical: scanned asset tags and serials routinely contain
+ * '/', '+', '#' and spaces, and an unencoded '#' truncates the request at the
+ * server while an unencoded '&' injects a second query parameter.
+ *
+ * Encoding is done over the UTF-8 bytes of `src`, so a non-ASCII tag produces
+ * the same escape sequence on the device (TCHAR == UTF-16) as on the host
+ * (TCHAR == a UTF-8 byte).
+ *
+ * Always NUL-terminates; returns false on truncation, in which case `dst` holds
+ * a shorter but complete encoding -- never half a percent-triplet and never
+ * half a multi-byte character.
+ */
+bool UrlEncode(TCHAR* dst, int cap, const TCHAR* src);
+
+// ---------------------------------------------------------------------------
 // Growable text buffer
 // ---------------------------------------------------------------------------
 

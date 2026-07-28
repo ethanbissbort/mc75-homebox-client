@@ -365,16 +365,65 @@ bool JsonLite::GetArrayElement(int index, JsonLite* element) const
         return false; // Index out of bounds
     }
 
-    // Create a shallow reference to this node
-    // Note: This is a simplified implementation
-    // In a full implementation, we'd clone the node
-    element->Clear();
-    element->m_root = current;
-    // The node is owned by this parser's tree; the element only borrows it and
-    // must not free it in its destructor (that would double-free).
-    element->m_borrowedRoot = true;
+    return BorrowNode(current, element);
+}
 
-    return true;
+bool JsonLite::GetObject(const TCHAR* key, JsonLite* out) const
+{
+    Node* node = FindKey(key);
+    if (!node || node->type != Node::TYPE_OBJECT) {
+        return false;
+    }
+
+    return BorrowNode(node, out);
+}
+
+bool JsonLite::GetArray(const TCHAR* key, JsonLite* out) const
+{
+    Node* node = FindKey(key);
+    if (!node || node->type != Node::TYPE_ARRAY) {
+        return false;
+    }
+
+    return BorrowNode(node, out);
+}
+
+bool JsonLite::GetNestedString(const TCHAR* key, const TCHAR* subKey,
+                               TCHAR* out, int outMax) const
+{
+    if (!out || outMax <= 0) {
+        return false;
+    }
+
+    // The borrowed view holds two pointers and allocates nothing, so this stays
+    // free of heap traffic on the scan path even though it is called once per
+    // displayed field.
+    JsonLite child;
+    if (!GetObject(key, &child)) {
+        return false;
+    }
+
+    return child.GetString(subKey, out, (DWORD)outMax);
+}
+
+TCHAR* JsonLite::GetNestedStringAlloc(const TCHAR* key, const TCHAR* subKey) const
+{
+    JsonLite child;
+    if (!GetObject(key, &child)) {
+        return NULL;
+    }
+
+    return child.GetStringAlloc(subKey);
+}
+
+bool JsonLite::GetNestedInt(const TCHAR* key, const TCHAR* subKey, int* value) const
+{
+    JsonLite child;
+    if (!GetObject(key, &child)) {
+        return false;
+    }
+
+    return child.GetInt(subKey, value);
 }
 
 void JsonLite::BeginObject()
@@ -614,6 +663,54 @@ JsonLite::Node* JsonLite::FindKey(const TCHAR* key) const
     }
 
     return NULL;
+}
+
+bool JsonLite::ContainsNode(const Node* root, const Node* node)
+{
+    // Siblings are walked iteratively for the same reason FreeNode does it: a
+    // `results` array of a few hundred entries would otherwise recurse once per
+    // element. Recursion follows nesting only, which Parse caps.
+    while (root) {
+        if (root == node) {
+            return true;
+        }
+        if (root->child && ContainsNode(root->child, node)) {
+            return true;
+        }
+        root = root->next;
+    }
+
+    return false;
+}
+
+bool JsonLite::BorrowNode(Node* node, JsonLite* out) const
+{
+    if (!node || !out) {
+        return false;
+    }
+
+    // Two ways a descent can be asked to free the node it is handing over,
+    // both of them use-after-free:
+    //   - descending into oneself, and
+    //   - descending into the parser that owns the tree (the shape a path walk
+    //     falls into when it reuses the document as the destination).
+    // Descend into a fresh view, or into one that is already borrowing.
+    if (out == this) {
+        return false;
+    }
+    if (out->m_root && !out->m_borrowedRoot && ContainsNode(out->m_root, node)) {
+        return false;
+    }
+
+    out->Clear();
+    out->m_root = node;
+    // The node stays owned by this parser's tree; the view only borrows it and
+    // must not free it in its destructor (that would double-free). Because a
+    // borrowed view never frees anything, owner and view can be destroyed in
+    // either order -- only reading through a stale view is unsafe.
+    out->m_borrowedRoot = true;
+
+    return true;
 }
 
 bool JsonLite::ParseValue(const TCHAR** ptr, Node* node)

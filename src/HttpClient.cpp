@@ -7,7 +7,42 @@
 // is only pulled in for the device build; the host build never defines the
 // macro and therefore keeps using the WinSock SendRequest path below.
 #include <wininet.h>
+
+// Windows CE ships a subset of the desktop wininet.h, and which constants made
+// the cut varies between SDK revisions. The values are fixed by the API, so
+// supplying any that are missing is safer than having the device build fail on
+// a header we cannot inspect from here.
+#ifndef INTERNET_FLAG_NO_COOKIES
+#define INTERNET_FLAG_NO_COOKIES              0x00080000
 #endif
+#ifndef INTERNET_FLAG_NO_AUTO_REDIRECT
+#define INTERNET_FLAG_NO_AUTO_REDIRECT        0x00200000
+#endif
+#ifndef INTERNET_FLAG_NO_UI
+#define INTERNET_FLAG_NO_UI                   0x00000200
+#endif
+#ifndef INTERNET_FLAG_IGNORE_CERT_CN_INVALID
+#define INTERNET_FLAG_IGNORE_CERT_CN_INVALID  0x00001000
+#endif
+#ifndef INTERNET_FLAG_IGNORE_CERT_DATE_INVALID
+#define INTERNET_FLAG_IGNORE_CERT_DATE_INVALID 0x00002000
+#endif
+#ifndef INTERNET_OPTION_SECURITY_FLAGS
+#define INTERNET_OPTION_SECURITY_FLAGS        31
+#endif
+#ifndef SECURITY_FLAG_IGNORE_UNKNOWN_CA
+#define SECURITY_FLAG_IGNORE_UNKNOWN_CA       0x00000100
+#endif
+#ifndef SECURITY_FLAG_IGNORE_CERT_CN_INVALID
+#define SECURITY_FLAG_IGNORE_CERT_CN_INVALID  0x00001000
+#endif
+#ifndef SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
+#define SECURITY_FLAG_IGNORE_CERT_DATE_INVALID 0x00002000
+#endif
+#ifndef SECURITY_FLAG_IGNORE_WRONG_USAGE
+#define SECURITY_FLAG_IGNORE_WRONG_USAGE      0x00000200
+#endif
+#endif // HBX_USE_WININET
 
 #if !defined(UNDER_CE) && !defined(_WIN32) && !defined(WIN32)
 // POSIX takes SO_RCVTIMEO / SO_SNDTIMEO as a struct timeval, not as the DWORD
@@ -28,6 +63,26 @@ const int kMaxResponseBytes = 512 * 1024;
 const int kChunkIncomplete = 0;
 const int kChunkComplete   = 1;
 const int kChunkMalformed  = -1;
+
+// WinInet error codes worth explaining to the operator. Spelled out here rather
+// than taken from <wininet.h> so DescribeWinInetError compiles in the host build
+// too, where that header is not included at all; the values are part of the
+// published API and cannot move.
+const DWORD kWinInetTimeout            = 12002;
+const DWORD kWinInetNameNotResolved    = 12007;
+const DWORD kWinInetCannotConnect      = 12029;
+const DWORD kWinInetConnectionAborted  = 12030;
+const DWORD kWinInetConnectionReset    = 12031;
+const DWORD kWinInetCertDateInvalid    = 12037;
+const DWORD kWinInetCertCnInvalid      = 12038;
+const DWORD kWinInetClientCertNeeded   = 12044;
+const DWORD kWinInetInvalidCa          = 12045;
+const DWORD kWinInetCertRevFailed      = 12057;
+const DWORD kWinInetSecureChannelError = 12157;
+const DWORD kWinInetDisconnected       = 12163;
+const DWORD kWinInetServerUnreachable  = 12164;
+const DWORD kWinInetInvalidCert        = 12169;
+const DWORD kWinInetCertRevoked        = 12170;
 
 /**
  * Growable byte buffer for raw wire bytes. Always keeps a NUL one past the
@@ -348,7 +403,10 @@ HttpClient::HttpClient()
     , m_lastStatusCode(0)
     , m_lastError(NULL)
     , m_headers(NULL)
+    , m_ignoreCertErrors(false)
 {
+    m_lastMethod[0] = 0;
+
     InitializeCriticalSection(&m_lock);
 
     // Initialize WinSock
@@ -392,6 +450,14 @@ bool HttpClient::Put(const TCHAR* url, const TCHAR* body, HttpResponse* response
     return HBX_SEND_REQUEST(TEXT("PUT"), url, body, response);
 }
 
+// Both transports take the verb as a string, so PATCH costs nothing beyond
+// this line: WinSock writes it into the request line, WinInet hands it to
+// HttpOpenRequest.
+bool HttpClient::Patch(const TCHAR* url, const TCHAR* body, HttpResponse* response)
+{
+    return HBX_SEND_REQUEST(TEXT("PATCH"), url, body, response);
+}
+
 bool HttpClient::Delete(const TCHAR* url, HttpResponse* response)
 {
     return HBX_SEND_REQUEST(TEXT("DELETE"), url, NULL, response);
@@ -401,6 +467,17 @@ void HttpClient::SetTimeout(DWORD timeoutMs)
 {
     ScopedLock guard(&m_lock);
     m_timeoutMs = timeoutMs;
+}
+
+void HttpClient::SetIgnoreCertificateErrors(bool ignore)
+{
+    ScopedLock guard(&m_lock);
+    m_ignoreCertErrors = ignore;
+}
+
+bool HttpClient::IgnoreCertificateErrors() const
+{
+    return m_ignoreCertErrors;
 }
 
 void HttpClient::AddHeader(const TCHAR* key, const TCHAR* value)
@@ -439,6 +516,16 @@ int HttpClient::GetLastHttpStatusCode() const
 const TCHAR* HttpClient::GetLastError() const
 {
     return m_lastError;
+}
+
+const TCHAR* HttpClient::GetLastMethod() const
+{
+    return m_lastMethod;
+}
+
+void HttpClient::RecordMethod(const TCHAR* method)
+{
+    Str::Copy(m_lastMethod, (int)kMethodChars, method ? method : TEXT(""));
 }
 
 void HttpClient::SetError(const TCHAR* message)
@@ -482,6 +569,10 @@ bool HttpClient::SendRequest(const TCHAR* method, const TCHAR* url, const TCHAR*
 
     ScopedLock guard(&m_lock);
 
+    // Recorded first so a diagnostic can name the verb even when the request
+    // never reaches the wire.
+    RecordMethod(method);
+
     // Parse URL
     TCHAR host[256];
     TCHAR path[1024];
@@ -512,6 +603,20 @@ bool HttpClient::SendRequest(const TCHAR* method, const TCHAR* url, const TCHAR*
     request.Append(TEXT("\r\n"));
 
     AppendHeaderLines(&request);
+
+    // Ask for JSON unless the caller has its own opinion. Both backends answer
+    // JSON by default, but NetBox's DRF layer also has an HTML "browsable API"
+    // renderer that wins whenever a client sends a browser-style Accept; that
+    // page is orders of magnitude larger than the JSON and would blow the
+    // response ceiling on a device with no heap to spare.
+    //
+    // Deliberately no "version=" parameter. NetBox uses AcceptHeaderVersioning
+    // with ALLOWED_VERSIONS containing only the version actually installed, so
+    // any pin answers 406 Not Acceptable -- and would break the client the day
+    // the server is upgraded.
+    if (!HasHeader(TEXT("Accept"))) {
+        request.Append(TEXT("Accept: application/json\r\n"));
+    }
 
     // Read-to-close is the fallback framing for a reply that carries neither
     // Content-Length nor chunked encoding, so ask the server to close.
@@ -677,9 +782,9 @@ bool HttpClient::SendRequest(const TCHAR* method, const TCHAR* url, const TCHAR*
 }
 
 #ifdef HBX_USE_WININET
-// WinInet transport: performs a real HTTP or HTTPS request. HTTPS (TLS) is
-// selected transparently when the URL uses the https scheme (default port 443)
-// or explicitly names port 443. All handles are released on every return path.
+// WinInet transport: performs a real HTTP or HTTPS request. TLS is negotiated
+// when, and only when, the URL names the https scheme. All handles are released
+// on every return path.
 bool HttpClient::SendRequestWinInet(const TCHAR* method, const TCHAR* url, const TCHAR* body, HttpResponse* response)
 {
     if (!response) {
@@ -690,6 +795,10 @@ bool HttpClient::SendRequestWinInet(const TCHAR* method, const TCHAR* url, const
 
     ScopedLock guard(&m_lock);
 
+    // Recorded first so a diagnostic can name the verb even when the request
+    // never reaches the wire.
+    RecordMethod(method);
+
     // Parse URL into host / port / path.
     TCHAR host[256];
     TCHAR path[1024];
@@ -699,8 +808,7 @@ bool HttpClient::SendRequestWinInet(const TCHAR* method, const TCHAR* url, const
         return false;
     }
 
-    // Use TLS for https URLs (default 443 or an explicit https:// scheme).
-    bool isHttps = (port == 443) || (wcsncmp(url, TEXT("https://"), 8) == 0);
+    const bool isHttps = IsSecureUrl(url);
 
     // Open a WinInet session.
     HINTERNET hInternet = InternetOpen(TEXT("HBXClient/1.0"),
@@ -726,10 +834,43 @@ bool HttpClient::SendRequestWinInet(const TCHAR* method, const TCHAR* url, const
         return false;
     }
 
-    // Build the request; enable TLS and bypass the cache.
-    DWORD requestFlags = INTERNET_FLAG_RELOAD;
+    // Build the request. Every flag below is load-bearing:
+    //
+    //   RELOAD             never serve this from the WinInet cache.
+    //
+    //   NO_COOKIES         NetBox lists DRF's SessionAuthentication BEFORE
+    //                      TokenAuthentication. WinInet stores and replays
+    //                      cookies for the life of the session by default, so
+    //                      one stray Set-Cookie: sessionid makes session auth
+    //                      match first on every later request -- which turns on
+    //                      CSRF enforcement, which nothing here can satisfy, so
+    //                      every write comes back "403 CSRF Failed". Token auth
+    //                      needs no cookie at all. This flag looks removable and
+    //                      is not.
+    //
+    //   NO_AUTO_REDIRECT   NetBox requires a trailing slash on API URLs and
+    //                      answers 301 without one. Letting WinInet follow that
+    //                      redirect re-issues the write as a GET: the call
+    //                      reports 200 and nothing was changed. Not following it
+    //                      also keeps this transport consistent with the WinSock
+    //                      one, which has never followed redirects -- otherwise
+    //                      the same misconfigured URL would behave differently on
+    //                      the device and in the host tests.
+    //
+    //   NO_UI              this runs on the sync thread; a modal certificate
+    //                      prompt there hangs the handheld with nobody to answer
+    //                      it.
+    DWORD requestFlags = INTERNET_FLAG_RELOAD |
+                         INTERNET_FLAG_NO_COOKIES |
+                         INTERNET_FLAG_NO_AUTO_REDIRECT |
+                         INTERNET_FLAG_NO_UI;
     if (isHttps) {
         requestFlags |= INTERNET_FLAG_SECURE;
+        if (m_ignoreCertErrors) {
+            // Opt-in only; see SetIgnoreCertificateErrors() for what this costs.
+            requestFlags |= INTERNET_FLAG_IGNORE_CERT_CN_INVALID |
+                            INTERNET_FLAG_IGNORE_CERT_DATE_INVALID;
+        }
     }
 
     HINTERNET hRequest = HttpOpenRequest(hConnect, method, path,
@@ -745,9 +886,38 @@ bool HttpClient::SendRequestWinInet(const TCHAR* method, const TCHAR* url, const
     InternetSetOption(hRequest, INTERNET_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
     InternetSetOption(hRequest, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
 
+    if (isHttps && m_ignoreCertErrors) {
+        // An untrusted CA is the one certificate failure with no HttpOpenRequest
+        // flag behind it -- it can only be waived through the security flags,
+        // and only on the request handle (the session handle answers with
+        // ERROR_INTERNET_INCORRECT_HANDLE_TYPE). Doing it before the first send
+        // avoids the documented fail-then-retry dance, which on some CE builds
+        // needs the request handle torn down and rebuilt to take effect.
+        DWORD securityFlags = 0;
+        DWORD securityLen = sizeof(securityFlags);
+        if (!InternetQueryOption(hRequest, INTERNET_OPTION_SECURITY_FLAGS,
+                                 &securityFlags, &securityLen)) {
+            securityFlags = 0;
+        }
+        securityFlags |= SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                         SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                         SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                         SECURITY_FLAG_IGNORE_WRONG_USAGE;
+        InternetSetOption(hRequest, INTERNET_OPTION_SECURITY_FLAGS,
+                          &securityFlags, sizeof(securityFlags));
+    }
+
     // Add the accumulated custom headers as a single "Key: Value\r\n" block.
     Str::Buffer headerBlock;
     AppendHeaderLines(&headerBlock);
+    // HttpOpenRequest was given no accept types, so WinInet sends no Accept
+    // header of its own. Supply one for the same reason as the WinSock path:
+    // keep NetBox's HTML browsable-API renderer out of a 512 KB response budget.
+    // Never with a "version=" parameter -- NetBox answers 406 to any version but
+    // the one it is running.
+    if (!HasHeader(TEXT("Accept"))) {
+        headerBlock.Append(TEXT("Accept: application/json\r\n"));
+    }
     if (body && body[0] != '\0' && !HasHeader(TEXT("Content-Type"))) {
         headerBlock.Append(TEXT("Content-Type: application/json; charset=utf-8\r\n"));
     }
@@ -786,10 +956,28 @@ bool HttpClient::SendRequestWinInet(const TCHAR* method, const TCHAR* url, const
     }
 
     if (!sent) {
+        // Read the code before anything else: InternetCloseHandle succeeds and
+        // resets the thread's last-error, so cleaning up first would throw away
+        // the only evidence of why the send failed. Reporting a bare
+        // "HttpSendRequest failed" is what made every TLS problem on this device
+        // -- untrusted CA, wrong host name, expired certificate, a server that
+        // will not speak TLS 1.0 -- look identical to a dead network.
+        DWORD lastError = ::GetLastError();
+
         InternetCloseHandle(hRequest);
         InternetCloseHandle(hConnect);
         InternetCloseHandle(hInternet);
-        SetError(TEXT("HttpSendRequest failed"));
+
+        const TCHAR* detail = DescribeWinInetError(lastError);
+        if (detail) {
+            SetError(detail);
+        } else {
+            Str::Buffer msg;
+            msg.Append(TEXT("HttpSendRequest failed (WinInet error "));
+            msg.AppendInt((long)lastError);
+            msg.AppendChar((TCHAR)')');
+            SetError(msg.Failed() ? TEXT("HttpSendRequest failed") : msg.Get());
+        }
         return false;
     }
 
@@ -999,6 +1187,76 @@ bool HttpClient::ParseUrl(const TCHAR* url, TCHAR* host, int* port, TCHAR* path,
     }
 
     return true;
+}
+
+bool HttpClient::IsSecureUrl(const TCHAR* url)
+{
+    // Scheme only. The previous test also accepted "port == 443", which meant a
+    // plain listener reached as http://host:443 -- a perfectly ordinary shape
+    // for the HTTP-only reverse proxy this device is expected to talk to -- was
+    // pushed through a TLS handshake it could never complete. ParseUrl already
+    // supplies 443 as the default port for an https URL, so the port carries no
+    // information the scheme does not.
+    return url != NULL && wcsncmp(url, TEXT("https://"), 8) == 0;
+}
+
+const TCHAR* HttpClient::DescribeWinInetError(DWORD code)
+{
+    switch (code) {
+        // --- TLS -----------------------------------------------------------
+        // The MC75's Schannel tops out at SSL 3.0 / TLS 1.0 with RC4, DES or
+        // 3DES, and its root store dates from around 2009. Every one of these
+        // is a likely first encounter for someone pointing the handheld at a
+        // current HTTPS endpoint, so each says what actually went wrong and
+        // what to do about it.
+        case kWinInetSecureChannelError:
+            return TEXT("TLS handshake failed (12157). This device offers only ")
+                   TEXT("SSL 3.0 / TLS 1.0 and a modern server will refuse it. ")
+                   TEXT("Use plain HTTP on a trusted LAN, or a proxy that ")
+                   TEXT("accepts legacy TLS.");
+        case kWinInetInvalidCa:
+            return TEXT("TLS certificate authority not trusted (12045). This ")
+                   TEXT("device's root store predates most current CAs. Install ")
+                   TEXT("the CA on the device, or use plain HTTP on a trusted LAN.");
+        case kWinInetCertCnInvalid:
+            return TEXT("TLS certificate name does not match the server (12038). ")
+                   TEXT("Use the exact host name the certificate was issued for.");
+        case kWinInetCertDateInvalid:
+            return TEXT("TLS certificate is expired or not yet valid (12037). ")
+                   TEXT("Check the certificate dates and the device clock.");
+        case kWinInetInvalidCert:
+            return TEXT("TLS certificate is invalid (12169).");
+        case kWinInetCertRevoked:
+            return TEXT("TLS certificate has been revoked (12170).");
+        case kWinInetCertRevFailed:
+            return TEXT("TLS revocation check could not be completed (12057).");
+        case kWinInetClientCertNeeded:
+            return TEXT("Server requested a client certificate (12044); none is ")
+                   TEXT("installed on this device.");
+
+        // --- network -------------------------------------------------------
+        case kWinInetTimeout:
+            return TEXT("Request timed out (12002).");
+        case kWinInetNameNotResolved:
+            return TEXT("Server name could not be resolved (12007). This device ")
+                   TEXT("has no mDNS, so a .local name will never resolve; use an ")
+                   TEXT("IP address or a name your DNS serves.");
+        case kWinInetCannotConnect:
+            return TEXT("Cannot connect to the server (12029). Check the address, ")
+                   TEXT("the port and that the server is listening.");
+        case kWinInetConnectionAborted:
+            return TEXT("Connection aborted by the server (12030).");
+        case kWinInetConnectionReset:
+            return TEXT("Connection reset by the server (12031).");
+        case kWinInetDisconnected:
+            return TEXT("No network connection (12163). Work will be queued.");
+        case kWinInetServerUnreachable:
+            return TEXT("Server unreachable (12164).");
+        default:
+            // Unknown code: the caller reports the number so it can still be
+            // looked up, rather than inventing advice for it.
+            return NULL;
+    }
 }
 
 void HttpClient::ClearHeaders()

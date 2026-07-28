@@ -181,10 +181,17 @@ Config::Config()
     , m_journalPath(NULL)
     , m_logLevel(NULL)
     , m_configPath(NULL)
+    , m_activeBackendId(NULL)
+    , m_homeboxInstanceId(NULL)
+    , m_netboxInstanceId(NULL)
+    , m_netboxBaseUrl(NULL)
+    , m_netboxToken(NULL)
+    , m_netboxAuthScheme(NULL)
     , m_syncIntervalSeconds(300) // Default 5 minutes
     , m_offlineModeEnabled(true)
     , m_scannerBeepEnabled(true)
     , m_scannerVibrateEnabled(true)
+    , m_allowInsecureTls(false)
 {
     InitDefaults();
 }
@@ -203,10 +210,23 @@ void Config::InitDefaults()
     SetApiKey(TEXT(""));
     SetJournalPath(TEXT("\\My Documents\\hbx_journal.log"));
     SetLogLevel(TEXT("INFO"));
+
+    // Backends. "hb" matches the tag on queue records written before entries
+    // carried one, so an upgraded device recognises the work it is already
+    // carrying. NetBox starts with an empty URL, which is how the controller
+    // tells "no NetBox here" from "NetBox is configured".
+    SetHomeboxInstanceId(TEXT("hb"));
+    SetNetboxInstanceId(TEXT("nb"));
+    SetActiveBackendId(TEXT("hb"));
+    SetNetboxBaseUrl(TEXT(""));
+    SetNetboxToken(TEXT(""));
+    SetNetboxAuthScheme(TEXT("Token"));
+
     m_syncIntervalSeconds = 300;
     m_offlineModeEnabled = true;
     m_scannerBeepEnabled = true;
     m_scannerVibrateEnabled = true;
+    m_allowInsecureTls = false;
 }
 
 void Config::Cleanup()
@@ -218,6 +238,12 @@ void Config::Cleanup()
     Assign(&m_journalPath, NULL);
     Assign(&m_logLevel, NULL);
     Assign(&m_configPath, NULL);
+    Assign(&m_activeBackendId, NULL);
+    Assign(&m_homeboxInstanceId, NULL);
+    Assign(&m_netboxInstanceId, NULL);
+    Assign(&m_netboxBaseUrl, NULL);
+    Assign(&m_netboxToken, NULL);
+    Assign(&m_netboxAuthScheme, NULL);
 }
 
 bool Config::Load(const TCHAR* configPath)
@@ -315,6 +341,49 @@ bool Config::Load(const TCHAR* configPath)
         delete[] value;
     }
 
+    // Backend instance ids come first: activeBackend names one of them, and its
+    // default has to follow whatever HomeBox was actually called.
+    value = ReadString(strict, jsonContent, TEXT("homeboxInstanceId"));
+    if (value) {
+        SetHomeboxInstanceId(value);
+        delete[] value;
+    }
+
+    value = ReadString(strict, jsonContent, TEXT("netboxInstanceId"));
+    if (value) {
+        SetNetboxInstanceId(value);
+        delete[] value;
+    }
+
+    value = ReadString(strict, jsonContent, TEXT("activeBackend"));
+    if (value) {
+        SetActiveBackendId(value);
+        delete[] value;
+    } else {
+        // A file that predates the second backend selects HomeBox, whatever the
+        // operator named it - never the literal default, which might name
+        // nothing that is registered.
+        SetActiveBackendId(m_homeboxInstanceId);
+    }
+
+    value = ReadString(strict, jsonContent, TEXT("netboxBaseUrl"));
+    if (value) {
+        SetNetboxBaseUrl(value);
+        delete[] value;
+    }
+
+    value = ReadString(strict, jsonContent, TEXT("netboxToken"));
+    if (value) {
+        SetNetboxToken(value);
+        delete[] value;
+    }
+
+    value = ReadString(strict, jsonContent, TEXT("netboxAuthScheme"));
+    if (value) {
+        SetNetboxAuthScheme(value);
+        delete[] value;
+    }
+
     int intValue = 0;
     if (ReadInt(strict, jsonContent, TEXT("syncIntervalSeconds"), &intValue)) {
         SetSyncIntervalSeconds(intValue);
@@ -334,6 +403,10 @@ bool Config::Load(const TCHAR* configPath)
 
     if (ReadBool(strict, jsonContent, TEXT("scannerVibrateEnabled"), &boolValue)) {
         m_scannerVibrateEnabled = boolValue;
+    }
+
+    if (ReadBool(strict, jsonContent, TEXT("allowInsecureTls"), &boolValue)) {
+        m_allowInsecureTls = boolValue;
     }
 
     delete[] jsonContent;
@@ -382,12 +455,25 @@ bool Config::Save(const TCHAR* configPath)
     // Values are escaped and the buffer grows. Both matter here: a Windows path
     // is full of backslashes, and a JWT auth token runs well past a thousand
     // characters, so a fixed buffer with raw values makes the file unreadable.
+    //
+    // Every key Load() understands must be written back. Save() rewrites the
+    // whole file from the fields it knows, and Controller::PersistAuthToken
+    // calls it on the first successful authentication of every run - so a key
+    // that is loaded but not saved is wiped off the device the first time the
+    // operator authenticates.
     Str::Buffer json;
     json.Append(TEXT("{\n"));
+    AppendStringLine(json, TEXT("activeBackend"), m_activeBackendId, false);
+    AppendStringLine(json, TEXT("homeboxInstanceId"), m_homeboxInstanceId, false);
     AppendStringLine(json, TEXT("apiBaseUrl"), m_apiBaseUrl, false);
     AppendStringLine(json, TEXT("deviceId"), m_deviceId, false);
     AppendStringLine(json, TEXT("apiKey"), m_apiKey, false);
     AppendStringLine(json, TEXT("authToken"), m_authToken, false);
+    AppendStringLine(json, TEXT("netboxInstanceId"), m_netboxInstanceId, false);
+    AppendStringLine(json, TEXT("netboxBaseUrl"), m_netboxBaseUrl, false);
+    AppendStringLine(json, TEXT("netboxToken"), m_netboxToken, false);
+    AppendStringLine(json, TEXT("netboxAuthScheme"), m_netboxAuthScheme, false);
+    AppendBoolLine(json, TEXT("allowInsecureTls"), m_allowInsecureTls, false);
     AppendIntLine(json, TEXT("syncIntervalSeconds"), m_syncIntervalSeconds, false);
     AppendStringLine(json, TEXT("journalPath"), m_journalPath, false);
     AppendStringLine(json, TEXT("logLevel"), m_logLevel, false);
@@ -488,6 +574,41 @@ bool Config::IsScannerVibrateEnabled() const
     return m_scannerVibrateEnabled;
 }
 
+const TCHAR* Config::GetActiveBackendId() const
+{
+    return m_activeBackendId;
+}
+
+const TCHAR* Config::GetHomeboxInstanceId() const
+{
+    return m_homeboxInstanceId;
+}
+
+const TCHAR* Config::GetNetboxInstanceId() const
+{
+    return m_netboxInstanceId;
+}
+
+const TCHAR* Config::GetNetboxBaseUrl() const
+{
+    return m_netboxBaseUrl;
+}
+
+const TCHAR* Config::GetNetboxToken() const
+{
+    return m_netboxToken;
+}
+
+const TCHAR* Config::GetNetboxAuthScheme() const
+{
+    return m_netboxAuthScheme;
+}
+
+bool Config::IsInsecureTlsAllowed() const
+{
+    return m_allowInsecureTls;
+}
+
 void Config::SetApiBaseUrl(const TCHAR* url)
 {
     Assign(&m_apiBaseUrl, url);
@@ -536,6 +657,41 @@ void Config::SetScannerBeepEnabled(bool enabled)
 void Config::SetScannerVibrateEnabled(bool enabled)
 {
     m_scannerVibrateEnabled = enabled;
+}
+
+void Config::SetActiveBackendId(const TCHAR* instanceId)
+{
+    Assign(&m_activeBackendId, instanceId);
+}
+
+void Config::SetHomeboxInstanceId(const TCHAR* instanceId)
+{
+    Assign(&m_homeboxInstanceId, instanceId);
+}
+
+void Config::SetNetboxInstanceId(const TCHAR* instanceId)
+{
+    Assign(&m_netboxInstanceId, instanceId);
+}
+
+void Config::SetNetboxBaseUrl(const TCHAR* url)
+{
+    Assign(&m_netboxBaseUrl, url);
+}
+
+void Config::SetNetboxToken(const TCHAR* token)
+{
+    Assign(&m_netboxToken, token);
+}
+
+void Config::SetNetboxAuthScheme(const TCHAR* scheme)
+{
+    Assign(&m_netboxAuthScheme, scheme);
+}
+
+void Config::SetAllowInsecureTls(bool allowed)
+{
+    m_allowInsecureTls = allowed;
 }
 
 } // namespace HBX

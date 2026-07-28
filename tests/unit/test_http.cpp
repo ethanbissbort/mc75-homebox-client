@@ -2,11 +2,15 @@
 //
 // These tests exercise only the pure, network-free surface of HttpClient:
 //   - ParseUrl(): protocol/host/port/path extraction (no sockets touched).
+//   - IsSecureUrl(): the https/plain decision the WinInet transport keys off.
+//   - DescribeWinInetError(): WinInet error code -> operator-facing diagnostic.
 //   - HttpResponse: default-constructed field values.
 //   - GetLastHttpStatusCode()/AddHeader()/ClearHeaders(): trivial config paths.
 //
-// No Get/Post/Put/Delete calls are made -- no server is available in the host
-// build, and those methods open real sockets.
+// Verb dispatch is checked through GetLastMethod() with a URL that cannot parse,
+// so the request is abandoned before any socket work. Beyond that no
+// Get/Post/Put/Patch/Delete call is made -- no server is available in the host
+// build, and those methods would open real sockets.
 
 #include "test_framework.hpp"
 #include "HttpClient.hpp"
@@ -206,4 +210,196 @@ TEST_CASE("ParseUrl: malformed input is rejected rather than half-parsed") {
     CHECK_FALSE(hc.ParseUrl(TEXT(""), host, &port, path));
     CHECK_FALSE(hc.ParseUrl(TEXT("http://"), host, &port, path));
     CHECK_FALSE(hc.ParseUrl(TEXT("://example.com"), host, &port, path));
+}
+
+// ---------------------------------------------------------------------------
+// Verb dispatch.
+//
+// A malformed URL is rejected by ParseUrl before any socket is created, but the
+// verb is recorded first -- which makes it the seam for checking that each
+// public method reaches the transport with the right method string. PATCH is
+// the one that matters: NetBox writes must be partial updates, because a PUT
+// carries a full object representation and would blank every field the
+// handheld does not know about (tenant, platform, custom fields, comments).
+// ---------------------------------------------------------------------------
+
+// A URL with no scheme and no host; ParseUrl refuses it, so nothing is sent.
+static const TCHAR* const kUnsendableUrl = TEXT("://not-a-url");
+
+TEST_CASE("HttpClient: no request attempted yet -> last method is empty") {
+    HttpClient hc;
+    CHECK_EQ_STR(hc.GetLastMethod(), TEXT(""));
+}
+
+TEST_CASE("Patch: dispatches the PATCH verb to the transport") {
+    HttpClient hc;
+    HttpClient::HttpResponse r;
+
+    CHECK_FALSE(hc.Patch(kUnsendableUrl, TEXT("{\"status\":\"inventory\"}"), &r));
+    CHECK_EQ_STR(hc.GetLastMethod(), TEXT("PATCH"));
+    // The verb is recorded, then the URL is rejected -- nothing went on the wire.
+    CHECK_EQ_STR(hc.GetLastError(), TEXT("Malformed or oversized URL"));
+    CHECK_EQ_INT(r.statusCode, 0);
+    CHECK(r.body == NULL);
+}
+
+TEST_CASE("Patch: a NULL response is refused without touching the transport") {
+    HttpClient hc;
+    CHECK_FALSE(hc.Patch(TEXT("http://example.com/api/dcim/devices/1/"),
+                         TEXT("{}"), NULL));
+    CHECK_EQ_STR(hc.GetLastMethod(), TEXT(""));
+}
+
+TEST_CASE("Verbs: every method reaches the transport under its own name") {
+    HttpClient hc;
+    HttpClient::HttpResponse r;
+
+    hc.Get(kUnsendableUrl, &r);
+    CHECK_EQ_STR(hc.GetLastMethod(), TEXT("GET"));
+
+    hc.Post(kUnsendableUrl, TEXT("{}"), &r);
+    CHECK_EQ_STR(hc.GetLastMethod(), TEXT("POST"));
+
+    hc.Put(kUnsendableUrl, TEXT("{}"), &r);
+    CHECK_EQ_STR(hc.GetLastMethod(), TEXT("PUT"));
+
+    hc.Patch(kUnsendableUrl, TEXT("{}"), &r);
+    CHECK_EQ_STR(hc.GetLastMethod(), TEXT("PATCH"));
+
+    hc.Delete(kUnsendableUrl, &r);
+    CHECK_EQ_STR(hc.GetLastMethod(), TEXT("DELETE"));
+}
+
+// ---------------------------------------------------------------------------
+// Scheme detection.
+//
+// The WinInet transport used to decide on TLS with
+// `(port == 443) || scheme == https`, so a plain listener addressed as
+// http://host:443 was pushed through a handshake it could never complete. Only
+// the scheme decides now; ParseUrl still supplies 443 as the https default.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("IsSecureUrl: the https scheme selects TLS") {
+    CHECK(HttpClient::IsSecureUrl(TEXT("https://netbox.lan/api/dcim/devices/")));
+    CHECK(HttpClient::IsSecureUrl(TEXT("https://netbox.lan:8443/api/")));
+    // Port 443 is the https default, so the scheme alone still gets this right.
+    CHECK(HttpClient::IsSecureUrl(TEXT("https://netbox.lan:443/api/")));
+}
+
+TEST_CASE("IsSecureUrl: port 443 alone does NOT make a URL https") {
+    // The regression: a plain HTTP reverse proxy listening on 443 is a normal
+    // deployment for this device, and treating it as TLS broke every request.
+    CHECK_FALSE(HttpClient::IsSecureUrl(TEXT("http://netbox.lan:443/api/")));
+    CHECK_FALSE(HttpClient::IsSecureUrl(TEXT("http://192.168.20.5:443/api/")));
+}
+
+TEST_CASE("IsSecureUrl: plain and malformed URLs are not secure") {
+    CHECK_FALSE(HttpClient::IsSecureUrl(TEXT("http://netbox.lan/api/")));
+    CHECK_FALSE(HttpClient::IsSecureUrl(TEXT("http://netbox.lan:8080/api/")));
+    CHECK_FALSE(HttpClient::IsSecureUrl(TEXT("netbox.lan/api/")));
+    CHECK_FALSE(HttpClient::IsSecureUrl(TEXT("https:/netbox.lan/")));
+    CHECK_FALSE(HttpClient::IsSecureUrl(TEXT("")));
+    CHECK_FALSE(HttpClient::IsSecureUrl(NULL));
+}
+
+TEST_CASE("IsSecureUrl agrees with the port ParseUrl derives from the scheme") {
+    HttpClient hc;
+    TCHAR host[256];
+    TCHAR path[1024];
+    int port = -1;
+
+    CHECK(hc.ParseUrl(TEXT("https://netbox.lan/api/"), host, &port, path));
+    CHECK_EQ_INT(port, 443);
+    CHECK(HttpClient::IsSecureUrl(TEXT("https://netbox.lan/api/")));
+
+    CHECK(hc.ParseUrl(TEXT("http://netbox.lan:443/api/"), host, &port, path));
+    CHECK_EQ_INT(port, 443);
+    CHECK_FALSE(HttpClient::IsSecureUrl(TEXT("http://netbox.lan:443/api/")));
+}
+
+// ---------------------------------------------------------------------------
+// TLS / transport error mapping.
+//
+// The WinInet path used to report the literal "HttpSendRequest failed" for
+// every failure, discarding ::GetLastError(). On a device whose Schannel stops
+// at TLS 1.0 and whose root store is from ~2009, that made a certificate the
+// device cannot chain, a host name mismatch and a server that will not speak
+// TLS 1.0 all look like a dead network.
+// ---------------------------------------------------------------------------
+
+// Non-NULL, non-empty and different from every other mapped code.
+static void CheckDistinctDiagnostic(DWORD code, const DWORD* others, int otherCount)
+{
+    const TCHAR* text = HttpClient::DescribeWinInetError(code);
+    CHECK(text != NULL);
+    if (!text) {
+        return;
+    }
+    CHECK(lstrlen(text) > 0);
+    for (int i = 0; i < otherCount; i++) {
+        if (others[i] == code) {
+            continue;
+        }
+        const TCHAR* other = HttpClient::DescribeWinInetError(others[i]);
+        CHECK(other != NULL && lstrcmp(text, other) != 0);
+    }
+}
+
+TEST_CASE("DescribeWinInetError: the four TLS codes map to distinct messages") {
+    // 12045 invalid CA, 12038 certificate CN mismatch,
+    // 12037 certificate date invalid, 12157 secure channel error.
+    static const DWORD kTlsCodes[] = { 12045, 12038, 12037, 12157 };
+    for (int i = 0; i < 4; i++) {
+        CheckDistinctDiagnostic(kTlsCodes[i], kTlsCodes, 4);
+    }
+}
+
+TEST_CASE("DescribeWinInetError: TLS messages name the code and the cause") {
+    const TCHAR* invalidCa = HttpClient::DescribeWinInetError(12045);
+    CHECK(invalidCa != NULL);
+    // The number has to survive into the message: it is what an operator can
+    // look up, and what a bug report can be searched for.
+    CHECK(invalidCa && wcsstr(invalidCa, TEXT("12045")) != NULL);
+
+    // The handshake failure is the one that needs to point at the platform
+    // ceiling rather than at the network.
+    const TCHAR* channel = HttpClient::DescribeWinInetError(12157);
+    CHECK(channel != NULL);
+    CHECK(channel && wcsstr(channel, TEXT("12157")) != NULL);
+    CHECK(channel && wcsstr(channel, TEXT("TLS 1.0")) != NULL);
+}
+
+TEST_CASE("DescribeWinInetError: common network codes are described too") {
+    static const DWORD kNetCodes[] = { 12002, 12007, 12029, 12030, 12031, 12163 };
+    for (int i = 0; i < 6; i++) {
+        const TCHAR* text = HttpClient::DescribeWinInetError(kNetCodes[i]);
+        CHECK(text != NULL);
+        CHECK(text && lstrlen(text) > 0);
+    }
+}
+
+TEST_CASE("DescribeWinInetError: an unmapped code returns NULL") {
+    // NULL is the signal for "no advice"; the caller then reports the raw
+    // number instead of inventing an explanation for it.
+    CHECK(HttpClient::DescribeWinInetError(0) == NULL);
+    CHECK(HttpClient::DescribeWinInetError(12345) == NULL);
+    CHECK(HttpClient::DescribeWinInetError(0xFFFFFFFFu) == NULL);
+}
+
+// ---------------------------------------------------------------------------
+// Certificate relaxation must be opt-in.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("SetIgnoreCertificateErrors: defaults to false and is explicit") {
+    HttpClient hc;
+    // Accepting any certificate from any party is never the default: with the
+    // API token riding in the Authorization header, an on-path attacker
+    // collects a working credential on the first request.
+    CHECK_FALSE(hc.IgnoreCertificateErrors());
+
+    hc.SetIgnoreCertificateErrors(true);
+    CHECK(hc.IgnoreCertificateErrors());
+
+    hc.SetIgnoreCertificateErrors(false);
+    CHECK_FALSE(hc.IgnoreCertificateErrors());
 }

@@ -1,6 +1,12 @@
 #include "../include/SyncEngine.hpp"
 #include "../include/StrUtil.hpp"
 
+// The connectivity probe resolves a host name directly rather than through the
+// HTTP transport: a name lookup costs one round trip where a request costs the
+// whole timeout, and the engine asks this question far more often than it
+// sends anything.
+#include <winsock.h>
+
 namespace HBX {
 
 namespace {
@@ -13,8 +19,18 @@ const DWORD kConnectivityCacheMs = 5000;
 // Below this the UI timer would effectively sync continuously.
 const int kMinAutoSyncSeconds = 5;
 
-// Longest transaction type we dispatch on; anything longer cannot match.
+// Longest transaction type we dispatch on, with the backend tag already
+// stripped; anything longer cannot match.
 const int kMaxTypeChars = 64;
+
+// The whole token as it appears in the record: "<instanceId>.<type>".
+const int kMaxTokenChars = SyncEngine::MAX_INSTANCE_ID_CHARS + kMaxTypeChars;
+
+// Records written before queue entries carried a backend tag belong to
+// HomeBox: it was the only backend that existed. Routing them by kind rather
+// than by a fixed id means a site that renamed its HomeBox instance still
+// drains the queue its devices were carrying at upgrade time.
+const TCHAR* const kLegacyKind = TEXT("hb");
 
 /**
  * Appends a tick count as unsigned decimal. Str::Buffer::AppendInt takes a
@@ -47,10 +63,104 @@ const TCHAR* SkipSpaces(const TCHAR* s)
     return s;
 }
 
+/** One queued record, split into the parts replay routes on. */
+struct ParsedRecord {
+    TCHAR instanceId[SyncEngine::MAX_INSTANCE_ID_CHARS]; // empty for a legacy record
+    TCHAR type[kMaxTypeChars];
+    const TCHAR* data;                                   // points into the record line
+};
+
+/**
+ * Splits "[tick] <instanceId>.<TYPE>: DATA" out of a journal record line.
+ * The instance id is optional; without it the record predates backend tagging.
+ */
+bool ParseQueuedPayload(const TCHAR* transaction, ParsedRecord* out)
+{
+    // GetQueuedTransactions hands back whole journal record lines:
+    //
+    //   "[2026-07-25 09:14:09] TRANS 00000042: [51234] hb.ITEM_SCAN: SCAN:12345"
+    //    \___ journal record header ________/ \___ QueueTransaction payload ___/
+    //
+    // PayloadOf strips the record header. A caller may also pass the payload on
+    // its own, which is accepted as-is.
+    const TCHAR* payload = Journal::PayloadOf(transaction);
+    if (!payload) {
+        payload = transaction;
+    }
+
+    if (*payload != (TCHAR)'[') {
+        return false;
+    }
+
+    const TCHAR* bracketEnd = wcschr(payload, (TCHAR)']');
+    if (!bracketEnd) {
+        return false;
+    }
+
+    const TCHAR* typeStart = SkipSpaces(bracketEnd + 1);
+    const TCHAR* colon = wcschr(typeStart, (TCHAR)':');
+    if (!colon) {
+        return false;
+    }
+
+    TCHAR token[kMaxTokenChars];
+    if (!Str::CopyN(token, kMaxTokenChars, typeStart, (int)(colon - typeStart))) {
+        // Too long to be anything we wrote.
+        return false;
+    }
+
+    out->instanceId[0] = (TCHAR)'\0';
+
+    // Split on the first '.': an instance id may not contain one (see
+    // SyncEngine::IsValidInstanceId), so the first is always the separator.
+    const TCHAR* dot = wcschr(token, (TCHAR)'.');
+    if (dot) {
+        if (!Str::CopyN(out->instanceId, SyncEngine::MAX_INSTANCE_ID_CHARS,
+                        token, (int)(dot - token)) ||
+            !Str::Copy(out->type, kMaxTypeChars, dot + 1)) {
+            return false;
+        }
+    } else if (!Str::Copy(out->type, kMaxTypeChars, token)) {
+        return false;
+    }
+
+    if (out->type[0] == (TCHAR)'\0') {
+        return false;
+    }
+
+    out->data = SkipSpaces(colon + 1);
+    return true;
+}
+
+/** Copies the host out of "scheme://host[:port][/path]". */
+bool HostFromUrl(TCHAR* host, int cap, const TCHAR* baseUrl)
+{
+    if (!baseUrl || lstrlen(baseUrl) == 0) {
+        return false;
+    }
+
+    const TCHAR* start = baseUrl;
+    if (wcsncmp(baseUrl, TEXT("http://"), 7) == 0) {
+        start = baseUrl + 7;
+    } else if (wcsncmp(baseUrl, TEXT("https://"), 8) == 0) {
+        start = baseUrl + 8;
+    }
+
+    int i = 0;
+    while (i < cap - 1 && start[i] && start[i] != (TCHAR)'/' && start[i] != (TCHAR)':') {
+        host[i] = start[i];
+        i++;
+    }
+    host[i] = (TCHAR)'\0';
+
+    return host[0] != (TCHAR)'\0';
+}
+
 } // namespace
 
-SyncEngine::SyncEngine(HbClient* hbClient, Journal* journal)
-    : m_hbClient(hbClient)
+SyncEngine::SyncEngine(InventoryBackend* backend, Journal* journal)
+    : m_backendCount(0)
+    , m_activeIndex(-1)
     , m_journal(journal)
     , m_syncStatus(SYNC_IDLE)
     , m_lastSyncError(NULL)
@@ -59,10 +169,14 @@ SyncEngine::SyncEngine(HbClient* hbClient, Journal* journal)
     , m_syncAttempted(false)
     , m_autoSyncEnabled(false)
     , m_autoSyncIntervalSeconds(300)
-    , m_connectivityTick(0)
-    , m_connectivityValid(false)
-    , m_connectivityOnline(false)
+    , m_skippedCount(0)
+    , m_connectivityCount(0)
 {
+    for (int i = 0; i < MAX_BACKENDS; i++) {
+        m_backends[i] = NULL;
+    }
+
+    RegisterBackend(backend);
 }
 
 SyncEngine::~SyncEngine()
@@ -83,6 +197,107 @@ void SyncEngine::SetLastSyncError(const TCHAR* message)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Backend registry
+// ---------------------------------------------------------------------------
+
+bool SyncEngine::IsValidInstanceId(const TCHAR* instanceId)
+{
+    if (!instanceId || instanceId[0] == (TCHAR)'\0') {
+        return false;
+    }
+
+    int n = 0;
+    for (const TCHAR* p = instanceId; *p != (TCHAR)'\0'; p++, n++) {
+        if (n >= MAX_INSTANCE_ID_CHARS - 1) {
+            return false;
+        }
+        // ':' ends the type token, '.' separates id from type, and the brackets
+        // and the space belong to the record header around it.
+        if (*p == (TCHAR)':' || *p == (TCHAR)'.' || *p == (TCHAR)' ' ||
+            *p == (TCHAR)'[' || *p == (TCHAR)']') {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void SyncEngine::RegisterBackend(InventoryBackend* backend)
+{
+    if (!backend || m_backendCount >= MAX_BACKENDS) {
+        return;
+    }
+
+    // An id that cannot survive the queue-record round trip is worse than no
+    // backend at all: work would be queued under a tag that never routes back.
+    const TCHAR* instanceId = backend->GetInstanceId();
+    if (!IsValidInstanceId(instanceId)) {
+        return;
+    }
+
+    for (int i = 0; i < m_backendCount; i++) {
+        if (m_backends[i] == backend ||
+            lstrcmp(m_backends[i]->GetInstanceId(), instanceId) == 0) {
+            return;
+        }
+    }
+
+    m_backends[m_backendCount++] = backend;
+
+    if (m_activeIndex < 0) {
+        m_activeIndex = 0;
+    }
+}
+
+bool SyncEngine::SetActiveBackend(const TCHAR* instanceId)
+{
+    if (!instanceId) {
+        return false;
+    }
+
+    for (int i = 0; i < m_backendCount; i++) {
+        if (lstrcmp(m_backends[i]->GetInstanceId(), instanceId) == 0) {
+            m_activeIndex = i;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+InventoryBackend* SyncEngine::GetActiveBackend() const
+{
+    if (m_activeIndex < 0 || m_activeIndex >= m_backendCount) {
+        return NULL;
+    }
+    return m_backends[m_activeIndex];
+}
+
+InventoryBackend* SyncEngine::FindBackend(const TCHAR* instanceId) const
+{
+    if (!instanceId) {
+        return NULL;
+    }
+
+    for (int i = 0; i < m_backendCount; i++) {
+        if (lstrcmp(m_backends[i]->GetInstanceId(), instanceId) == 0) {
+            return m_backends[i];
+        }
+    }
+
+    return NULL;
+}
+
+int SyncEngine::GetBackendCount() const
+{
+    return m_backendCount;
+}
+
+// ---------------------------------------------------------------------------
+// Queue management
+// ---------------------------------------------------------------------------
+
 bool SyncEngine::QueueTransaction(const TCHAR* transactionType, const TCHAR* data)
 {
     if (!transactionType || !data || !m_journal) {
@@ -97,6 +312,19 @@ bool SyncEngine::QueueTransaction(const TCHAR* transactionType, const TCHAR* dat
     entry.AppendChar((TCHAR)'[');
     AppendTick(&entry, GetTickCount());
     entry.Append(TEXT("] "));
+
+    // Tag the entry with the backend that owns it. A type that already carries
+    // a '.' is taken to be qualified already, which is how a caller queues work
+    // for a backend other than the active one. Registration guarantees the
+    // active backend's id is usable here.
+    if (!wcschr(transactionType, (TCHAR)'.')) {
+        const InventoryBackend* active = GetActiveBackend();
+        if (active) {
+            entry.Append(active->GetInstanceId());
+            entry.AppendChar((TCHAR)'.');
+        }
+    }
+
     entry.Append(transactionType);
     entry.Append(TEXT(": "));
     entry.Append(data);
@@ -192,11 +420,16 @@ bool SyncEngine::ClearQueue()
     return m_journal->Clear();
 }
 
+// ---------------------------------------------------------------------------
+// Sync
+// ---------------------------------------------------------------------------
+
 bool SyncEngine::Sync()
 {
     m_syncStatus = SYNC_IN_PROGRESS;
     m_lastSyncAttemptTick = GetTickCount();
     m_syncAttempted = true;
+    m_skippedCount = 0;
 
     SetLastSyncError(NULL);
 
@@ -206,8 +439,11 @@ bool SyncEngine::Sync()
         return false;
     }
 
-    // Check if we're online
-    if (!CheckConnectivity()) {
+    // Every configured backend gets a say: the queue can hold work for a
+    // backend that is not the active one, and a NetBox on the local LAN is
+    // still drainable while the HomeBox server on the far side of a dead GPRS
+    // link is not.
+    if (!AnyBackendOnline()) {
         m_syncStatus = SYNC_OFFLINE;
         SetLastSyncError(TEXT("No network connectivity"));
         return false;
@@ -246,13 +482,26 @@ bool SyncEngine::Sync()
             continue;
         }
 
-        if (ProcessQueuedTransaction(transactions[i])) {
+        switch (ProcessQueuedTransaction(transactions[i])) {
+        case REPLAY_SENT:
             successCount++;
             // Mark as synced in journal
             m_journal->MarkTransactionSynced(transactions[i]);
-        } else {
+            break;
+
+        case REPLAY_SKIPPED:
+            // Nobody can replay this - the backend it names is not configured,
+            // or the record is malformed. It stays queued and is kept out of
+            // the success/failure ratio so one stranded entry cannot pin the
+            // status at "failed" on every sync for the life of the device.
+            m_skippedCount++;
+            break;
+
+        case REPLAY_RETRY:
+        default:
             // Left queued so the next Sync() retries it.
             failCount++;
+            break;
         }
 
         // Free the transaction string
@@ -267,19 +516,37 @@ bool SyncEngine::Sync()
     if (failCount == 0) {
         m_syncStatus = SYNC_SUCCESS;
         m_lastSyncTime = GetTickCount();
+
+        if (m_skippedCount > 0) {
+            // Reported, but not as a failure: the sync itself worked.
+            const int kCap = 128;
+            TCHAR message[kCap];
+            message[0] = (TCHAR)'\0';
+            Str::Append(message, kCap, TEXT("Skipped "));
+            Str::AppendInt(message, kCap, m_skippedCount);
+            Str::Append(message, kCap, TEXT(" for unknown backends"));
+            SetLastSyncError(message);
+        }
+
         return true;
     } else if (successCount > 0) {
         // Partial success
         m_syncStatus = SYNC_PARTIAL;
         m_lastSyncTime = GetTickCount();
 
-        TCHAR errorMsg[96];
+        const int kCap = 128;
+        TCHAR errorMsg[kCap];
         errorMsg[0] = (TCHAR)'\0';
-        Str::Append(errorMsg, 96, TEXT("Synced "));
-        Str::AppendInt(errorMsg, 96, successCount);
-        Str::Append(errorMsg, 96, TEXT(" of "));
-        Str::AppendInt(errorMsg, 96, count);
-        Str::Append(errorMsg, 96, TEXT(" transactions"));
+        Str::Append(errorMsg, kCap, TEXT("Synced "));
+        Str::AppendInt(errorMsg, kCap, successCount);
+        Str::Append(errorMsg, kCap, TEXT(" of "));
+        Str::AppendInt(errorMsg, kCap, count);
+        Str::Append(errorMsg, kCap, TEXT(" transactions"));
+        if (m_skippedCount > 0) {
+            Str::Append(errorMsg, kCap, TEXT(", "));
+            Str::AppendInt(errorMsg, kCap, m_skippedCount);
+            Str::Append(errorMsg, kCap, TEXT(" skipped"));
+        }
         SetLastSyncError(errorMsg);
 
         return true;
@@ -289,9 +556,9 @@ bool SyncEngine::Sync()
     SetLastSyncError(TEXT("All transactions failed to sync"));
 
     // Nothing got through: the most likely explanation is that coverage was
-    // lost since the probe, so drop the cached answer instead of reporting
+    // lost since the probe, so drop the cached answers instead of reporting
     // "online" for the rest of the cache window.
-    m_connectivityValid = false;
+    InvalidateConnectivity();
 
     return false;
 }
@@ -302,24 +569,65 @@ bool SyncEngine::SyncItem(const TCHAR* transactionLine)
         return false;
     }
 
-    // Check connectivity
-    if (!CheckConnectivity()) {
+    m_skippedCount = 0;
+
+    // Connectivity is checked per backend inside ProcessQueuedTransaction: this
+    // entry may belong to a backend other than the active one.
+    if (ProcessQueuedTransaction(transactionLine) != REPLAY_SENT) {
         return false;
     }
 
-    // Process the single transaction
-    if (ProcessQueuedTransaction(transactionLine)) {
-        // Mark as synced
-        m_journal->MarkTransactionSynced(transactionLine);
-        return true;
+    // Mark as synced
+    m_journal->MarkTransactionSynced(transactionLine);
+    return true;
+}
+
+ReplayResult SyncEngine::ProcessQueuedTransaction(const TCHAR* transaction)
+{
+    if (!transaction) {
+        return REPLAY_SKIPPED;
     }
 
-    return false;
+    ParsedRecord record;
+    if (!ParseQueuedPayload(transaction, &record)) {
+        // A record whose shape we cannot read now will not become readable
+        // later, so retrying it every five minutes forever only keeps the queue
+        // looking broken. It stays queued for the operator to remove.
+        return REPLAY_SKIPPED;
+    }
+
+    InventoryBackend* backend = NULL;
+
+    if (record.instanceId[0] != (TCHAR)'\0') {
+        backend = FindBackend(record.instanceId);
+    } else {
+        // Untagged: written by a build that only knew about HomeBox.
+        for (int i = 0; i < m_backendCount; i++) {
+            if (lstrcmp(m_backends[i]->GetKind(), kLegacyKind) == 0) {
+                backend = m_backends[i];
+                break;
+            }
+        }
+    }
+
+    if (!backend) {
+        return REPLAY_SKIPPED;
+    }
+
+    // Do not spend a blocking request - and its whole timeout - on a backend
+    // whose host does not resolve. With two backends on different networks the
+    // batch would otherwise stall on the unreachable one before reaching the
+    // entries that could have been sent.
+    if (!CheckConnectivity(backend)) {
+        return REPLAY_RETRY;
+    }
+
+    return backend->Replay(record.type, record.data);
 }
 
 bool SyncEngine::IsOnline() const
 {
-    return CheckConnectivity();
+    return CheckConnectivity(GetActiveBackend());
 }
 
 SyncEngine::SyncStatus SyncEngine::GetSyncStatus() const
@@ -335,6 +643,11 @@ const TCHAR* SyncEngine::GetLastSyncError() const
 DWORD SyncEngine::GetLastSyncTime() const
 {
     return m_lastSyncTime;
+}
+
+int SyncEngine::GetSkippedCount() const
+{
+    return m_skippedCount;
 }
 
 void SyncEngine::SetAutoSyncEnabled(bool enabled)
@@ -385,9 +698,40 @@ bool SyncEngine::ShouldAutoSync(DWORD nowTick) const
     return elapsed >= (DWORD)m_autoSyncIntervalSeconds * 1000;
 }
 
-bool SyncEngine::CheckConnectivity() const
+// ---------------------------------------------------------------------------
+// Connectivity
+// ---------------------------------------------------------------------------
+
+void SyncEngine::InvalidateConnectivity() const
 {
-    if (!m_hbClient) {
+    m_connectivityCount = 0;
+}
+
+bool SyncEngine::AnyBackendOnline() const
+{
+    // The active backend answers first: it is the one whose cache entry is
+    // warm, so the common case costs no lookup at all.
+    if (CheckConnectivity(GetActiveBackend())) {
+        return true;
+    }
+
+    for (int i = 0; i < m_backendCount; i++) {
+        if (i != m_activeIndex && CheckConnectivity(m_backends[i])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool SyncEngine::CheckConnectivity(const InventoryBackend* backend) const
+{
+    if (!backend) {
+        return false;
+    }
+
+    const TCHAR* instanceId = backend->GetInstanceId();
+    if (!instanceId) {
         return false;
     }
 
@@ -395,37 +739,23 @@ bool SyncEngine::CheckConnectivity() const
     // costs a synchronous gethostbyname - several seconds on GPRS, on whichever
     // thread asked. A few seconds of staleness is cheaper than that.
     DWORD now = GetTickCount();
-    if (m_connectivityValid && (DWORD)(now - m_connectivityTick) < kConnectivityCacheMs) {
-        return m_connectivityOnline;
+    int slot = -1;
+    for (int i = 0; i < m_connectivityCount; i++) {
+        if (lstrcmp(m_connectivity[i].instanceId, instanceId) == 0) {
+            slot = i;
+            break;
+        }
     }
 
-    // Try a simple HTTP connection to test connectivity
-    // We'll try to resolve the hostname from the base URL
-    const TCHAR* baseUrl = m_hbClient->GetBaseUrl();
-    if (!baseUrl || lstrlen(baseUrl) == 0) {
-        return false;
+    if (slot >= 0 && (DWORD)(now - m_connectivity[slot].tick) < kConnectivityCacheMs) {
+        return m_connectivity[slot].online;
     }
 
-    // Extract host from URL
+    // Try a simple name resolution to test connectivity to this backend's host.
     TCHAR host[256];
-    const TCHAR* start = baseUrl;
-
-    // Skip protocol
-    if (wcsncmp(baseUrl, TEXT("http://"), 7) == 0) {
-        start = baseUrl + 7;
-    } else if (wcsncmp(baseUrl, TEXT("https://"), 8) == 0) {
-        start = baseUrl + 8;
-    }
-
-    // Copy host (up to first slash or colon)
-    int i = 0;
-    while (i < 255 && start[i] && start[i] != (TCHAR)'/' && start[i] != (TCHAR)':') {
-        host[i] = start[i];
-        i++;
-    }
-    host[i] = (TCHAR)'\0';
-
-    if (host[0] == (TCHAR)'\0') {
+    if (!HostFromUrl(host, 256, backend->GetBaseUrl())) {
+        // A backend with no usable URL is misconfigured rather than offline;
+        // nothing is cached, so fixing the URL takes effect immediately.
         return false;
     }
 
@@ -451,136 +781,27 @@ bool SyncEngine::CheckConnectivity() const
         WSACleanup();
     }
 
-    m_connectivityOnline = (hostInfo != NULL);
-    m_connectivityTick = now;
-    m_connectivityValid = true;
-
-    return m_connectivityOnline;
-}
-
-bool SyncEngine::ProcessQueuedTransaction(const TCHAR* transaction)
-{
-    if (!transaction || !m_hbClient) {
-        return false;
-    }
-
-    // GetQueuedTransactions hands back whole journal record lines:
-    //
-    //   "[2026-07-25 09:14:09] TRANS 00000042: [51234] ITEM_SCAN: SCAN:12345"
-    //    \___ journal record header ________/ \___ QueueTransaction payload _/
-    //
-    // PayloadOf strips the record header. A caller may also pass the payload on
-    // its own, which is accepted as-is; anything else is left queued rather
-    // than reported as a sync that never happened.
-    const TCHAR* payload = Journal::PayloadOf(transaction);
-    if (!payload) {
-        payload = transaction;
-    }
-
-    if (*payload != (TCHAR)'[') {
-        return false;
-    }
-
-    // Payload shape: "[tick] TYPE: DATA".
-    const TCHAR* bracketEnd = wcschr(payload, (TCHAR)']');
-    if (!bracketEnd) {
-        return false;
-    }
-
-    const TCHAR* typeStart = SkipSpaces(bracketEnd + 1);
-    const TCHAR* colon = wcschr(typeStart, (TCHAR)':');
-    if (!colon) {
-        return false;
-    }
-
-    TCHAR transactionType[kMaxTypeChars];
-    if (!Str::CopyN(transactionType, kMaxTypeChars, typeStart, (int)(colon - typeStart))) {
-        // Too long to be a type we handle.
-        return false;
-    }
-
-    const TCHAR* data = SkipSpaces(colon + 1);
-
-    if (wcscmp(transactionType, TEXT("ITEM_SCAN")) == 0) {
-        // DATA is "SCAN:<barcode>" or "SCANLOC:<len>:<barcode><locationId>".
-        const TCHAR* barcode = NULL;
-        const TCHAR* locationId = NULL;
-        TCHAR* barcodeCopy = NULL; // only the length-prefixed form needs one
-
-        if (wcsncmp(data, TEXT("SCANLOC:"), 8) == 0) {
-            const TCHAR* lenStart = data + 8;
-            const TCHAR* lenEnd = wcschr(lenStart, (TCHAR)':');
-            if (!lenEnd) {
-                return false;
-            }
-
-            TCHAR lenText[12];
-            int barcodeLen = 0;
-            if (!Str::CopyN(lenText, 12, lenStart, (int)(lenEnd - lenStart)) ||
-                !Str::ParseInt(lenText, &barcodeLen)) {
-                return false;
-            }
-
-            const TCHAR* body = lenEnd + 1;
-            if (barcodeLen <= 0 || barcodeLen > Str::Length(body)) {
-                return false;
-            }
-
-            barcodeCopy = Str::DupN(body, barcodeLen);
-            if (!barcodeCopy) {
-                return false;
-            }
-            barcode = barcodeCopy;
-            locationId = body + barcodeLen;
-        } else if (wcsncmp(data, TEXT("SCAN:"), 5) == 0) {
-            barcode = data + 5;
+    if (slot < 0) {
+        if (m_connectivityCount < MAX_BACKENDS) {
+            slot = m_connectivityCount++;
         } else {
-            return false;
+            // Full only if a backend was renamed while the engine was alive;
+            // recycle the stalest entry rather than growing the array.
+            slot = 0;
+            for (int i = 1; i < m_connectivityCount; i++) {
+                if ((DWORD)(now - m_connectivity[i].tick) >
+                    (DWORD)(now - m_connectivity[slot].tick)) {
+                    slot = i;
+                }
+            }
         }
-
-        if (barcode[0] == (TCHAR)'\0') {
-            delete[] barcodeCopy;
-            return false;
-        }
-
-        // Only a real success clears the entry from the queue; any failure
-        // returns false so it stays queued and is retried on the next Sync().
-        Models::Item item;
-        bool ok = m_hbClient->GetItem(barcode, &item);
-
-        // If a location was captured with the scan, push the move too.
-        if (ok && locationId && locationId[0] != (TCHAR)'\0') {
-            ok = m_hbClient->UpdateItemLocation(barcode, locationId);
-        }
-
-        delete[] barcodeCopy;
-        return ok;
-    } else if (wcscmp(transactionType, TEXT("ITEM_UPDATE")) == 0) {
-        // DATA format: "UPDATE:<json>" where <json> is a complete Item JSON
-        // object, e.g.
-        //   UPDATE:{"id":"42","barcode":"123","name":"Widget","quantity":3}
-        // The JSON is parsed with Models::Item::FromJson and pushed with
-        // HbClient::UpdateItem; its result is returned so a failed update stays
-        // queued for retry.
-        if (wcsncmp(data, TEXT("UPDATE:"), 7) != 0) {
-            return false;
-        }
-
-        const TCHAR* json = data + 7;
-        if (*json == (TCHAR)'\0') {
-            return false;
-        }
-
-        Models::Item item;
-        if (!item.FromJson(json)) {
-            return false;
-        }
-
-        return m_hbClient->UpdateItem(&item);
+        Str::Copy(m_connectivity[slot].instanceId, MAX_INSTANCE_ID_CHARS, instanceId);
     }
 
-    // Unknown or unsupported transaction type
-    return false;
+    m_connectivity[slot].online = (hostInfo != NULL);
+    m_connectivity[slot].tick = now;
+
+    return m_connectivity[slot].online;
 }
 
 } // namespace HBX
