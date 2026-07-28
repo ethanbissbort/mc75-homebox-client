@@ -156,6 +156,62 @@ The application follows a **modified MVC pattern** adapted for embedded Windows 
 
 ---
 
+### 1️⃣½ InventoryBackend (the two-system seam)
+
+**File**: `include/InventoryBackend.hpp`
+
+The app talks to **two** inventory systems: HomeBox (general inventory) and
+NetBox (DCIM/IPAM, for barcoded IT gear). The operator switches between them
+and one is active at a time. `InventoryBackend` is the abstraction both
+implement — the Controller and the SyncEngine work only through it, so neither
+contains a branch on which system is live.
+
+```
+                    ┌─────────────────────┐
+                    │  InventoryBackend   │   pure virtual
+                    │  (abstract)         │
+                    └──────────┬──────────┘
+                        ┌──────┴──────┐
+                ┌───────▼──────┐ ┌────▼─────────┐
+                │  HbClient    │ │  NbClient    │
+                │  "hb"        │ │  "nb"        │
+                │  HomeBox     │ │  NetBox      │
+                └──────────────┘ └──────────────┘
+                        │               │
+                        └───────┬───────┘
+                                ▼
+                    Models::AssetSummary
+              (fixed-size, heap-free, what the UI renders)
+```
+
+**The interface is deliberately narrow**: resolve a scanned code, change a
+status, move an asset, replay a queued transaction. Creating a device is not on
+it — a NetBox device requires four mandatory foreign keys (`device_type`,
+`role`, `site`, `status`), which is not something anyone picks on a 240×320
+screen with a numeric keypad. An operation absent from this interface is one
+the app deliberately has no UI for.
+
+**Capability, not identity.** The UI branches on `SupportsStatus()` and
+`SessionIsRenewable()`, never on "is this NetBox". HomeBox has no status
+concept, so the status action simply does not appear; HomeBox exchanges
+credentials for a token so a 401 is worth one retry, while a NetBox API token
+is static configuration so a 401 there means the token is wrong and retrying
+only burns a round trip per scan.
+
+**Why a common summary rather than a common model.** A HomeBox item is
+(barcode, name, description, quantity, location, category); a NetBox device is
+(name, model, manufacturer, serial, asset tag, site, location, rack, position,
+face, status, role). They share almost nothing, so forcing either into the
+other would lose most of whichever lost. Each backend keeps its own model and
+both project into `Models::AssetSummary` for display. That summary uses fixed
+buffers with no heap: a scan-heavy shift allocating per decode is exactly what
+fragments a Windows CE heap over eight hours.
+
+**Cost.** One vtable pointer per instance, and at most two instances exist — so
+the abstraction costs 8 bytes of RAM on a device where that is worth counting.
+
+---
+
 ### 2️⃣ HbClient (API Client)
 
 **File**: `src/HbClient.cpp`, `include/HbClient.hpp`
@@ -664,14 +720,43 @@ User action → try the server first
               ├─ call succeeded            → done, nothing is queued
               └─ call failed / unreachable → queue it
 
-Queue stored in the Journal as TRANS records:
-  [2026-07-25 09:14:09] TRANS 00000042: [51234] ITEM_SCAN: SCAN:123456789
-  [2026-07-25 09:14:31] TRANS 00000043: [73180] ITEM_UPDATE: UPDATE:{"id":"123",...}
+Queue stored in the Journal as TRANS records, tagged with the backend:
+  [2026-07-25 09:14:09] TRANS 00000042: [51234] hb.ITEM_SCAN: SCAN:123456789
+  [2026-07-25 09:14:31] TRANS 00000043: [73180] nb-prod.DEVICE_MOVE: MOVE:{"id":"231",...}
 ```
 
 The client does not ask "am I online?" and then choose a path. It attempts the
 call, and queues only what actually failed — a probe that says "online" seconds
 before a request that times out would otherwise lose the scan.
+
+#### **1a. Why the tag is an instance id, not a system name**
+
+A record is tagged `nb-prod`, not `netbox`. Asset tags are unique *per NetBox
+instance* rather than globally, so replaying a queued move against a different
+instance would silently move whatever device happens to hold that tag there —
+and a wrong-instance replay looks like a success, which is worse than a
+failure. Routing on the instance id makes that impossible.
+
+A record written before tagging existed carries a bare `ITEM_SCAN` and still
+replays against HomeBox, so upgrading a device in the field never strands the
+queue it is already carrying.
+
+#### **1b. Replay is tri-state**
+
+A queue entry can belong to a backend that is no longer configured — the
+operator switched systems, or the NetBox instance id changed. Neither obvious
+answer is right: reporting a failure would pin the sync status at "failed" for
+the life of the device and make a working queue look broken, while reporting
+success would silently discard the operator's work.
+
+| Result | Meaning | Effect on the entry |
+|--------|---------|---------------------|
+| `REPLAY_SENT` | the server accepted it | acknowledged, dropped at compaction |
+| `REPLAY_RETRY` | transient failure, or a payload that will not parse | stays queued, counts as a failure |
+| `REPLAY_SKIPPED` | not addressed to any configured backend | stays queued, **excluded** from the success/failure ratio |
+
+The queue view shows the skipped count separately, so those entries can be
+removed deliberately rather than being mistaken for errors.
 
 One escape hatch: if `offlineModeEnabled` is `false` in `hb_conf.json` the scan is
 **discarded** instead of queued, and the operator is told so immediately. That is

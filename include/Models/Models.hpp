@@ -7,6 +7,8 @@
 
 #include "Item.hpp"
 #include "Location.hpp"
+#include "Device.hpp"
+#include "AssetSummary.hpp"
 #include "JsonLite.hpp"
 
 #endif // MODELS_MODELS_HPP

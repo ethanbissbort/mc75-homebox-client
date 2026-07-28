@@ -2,7 +2,9 @@
 
 ## Project Overview
 
-**MC75 HomeBox Client** is a native C++ application for Motorola MC75 handheld devices running Windows Mobile 6.5 Professional. The application integrates with the HomeBox inventory management system, providing scanning, data synchronization, and offline queue management capabilities.
+**MC75 HomeBox Client** is a native C++ application for Motorola MC75 handheld devices running Windows Mobile 6.5 Professional. It provides barcode scanning, data synchronization and offline queue management against two inventory systems: **HomeBox** (household/general inventory) and **NetBox** (DCIM/IPAM, for barcoded IT gear). The operator switches between them and one is active at a time.
+
+Transport note that shapes deployment: Windows Mobile 6.5 tops out at TLS 1.0 with a cipher list that has an empty intersection with modern server defaults, so HTTPS to a current NetBox or HomeBox instance is not achievable from this hardware. Both backends are expected to be reached over plain HTTP on a trusted, segmented LAN — see `docs/NETBOX.md` for the reasoning and the supported configuration.
 
 ### Key Technologies
 - **Language**: C++ (Visual Studio 2008)
@@ -20,20 +22,26 @@ mc75-homebox-client/
 ├── src/                          # Source files (.cpp)
 │   ├── main.cpp                  # Application entry point
 │   ├── Controller.cpp            # Main application controller
-│   ├── HbClient.cpp              # HomeBox API client
+│   ├── HbClient.cpp              # HomeBox backend (InventoryBackend)
+│   ├── NbClient.cpp              # NetBox backend (InventoryBackend)
 │   ├── HttpClient.cpp            # HTTP communication layer
-│   ├── SyncEngine.cpp            # Offline/online sync management
-│   ├── Journal.cpp               # Transaction journaling
+│   ├── SyncEngine.cpp            # Offline/online sync + backend registry
+│   ├── Journal.cpp               # Transaction journaling + offline queue
 │   ├── ScannerHAL.cpp            # Hardware abstraction for scanner
 │   ├── Config.cpp                # Configuration management
+│   ├── StrUtil.cpp               # Bounded strings, JSON escaping, UTF-8
 │   ├── Views/                    # UI view components
 │   │   ├── ScanView.cpp          # Barcode scanning interface
-│   │   ├── ItemView.cpp          # Item display/edit interface
+│   │   ├── ItemView.cpp          # HomeBox item display/edit
+│   │   ├── DeviceView.cpp        # Read-only asset detail (either backend)
+│   │   ├── PickerView.cpp        # Generic chooser + match disambiguation
 │   │   ├── QueueView.cpp         # Offline queue management
 │   │   └── ViewHelpers.cpp       # UI utility functions
 │   └── Models/                   # Data models
-│       ├── Item.cpp              # Item entity
+│       ├── Item.cpp              # HomeBox item entity
+│       ├── Device.cpp            # NetBox device entity
 │       ├── Location.cpp          # Location entity
+│       ├── AssetSummary.cpp      # Backend-neutral view for the detail screen
 │       └── JsonLite.cpp          # Lightweight JSON parser
 │
 ├── include/                      # Header files (.hpp, .h)
@@ -54,6 +62,8 @@ mc75-homebox-client/
 │   ├── unit/                     # Unit tests
 │   │   ├── test_json.cpp
 │   │   ├── test_journal.cpp
+│   │   ├── test_strutil.cpp
+│   │   ├── test_netbox.cpp
 │   │   └── test_http.cpp
 │   └── integration/              # Integration tests
 │       ├── test_api_endpoints.cpp
@@ -68,6 +78,9 @@ mc75-homebox-client/
 │   ├── API_NOTES.md
 │   ├── DESIGN.md
 │   ├── BUILD.md
+│   ├── NETBOX.md             # NetBox integration + transport constraints
+│   ├── MC75_SETUP.md
+│   ├── WINDOWS7_BUILD.md
 │   └── DEPLOYMENT.md
 │
 ├── bin/                          # Build output (gitignored)
@@ -90,30 +103,57 @@ The application follows a modified MVC pattern suitable for embedded Windows Mob
 
 ### Core Components
 
-1. **HbClient** (`HbClient.cpp`, `HbClient.hpp`)
-   - Handles communication with HomeBox backend API
-   - Manages authentication and API requests
+0. **InventoryBackend** (`InventoryBackend.hpp`)
+   - The abstraction both inventory systems implement; the controller and the
+     sync engine work only through it, so neither knows which system is live
+   - Deliberately narrow: resolve a scanned code, change a status, move an
+     asset. Device creation is **not** on it — a NetBox device requires four
+     mandatory foreign keys, which is not a 240x320 workflow
+   - `ReplayResult` is tri-state (`SENT`/`RETRY`/`SKIPPED`); SKIPPED exists so a
+     queue entry for a de-configured backend neither pins the sync status at
+     "failed" nor silently discards the operator's work
+
+1. **HbClient** (`HbClient.cpp`) / **NbClient** (`NbClient.cpp`)
+   - The two `InventoryBackend` implementations, for HomeBox and NetBox
+   - Each owns its own auth shape: HomeBox exchanges credentials for a token
+     and so `SessionIsRenewable()` is true; NetBox uses a static configured API
+     token, so a 401 means the token is wrong and retrying is pointless
+   - `AssetSummary` is what both produce for the detail screen, so the UI
+     branches on capability (`SupportsStatus()`) and never on backend identity
 
 2. **HttpClient** (`HttpClient.cpp`, `HttpClient.hpp`)
-   - Low-level HTTP communication
-   - Handles network requests over WinSock
+   - Low-level HTTP: WinSock plaintext, or WinInet under `HBX_USE_WININET`
+   - Supports PATCH, which NetBox mutations require (a PUT would blank every
+     field the handheld does not send). Cookies are suppressed and redirects
+     are not followed — both are NetBox correctness requirements, not hygiene
 
 3. **SyncEngine** (`SyncEngine.cpp`, `SyncEngine.hpp`)
-   - Manages offline/online synchronization
-   - Queues transactions when offline
-   - Syncs pending operations when connectivity is restored
+   - Holds a registry of backends and routes replay by *instance id*, because
+     asset tags are unique per NetBox instance rather than globally
+   - Queue records are tagged `<instanceId>.<TYPE>`; an untagged record still
+     replays against HomeBox so an in-field upgrade cannot strand a queue
+   - Connectivity is cached per backend: two backends can be on different nets
 
 4. **Journal** (`Journal.cpp`, `Journal.hpp`)
-   - Transaction logging and persistence
-   - Provides audit trail and recovery mechanism
+   - Audit trail and the durable offline queue, in one UTF-8 line file
+   - AUDIT records are history; only TRANS records are queue work
+   - SYNCED markers reference a sequence number, not the record text
 
 5. **ScannerHAL** (`ScannerHAL.hpp`)
    - Hardware Abstraction Layer for Motorola MC75 scanner
-   - Interfaces with Zebra EMDK
+   - Interfaces with Zebra EMDK; decodes are marshalled to the UI thread rather
+     than running the journal and a blocking request on the callback thread
 
 6. **JsonLite** (`Models/JsonLite.cpp`)
-   - Lightweight JSON parsing library
-   - Minimal footprint for embedded environment
+   - Lightweight JSON parsing library, minimal footprint
+   - Supports nested descent (`GetObject`/`GetArray`), which NetBox requires:
+     it nests site/location/rack/device_type and wraps lists in an envelope
+
+7. **StrUtil** (`StrUtil.cpp`, `StrUtil.hpp`) — namespace `HBX::Str`
+   - Bounded copy/append, saturating `ParseInt`, RFC 8259 JSON escaping,
+     UTF-8 conversion, URL percent-encoding, and a growable `Str::Buffer`
+   - **Use these instead of `wsprintf`**, which caps at 1024 characters on
+     Windows CE and silently truncates or overruns beyond that
 
 ## Build System
 

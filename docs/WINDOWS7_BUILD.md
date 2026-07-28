@@ -461,9 +461,9 @@ API request gating). The repo ships a host harness that builds with any modern
 
 ```bash
 ./scripts/build_host_debug.sh
-# compile-checks all 16 source files against a Win32/CE shim, repeats the check
+# compile-checks all 21 source files against a Win32/CE shim, repeats the check
 # with the device macros (HBX_USE_EMDK + HBX_USE_WININET), then runs the
-# unit + integration suite:  ==== 53/53 test cases passed, 1065/1065 checks passed ====
+# unit + integration suite:  ==== 138/138 test cases passed, 1740/1740 checks passed ====
 ```
 
 This is for quick verification on any machine (Linux/macOS/WSL). It does **not**
