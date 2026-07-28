@@ -1,8 +1,17 @@
 #include "resource.h"
 
+// IDS_MENU is the only entry the running application actually loads:
+// SHCreateMenuBar reads it through the SHMENUBAR template in layout.rc for the
+// soft-key button caption. The other two describe the package and are read by
+// the installer and by anyone inspecting the binary.
+//
+// The product name is deliberately not "HomeBox Client" any more. The client
+// talks to whichever inventory system is configured, and the window title names
+// that system at runtime - a fixed HomeBox caption would contradict the title
+// bar on every NetBox screen.
 STRINGTABLE
 BEGIN
-    IDS_APP_TITLE           "HomeBox Client"
+    IDS_APP_TITLE           "HBX Client"
     IDS_APP_VERSION         "Version 1.0.0"
     IDS_MENU                "Menu"
 END

@@ -1,0 +1,71 @@
+{
+  "activeBackend": "hb",
+  "homeboxInstanceId": "hb",
+  "apiBaseUrl": "http://localhost:8080/api",
+  "deviceId": "MC75-DEVICE-001",
+  "apiKey": "",
+  "authToken": "",
+  "netboxInstanceId": "nb",
+  "netboxBaseUrl": "",
+  "netboxToken": "",
+  "netboxAuthScheme": "Token",
+  "allowInsecureTls": false,
+  "syncIntervalSeconds": 300,
+  "journalPath": "\\My Documents\\hbx_journal.log",
+  "logLevel": "INFO",
+  "scannerBeepEnabled": true,
+  "scannerVibrateEnabled": true,
+  "offlineModeEnabled": true,
+
+  "_readme": [
+    "Template for \\Program Files\\HBXClient\\hb_conf.json. Encoding is UTF-8.",
+    "Every key is optional; an absent key takes the default shown above, which",
+    "is the value Config::InitDefaults installs (src/Config.cpp). Full table:",
+    "docs/DEPLOYMENT.md. NetBox specifics: docs/NETBOX.md.",
+
+    "This _readme key is ignored by the loader, and the app DELETES it the",
+    "first time it writes the file back. Config::Save rewrites the whole",
+    "document from the fields it knows, and it saves on the first successful",
+    "HomeBox authentication of every run -- so keep your annotated copy on the",
+    "PC, not only on the device.",
+
+    "BACKENDS. Two inventory systems are supported and exactly one is active",
+    "at a time. activeBackend names one of the two instance ids below. It must",
+    "match one of them; anything else falls back to HomeBox and journals",
+    "BACKEND_UNKNOWN. Instance ids tag every offline queue record so a queued",
+    "write always replays against the server it was recorded for, which means",
+    "they must be non-empty, at most 31 characters, and must not contain a",
+    "colon, a dot, a space or a closing square bracket.",
+
+    "NETBOX is off until netboxBaseUrl is non-empty -- unconfigured means the",
+    "client is never built and never registered, so activeBackend cannot",
+    "select a server that resolves nothing. Set the server ROOT, with no /api",
+    "suffix and no trailing slash, e.g. http://192.168.20.5 -- the client",
+    "appends /api/dcim/... itself. Use a literal IP unless the device's hosts",
+    "file or your LAN DNS can resolve the name; WM6.5 has no mDNS.",
+
+    "NETBOX TOKEN SCHEME. netboxAuthScheme is Token for a v1 token (40 hex",
+    "characters, every NetBox through 4.6) or Bearer for a v2 token (NetBox",
+    "4.5+, looks like nbt_<key>.<secret>). Sending the wrong scheme produces a",
+    "403 that looks exactly like a network fault. v1 is deprecated in NetBox",
+    "4.6 and removed in 5.0; migrating is this one line, not a rebuild.",
+
+    "TLS. allowInsecureTls makes the client accept ANY certificate from ANY",
+    "party -- it is not a compatibility shim, it removes authentication of the",
+    "server. It is defensible only on a trusted isolated LAN. Read the",
+    "transport section of docs/NETBOX.md before turning it on: HTTPS from this",
+    "hardware to a current NetBox does not work at all, and plain HTTP on a",
+    "segmented VLAN is the supported configuration.",
+
+    "CREDENTIALS. apiKey is the HomeBox device credential you provision.",
+    "authToken is the session token HomeBox issues in exchange; the app writes",
+    "it back here itself, so leave it empty. netboxToken is a static NetBox",
+    "API token -- there is no exchange, and a 401 means it is wrong or",
+    "revoked. Give it the narrowest object permissions the workflow needs.",
+
+    "OTHER. syncIntervalSeconds is the minimum spacing between automatic",
+    "syncs; 0 or less disables auto-sync, and values under 5 are clamped to 5.",
+    "offlineModeEnabled false DISCARDS work that cannot be sent instead of",
+    "queueing it. The older spelling offlineMode is still accepted on load."
+  ]
+}

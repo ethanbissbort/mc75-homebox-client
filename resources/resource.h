@@ -19,6 +19,10 @@
 #define IDM_VIEW_ITEM                   1013
 #define IDM_ACTION_SETLOC               1014
 
+// Chooses which configured inventory system takes new work. Handled in
+// Controller::WindowProc; see also IDM_MAINMENU in layout.rc.
+#define IDM_ACTION_SWITCHBACKEND        1015
+
 // Control IDs
 #define IDC_SCAN_BUTTON                 2001
 #define IDC_SYNC_BUTTON                 2002

@@ -23,7 +23,12 @@
 
 ## 🎯 Overview
 
-The **MC75 HomeBox Client** is a native C++ application designed for Motorola MC75 handheld scanners running Windows Mobile 6.5 Professional. It provides seamless integration with the HomeBox inventory management system, enabling real-time barcode scanning, item tracking, and offline transaction queuing.
+The **MC75 HomeBox Client** is a native C++ application designed for Motorola MC75 handheld scanners running Windows Mobile 6.5 Professional. It provides barcode scanning, item tracking and offline transaction queuing against **two inventory backends**:
+
+- **HomeBox** — full item CRUD, the original backend.
+- **NetBox** — DCIM device lookup, status change and move. See [NETBOX.md](docs/NETBOX.md).
+
+Exactly one backend is active at a time, named by `activeBackend` in `hb_conf.json`. The offline queue is shared: every record is tagged with its backend's instance id, so queued work always replays against the server it was recorded for — even after the operator switches backends.
 
 ### 🏭 Built For
 
@@ -41,23 +46,28 @@ The **MC75 HomeBox Client** is a native C++ application designed for Motorola MC
 | Feature | Description | Status |
 |---------|-------------|--------|
 | 📦 **Barcode Scanning** | Hardware-integrated scanner with EMDK support | ✅ Complete |
-| 📊 **Item Management** | Full CRUD operations for inventory items | ✅ Complete |
-| 🌐 **API Integration** | RESTful communication with HomeBox backend | ✅ Complete |
-| 💾 **Offline Queue** | Transaction queuing with automatic sync | ✅ Complete |
+| 🔀 **Two Backends** | HomeBox and NetBox, one active at a time | ✅ Complete |
+| 📊 **Item Management** | Full CRUD operations for HomeBox inventory items | ✅ Complete |
+| 🖥️ **NetBox Devices** | Scan-to-device lookup, status change, atomic move | ✅ Complete |
+| 🌐 **API Integration** | RESTful communication with both backends | ✅ Complete |
+| 💾 **Offline Queue** | Transaction queuing with automatic sync, routed per backend | ✅ Complete |
 | 📝 **Transaction Journal** | Audit trail with timestamp logging | ✅ Complete |
 | 🔄 **Automatic Sync** | Timer-driven sync attempts from the UI thread when online | ✅ Complete |
+| ➕ **NetBox device creation** | Four mandatory foreign keys — a web-UI job, not a handheld one | ⛔ Out of scope |
 
 ### 🎨 User Interface
 
 - **📱 Scan View**: Real-time barcode scanning interface
-- **📋 Item View**: Comprehensive item editing with 6 input fields
+- **📋 Item View**: Comprehensive HomeBox item editing with 6 input fields
+- **🖥️ Device View**: NetBox device detail — a viewer with targeted actions, not an editor
+- **🔢 Picker View**: Reusable chooser, and the disambiguation list when one scan matches several devices
 - **📊 Queue View**: ListView-based transaction queue manager
 - **🎯 Status Display**: Live sync status and item count indicators
 
 ### 🔧 Technical Features
 
 - ⚡ **Lightweight JSON Parser**: Custom implementation for embedded environment
-- 🔐 **Secure Authentication**: Bearer token-based API authentication
+- 🔐 **Pluggable Authentication**: HomeBox exchanges a device key for a bearer session token; NetBox uses a static API token with a configurable `Token` / `Bearer` scheme
 - 📡 **Smart Connectivity**: DNS-based connectivity detection
 - 💪 **Manual Memory Management**: Optimized for resource-constrained devices
 - 🌍 **Unicode Support**: Full TCHAR/WCHAR string handling
@@ -84,13 +94,15 @@ The **MC75 HomeBox Client** is a native C++ application designed for Motorola MC
 
 ### 🔌 Core Components
 
-#### **HbClient** 🌐
-- REST API communication
-- Authentication management
+#### **HbClient / NbClient** 🌐
+- Two `InventoryBackend` implementations behind one interface
+- `HbClient`: HomeBox item CRUD, session-token authentication
+- `NbClient`: NetBox DCIM lookup / status / move, static API token
 - JSON request/response handling
 
 #### **SyncEngine** 🔄
 - Offline transaction queuing
+- Backend registry: records are tagged `<instanceId>.<TYPE>` and replayed against the backend they were recorded for
 - Background synchronization
 - Connectivity monitoring
 
@@ -147,10 +159,10 @@ and `make` are needed:
 
 ```bash
 ./scripts/build_host_debug.sh
-# -> compile-checks all 16 source files against the shim, repeats the check with
+# -> compile-checks all 21 source files against the shim, repeats the check with
 #    the device macros (HBX_USE_EMDK + HBX_USE_WININET), then runs the
 #    unit + integration suite:
-#    ==== 53/53 test cases passed, 1065/1065 checks passed ====
+#    ==== 138/138 test cases passed, 1740/1740 checks passed ====
 ```
 
 The script is a thin wrapper around `make -C tests/host check`, which is the
@@ -174,21 +186,32 @@ scripts\deploy_to_device.bat Debug
 
 ### ⚙️ Configure
 
-Create `hb_conf.json` in the installation directory. The app looks in
-`\Program Files\HBXClient\`, then `\My Documents\`, then `\Storage Card\`, and
-runs on documented defaults if it finds none. Every key is optional; see
-[DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full table, including the `apiKey`
-(yours) / `authToken` (the app's) distinction.
+An annotated `hb_conf.json` template ships in the repository root and the CAB
+deploys it. The app looks in `\Program Files\HBXClient\`, then `\My Documents\`,
+then `\Storage Card\`, and runs on documented defaults if it finds none. Every
+key is optional; see [DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full table,
+including the `apiKey` (yours) / `authToken` (the app's) distinction.
 
 ```json
 {
+  "activeBackend": "hb",
   "apiBaseUrl": "https://your-homebox-api.com",
   "deviceId": "MC75-001",
   "apiKey": "your-api-key-here",
+  "netboxInstanceId": "nb",
+  "netboxBaseUrl": "http://192.168.20.5",
+  "netboxToken": "your-netbox-token",
+  "netboxAuthScheme": "Token",
   "syncIntervalSeconds": 300,
   "journalPath": "\\My Documents\\hbx_journal.log"
 }
 ```
+
+Set `activeBackend` to `"nb"` to make NetBox the active backend. NetBox stays
+off entirely while `netboxBaseUrl` is empty. **HTTPS to a current NetBox is not
+achievable from this hardware** — the supported configuration is plain HTTP on
+a segmented scanner VLAN, explained in
+[NETBOX.md → Transport](docs/NETBOX.md#-transport-https-does-not-work-from-this-device).
 
 ---
 
@@ -205,6 +228,7 @@ Comprehensive documentation is available in the `docs/` directory:
 | 📱 **MC75_SETUP.md** | Reset & fully update an MC75 over USB, then deploy | [View](docs/MC75_SETUP.md) |
 | 🚀 **DEPLOYMENT.md** | Deployment procedures and CAB packaging | [View](docs/DEPLOYMENT.md) |
 | 🌐 **API_NOTES.md** | HomeBox API integration guide | [View](docs/API_NOTES.md) |
+| 🖥️ **NETBOX.md** | NetBox backend: scope, tokens, transport, workflow, troubleshooting | [View](docs/NETBOX.md) |
 | 🤖 **CLAUDE.md** | AI assistant development guide | [View](CLAUDE.md) |
 
 ---
@@ -221,17 +245,22 @@ mc75-homebox-client/
 │   ├── Config.cpp            # hb_conf.json loader
 │   ├── StrUtil.cpp           # HBX::Str bounded string / UTF-8 helpers
 │   ├── HttpClient.cpp        # HTTP/HTTPS transports
-│   ├── HbClient.cpp          # API client
-│   ├── SyncEngine.cpp        # Sync manager
+│   ├── HbClient.cpp          # HomeBox API client
+│   ├── NbClient.cpp          # NetBox DCIM client
+│   ├── SyncEngine.cpp        # Sync manager + backend registry
 │   ├── Journal.cpp           # Transaction journal + offline queue
 │   ├── ScannerHAL.cpp        # Scanner abstraction
 │   ├── Views/                # UI components
 │   │   ├── ScanView.cpp
 │   │   ├── ItemView.cpp
-│   │   └── QueueView.cpp
+│   │   ├── QueueView.cpp
+│   │   ├── DeviceView.cpp
+│   │   └── PickerView.cpp
 │   └── Models/               # Data models
 │       ├── Item.cpp
 │       ├── Location.cpp
+│       ├── Device.cpp
+│       ├── AssetSummary.cpp
 │       └── JsonLite.cpp
 │
 ├── 📋 include/                # Header files (.hpp)
@@ -265,7 +294,7 @@ mc75-homebox-client/
 - **Architecture**: ARMV4I (32-bit ARM)
 - **UI Framework**: Win32 API (CreateWindow, MessageBox, etc.)
 - **Scanner SDK**: Zebra EMDK for C/C++
-- **Networking**: WinSock (HTTP/1.1 client)
+- **Networking**: WinInet on the device build (`HBX_USE_WININET`), WinSock HTTP/1.1 otherwise
 - **Data Format**: JSON (custom lightweight parser)
 
 ### 🔍 Code Quality
@@ -274,9 +303,9 @@ What the repository can actually demonstrate:
 
 ```bash
 ✅ No TODO / FIXME markers in src/ or include/
-✅ Host compile gate clean: all 16 sources build against the Win32/CE shim
-✅ Device compile gate clean: the same 16 with HBX_USE_EMDK + HBX_USE_WININET
-✅ 53/53 test cases, 1065/1065 checks (make -C tests/host check)
+✅ Host compile gate clean: all 21 sources build against the Win32/CE shim
+✅ Device compile gate clean: the same 21 with HBX_USE_EMDK + HBX_USE_WININET
+✅ 138/138 test cases, 1740/1740 checks (make -C tests/host check)
 ✅ Bounded string / UTF-8 handling centralised in HBX::Str (include/StrUtil.hpp)
 ✅ Offline-first: scans are journalled and replayed rather than dropped
 ```
@@ -285,10 +314,14 @@ And what it does **not** demonstrate:
 
 ```bash
 ⚠️ The suite only RUNS the platform-independent core - StrUtil, JsonLite, Item,
-   Location, Config, Journal, HttpClient, HbClient, SyncEngine (tests/host/Makefile).
-   Controller, the three views, ScannerHAL and main are compile-checked only.
+   Location, Device, AssetSummary, Config, Journal, HttpClient, HbClient,
+   NbClient, SyncEngine (tests/host/Makefile). Controller, the five views,
+   ScannerHAL and main are compile-checked only.
 ⚠️ The EMDK and WinInet paths are compile-checked against the shim headers; they
    can only be exercised on an MC75 (or the WM6.5 emulator, minus the scanner).
+⚠️ NbClient is tested against constructed NetBox payloads, not a live NetBox.
+   Its URL construction, move-body shapes, code classification and device
+   parsing are covered; nothing here proves a real server accepts them.
 ⚠️ Memory is managed by hand (new[]/delete[]); ownership is documented per method
    in the headers, but nothing in the build enforces it.
 ```

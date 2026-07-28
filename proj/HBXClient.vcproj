@@ -31,6 +31,7 @@
 				AdditionalIncludeDirectories="..\include;$(WINDOWSMOBILE65SDK)\PocketPC\Include\Armv4i;$(ZEBRAEMDK)\Include"
 				PreprocessorDefinitions="WIN32;_WIN32_WCE=0x0600;UNDER_CE;WIN32_PLATFORM_PSPC;_DEBUG;HBX_USE_WININET;HBX_USE_EMDK"
 				RuntimeLibrary="3"
+				RuntimeTypeInfo="false"
 				UsePrecompiledHeader="0"
 				WarningLevel="3"
 				DebugInformationFormat="3"/>
@@ -70,6 +71,7 @@
 				AdditionalIncludeDirectories="..\include;$(WINDOWSMOBILE65SDK)\PocketPC\Include\Armv4i;$(ZEBRAEMDK)\Include"
 				PreprocessorDefinitions="WIN32;_WIN32_WCE=0x0600;UNDER_CE;WIN32_PLATFORM_PSPC;NDEBUG;HBX_USE_WININET;HBX_USE_EMDK"
 				RuntimeLibrary="2"
+				RuntimeTypeInfo="false"
 				UsePrecompiledHeader="0"
 				WarningLevel="3"
 				DebugInformationFormat="3"/>
@@ -95,6 +97,7 @@
 		<File RelativePath="..\src\Controller.cpp"/>
 		<File RelativePath="..\src\HttpClient.cpp"/>
 		<File RelativePath="..\src\HbClient.cpp"/>
+		<File RelativePath="..\src\NbClient.cpp"/>
 		<File RelativePath="..\src\Journal.cpp"/>
 		<File RelativePath="..\src\SyncEngine.cpp"/>
 		<File RelativePath="..\src\Config.cpp"/>
@@ -104,11 +107,15 @@
 			<File RelativePath="..\src\Views\ScanView.cpp"/>
 			<File RelativePath="..\src\Views\ItemView.cpp"/>
 			<File RelativePath="..\src\Views\QueueView.cpp"/>
+			<File RelativePath="..\src\Views\DeviceView.cpp"/>
+			<File RelativePath="..\src\Views\PickerView.cpp"/>
 			<File RelativePath="..\src\Views\ViewHelpers.cpp"/>
 		</Filter>
 		<Filter Name="Models">
 			<File RelativePath="..\src\Models\Item.cpp"/>
 			<File RelativePath="..\src\Models\Location.cpp"/>
+			<File RelativePath="..\src\Models\Device.cpp"/>
+			<File RelativePath="..\src\Models\AssetSummary.cpp"/>
 			<File RelativePath="..\src\Models\JsonLite.cpp"/>
 		</Filter>
 		<File RelativePath="..\resources\layout.rc"/>
@@ -118,6 +125,8 @@
 			<File RelativePath="..\include\Controller.hpp"/>
 			<File RelativePath="..\include\HttpClient.hpp"/>
 			<File RelativePath="..\include\HbClient.hpp"/>
+			<File RelativePath="..\include\InventoryBackend.hpp"/>
+			<File RelativePath="..\include\NbClient.hpp"/>
 			<File RelativePath="..\include\Journal.hpp"/>
 			<File RelativePath="..\include\SyncEngine.hpp"/>
 			<File RelativePath="..\include\Config.hpp"/>
@@ -126,10 +135,14 @@
 			<File RelativePath="..\include\Models\Models.hpp"/>
 			<File RelativePath="..\include\Models\Item.hpp"/>
 			<File RelativePath="..\include\Models\Location.hpp"/>
+			<File RelativePath="..\include\Models\Device.hpp"/>
+			<File RelativePath="..\include\Models\AssetSummary.hpp"/>
 			<File RelativePath="..\include\Models\JsonLite.hpp"/>
 			<File RelativePath="..\include\Views\ScanView.hpp"/>
 			<File RelativePath="..\include\Views\ItemView.hpp"/>
 			<File RelativePath="..\include\Views\QueueView.hpp"/>
+			<File RelativePath="..\include\Views\DeviceView.hpp"/>
+			<File RelativePath="..\include\Views\PickerView.hpp"/>
 			<File RelativePath="..\include\Views\ViewHelpers.hpp"/>
 		</Filter>
 	</Files>

@@ -364,9 +364,16 @@ writes it back as UTF-8, so accented item text and non-ASCII paths survive.
 
 ```json
 {
+  "activeBackend": "hb",
+  "homeboxInstanceId": "hb",
   "apiBaseUrl": "https://api.homebox.example.com",
   "deviceId": "MC75-WAREHOUSE-001",
   "apiKey": "your-api-key-here",
+  "netboxInstanceId": "nb",
+  "netboxBaseUrl": "",
+  "netboxToken": "",
+  "netboxAuthScheme": "Token",
+  "allowInsecureTls": false,
   "syncIntervalSeconds": 300,
   "journalPath": "\\My Documents\\hbx_journal.log",
   "logLevel": "INFO",
@@ -375,6 +382,13 @@ writes it back as UTF-8, so accented item text and non-ASCII paths survive.
   "offlineModeEnabled": true
 }
 ```
+
+The repository root ships an annotated `hb_conf.json` with these defaults; the
+CAB deploys it to `\Program Files\HBXClient\` when it exists. Note that
+`Config::Save` rewrites the whole file from the fields it knows and runs on the
+first successful authentication of every run, so any comment key you add — the
+template's `_readme` included — is dropped at that point. Keep the annotated
+copy on the PC.
 
 Every key is optional. A key that is absent takes the default below, and a file
 that fails a strict JSON parse (one trailing comma is enough) falls back to a
@@ -412,6 +426,28 @@ Defaults are the ones `Config::InitDefaults` installs (`src/Config.cpp`).
 | `scannerBeepEnabled` | bool | true | Decode beep (applied to the scanner at startup) |
 | `scannerVibrateEnabled` | bool | true | Decode vibrate (applied to the scanner at startup) |
 | `offlineModeEnabled` | bool | **true** | Whether a scan that cannot reach the server is queued for later sync. Set `false` only if unsent work should be **discarded** with an error dialog rather than queued. The older name `offlineMode` is still accepted on load; `Save()` writes `offlineModeEnabled` |
+
+#### Backend selection and NetBox
+
+The client supports two inventory backends and exactly one is active at a time.
+These seven keys drive that; see [NETBOX.md](NETBOX.md) for the NetBox
+integration in full.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `activeBackend` | string | `"hb"` | Instance id of the backend that takes new work. Must equal `homeboxInstanceId` or `netboxInstanceId`; anything else falls back to HomeBox and journals `BACKEND_UNKNOWN`. A file predating this key selects HomeBox under whatever name it was given |
+| `homeboxInstanceId` | string | `"hb"` | Instance id tagging HomeBox queue records. The default matches records written before entries carried a tag, so an upgraded device recognises the work it is already holding |
+| `netboxInstanceId` | string | `"nb"` | Instance id tagging NetBox queue records |
+| `netboxBaseUrl` | string | `""` | NetBox server **root** — no `/api` suffix; the client appends the API path itself. A trailing `/` is stripped. **Empty means NetBox is not configured**: the client is never built and never registered, so `activeBackend` cannot select a server that resolves nothing. Use a literal IP unless LAN DNS or the device hosts file can resolve the name |
+| `netboxToken` | string | `""` | NetBox API token, without the scheme word. Static configuration — there is no exchange, and a 401 means it is wrong or revoked |
+| `netboxAuthScheme` | string | `"Token"` | `Token` for a v1 token (40 hex chars, every NetBox through 4.6) or `Bearer` for a v2 token (`nbt_<key>.<secret>`, NetBox 4.5+). The wrong scheme produces a 403 that looks like a network fault |
+| `allowInsecureTls` | bool | **false** | Accept **any** TLS certificate from any party. This removes authentication of the server, not just a compatibility check — read [NETBOX.md → Transport](NETBOX.md#-transport-https-does-not-work-from-this-device) before enabling it. `Controller::ConfigureNetbox` journals a line whenever it is on |
+
+An instance id is parsed back out of every queue record, so it must be
+non-empty, at most 31 characters, and free of `:`, `.`, ` ` and `]`
+(`SyncEngine::IsValidInstanceId`). An id that fails that check is refused, the
+default is kept, and `BACKEND_ID_INVALID` goes to the journal — the backend is
+still registered, because dropping it would stop the device queueing at all.
 
 ### Deployment Scenarios
 
@@ -604,6 +640,11 @@ Scanner doesn't trigger
 4. Check API server status
 5. Enable verbose logging
 ```
+
+For a NetBox backend the failure modes are different — a wrong token scheme, a
+`/api` suffix on `netboxBaseUrl`, an `https://` URL that this hardware cannot
+negotiate at all, or a hostname with no DNS. See
+[NETBOX.md → Troubleshooting](NETBOX.md#-troubleshooting).
 
 ---
 

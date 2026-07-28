@@ -1,6 +1,7 @@
 #include "../../include/Views/QueueView.hpp"
 #include "../../include/Views/ViewHelpers.hpp"
 #include "../../include/Journal.hpp"
+#include "../../include/StrUtil.hpp"
 #include <commctrl.h>
 
 // The host shim carries only the list-view surface the original code used; the
@@ -17,6 +18,25 @@
 namespace HBX {
 namespace Views {
 
+namespace {
+
+// A queue record written before entries carried a backend tag belongs to
+// HomeBox - it was the only backend that existed - and SyncEngine still routes
+// it there by kind. The row shows that rather than "unknown", because "unknown"
+// would suggest the entry is stranded when it is not.
+const TCHAR* const kLegacyBackendTag = TEXT("hb");
+
+/** Skips spaces. */
+const TCHAR* SkipSpaces(const TCHAR* s)
+{
+    while (*s == (TCHAR)' ') {
+        s++;
+    }
+    return s;
+}
+
+} // namespace
+
 QueueView::QueueView()
     : m_hwnd(NULL)
     , m_listView(NULL)
@@ -26,6 +46,7 @@ QueueView::QueueView()
     , m_removeButton(NULL)
     , m_statusLabel(NULL)
     , m_countLabel(NULL)
+    , m_skippedLabel(NULL)
     , m_hInstance(NULL)
     , m_syncEngine(NULL)
     , m_syncCallback(NULL)
@@ -33,6 +54,7 @@ QueueView::QueueView()
     , m_changedCallback(NULL)
     , m_changedUserData(NULL)
     , m_selectedIndex(-1)
+    , m_skippedCount(0)
     , m_queueLines(NULL)
     , m_queueLineCount(0)
 {
@@ -96,6 +118,19 @@ bool QueueView::Create(HWND parentWnd, HINSTANCE hInstance)
         10, 35, 220, 20,
         m_hwnd,
         (HMENU)ID_COUNT_LABEL,
+        hInstance,
+        NULL
+    );
+
+    // Hidden until a sync actually skips something; LayoutControls gives the
+    // line back to the list while there is nothing to report.
+    m_skippedLabel = CreateWindow(
+        TEXT("STATIC"),
+        TEXT(""),
+        WS_CHILD | SS_LEFT,
+        10, 55, 220, 20,
+        m_hwnd,
+        (HMENU)ID_SKIPPED_LABEL,
         hInstance,
         NULL
     );
@@ -254,12 +289,108 @@ void QueueView::RefreshQueue()
             // "[timestamp] TRANS nnnnnnnn: " prefix eats the entire visible
             // column width on a QVGA screen.
             const TCHAR* payload = Journal::PayloadOf(m_queueLines[i]);
-            AddQueuedItem(payload ? payload : m_queueLines[i], rowStatus);
+
+            TCHAR backend[BACKEND_TAG_CHARS];
+            TCHAR description[ROW_TEXT_CHARS];
+            SplitPayload(payload ? payload : m_queueLines[i],
+                         backend, BACKEND_TAG_CHARS,
+                         description, ROW_TEXT_CHARS);
+
+            AddQueuedItem(backend, description, rowStatus);
         }
     }
 
     // Keep the count label in sync with the engine's authoritative count.
     SetItemCount(m_syncEngine->GetQueuedTransactionCount());
+    UpdateSkippedIndicator();
+}
+
+// static
+void QueueView::SplitPayload(const TCHAR* payload,
+                             TCHAR* backend, int backendCap,
+                             TCHAR* description, int descriptionCap)
+{
+    if (backend && backendCap > 0) {
+        backend[0] = 0;
+    }
+    if (description && descriptionCap > 0) {
+        description[0] = 0;
+    }
+    if (!payload) {
+        return;
+    }
+
+    // "[tick] <instanceId>.<TYPE>: DATA". The leading bracket is written by
+    // SyncEngine::QueueTransaction; anything else did not come from the queue
+    // and is shown verbatim so it can be recognised and removed.
+    const TCHAR* cursor = payload;
+    if (*cursor == (TCHAR)'[') {
+        const TCHAR* bracketEnd = wcschr(cursor, (TCHAR)']');
+        if (!bracketEnd) {
+            Str::Copy(description, descriptionCap, payload);
+            return;
+        }
+        cursor = SkipSpaces(bracketEnd + 1);
+    }
+
+    const TCHAR* colon = wcschr(cursor, (TCHAR)':');
+    if (!colon) {
+        Str::Copy(description, descriptionCap, payload);
+        return;
+    }
+
+    // The instance id may not contain a '.', so the first one separates it from
+    // the transaction type.
+    const TCHAR* dot = wcschr(cursor, (TCHAR)'.');
+    const TCHAR* typeStart = cursor;
+    if (dot && dot < colon) {
+        Str::CopyN(backend, backendCap, cursor, (int)(dot - cursor));
+        typeStart = dot + 1;
+    } else {
+        Str::Copy(backend, backendCap, kLegacyBackendTag);
+    }
+
+    // Type first, then as much of the payload as the column can show: the type
+    // is what tells a status change from a move, and the operator needs that
+    // before the arguments.
+    Str::CopyN(description, descriptionCap, typeStart, (int)(colon - typeStart));
+    Str::Append(description, descriptionCap, TEXT(" "));
+    Str::Append(description, descriptionCap, SkipSpaces(colon + 1));
+}
+
+void QueueView::UpdateSkippedIndicator()
+{
+    // A skipped entry is one that is still queued, so an empty queue has none
+    // however the last sync went. Without this the indicator would outlive the
+    // entries it describes and read as a fault on a queue that is now empty.
+    int skipped = 0;
+    if (m_syncEngine && m_syncEngine->GetQueuedTransactionCount() > 0) {
+        skipped = m_syncEngine->GetSkippedCount();
+    }
+    bool wasVisible = (m_skippedCount > 0);
+    m_skippedCount = skipped;
+
+    if (m_skippedLabel) {
+        if (skipped > 0) {
+            // Worded so it cannot be read as an error: these entries were not
+            // sent and were not rejected either - nothing on the device is
+            // configured to take them.
+            TCHAR text[64];
+            text[0] = 0;
+            Str::Append(text, 64, TEXT("Skipped: "));
+            Str::AppendInt(text, 64, (long)skipped);
+            Str::Append(text, 64, TEXT(" - no backend for these"));
+            SetWindowText(m_skippedLabel, text);
+        } else {
+            SetWindowText(m_skippedLabel, TEXT(""));
+        }
+        ShowWindow(m_skippedLabel, skipped > 0 ? SW_SHOW : SW_HIDE);
+    }
+
+    // The list grows back into the line when there is nothing to report.
+    if (wasVisible != (skipped > 0)) {
+        LayoutControls();
+    }
 }
 
 void QueueView::SetSyncEngine(SyncEngine* syncEngine)
@@ -298,9 +429,13 @@ void QueueView::UpdateSyncStatus(SyncEngine::SyncStatus status)
     }
 
     SetWindowText(m_statusLabel, statusText);
+
+    // The skipped tally is recomputed by the same sync that produced this
+    // status, so this is the point at which it can have changed.
+    UpdateSkippedIndicator();
 }
 
-void QueueView::AddQueuedItem(const TCHAR* description, const TCHAR* status)
+void QueueView::AddQueuedItem(const TCHAR* backend, const TCHAR* description, const TCHAR* status)
 {
     if (!m_listView || !description) {
         return;
@@ -310,13 +445,15 @@ void QueueView::AddQueuedItem(const TCHAR* description, const TCHAR* status)
     item.mask = LVIF_TEXT;
     item.iItem = ListView_GetItemCount(m_listView);
     item.iSubItem = 0;
-    item.pszText = (TCHAR*)description;
+    item.pszText = (TCHAR*)(backend ? backend : TEXT(""));
 
     int inserted = ListView_InsertItem(m_listView, &item);
     if (inserted >= 0) {
+        ListView_SetItemText(m_listView, inserted, 1, (TCHAR*)description);
+
         // The Status column was created but never written, so every row showed
         // an empty cell no matter what had happened to the transaction.
-        ListView_SetItemText(m_listView, inserted, 1,
+        ListView_SetItemText(m_listView, inserted, 2,
                              (TCHAR*)(status ? status : TEXT("Pending")));
     }
 
@@ -354,7 +491,9 @@ void QueueView::SetItemCount(int count)
 {
     if (m_countLabel) {
         TCHAR buffer[64];
-        wsprintf(buffer, TEXT("Items: %d"), count);
+        buffer[0] = 0;
+        Str::Append(buffer, 64, TEXT("Items: "));
+        Str::AppendInt(buffer, 64, (long)count);
         SetWindowText(m_countLabel, buffer);
     }
 }
@@ -442,12 +581,98 @@ void QueueView::OnSyncClick()
     }
 }
 
+bool QueueView::BuildClearPrompt(TCHAR* out, int cap) const
+{
+    if (!out || cap <= 0) {
+        return false;
+    }
+    out[0] = 0;
+
+    const int queued = m_syncEngine ? m_syncEngine->GetQueuedTransactionCount() : 0;
+    if (queued <= 0) {
+        return false;
+    }
+
+    Str::Append(out, cap, TEXT("Discard "));
+    Str::AppendInt(out, cap, (long)queued);
+    Str::Append(out, cap, (queued == 1) ? TEXT(" queued transaction?")
+                                        : TEXT(" queued transactions?"));
+
+    // Name the backends the work was waiting for. "Clear all queued
+    // transactions?" gave the operator no way to tell a stranded entry for a
+    // decommissioned server from a shift's worth of unsent scans, and the
+    // button destroys both.
+    TCHAR tags[MAX_TALLIED_BACKENDS][BACKEND_TAG_CHARS];
+    int tallies[MAX_TALLIED_BACKENDS];
+    int tagCount = 0;
+    int untallied = 0;
+
+    for (int i = 0; i < m_queueLineCount; i++) {
+        if (!m_queueLines || !m_queueLines[i]) {
+            continue;
+        }
+
+        const TCHAR* payload = Journal::PayloadOf(m_queueLines[i]);
+        TCHAR backend[BACKEND_TAG_CHARS];
+        TCHAR description[ROW_TEXT_CHARS];
+        SplitPayload(payload ? payload : m_queueLines[i],
+                     backend, BACKEND_TAG_CHARS, description, ROW_TEXT_CHARS);
+
+        if (backend[0] == 0) {
+            untallied++;
+            continue;
+        }
+
+        int slot = -1;
+        for (int t = 0; t < tagCount; t++) {
+            if (lstrcmp(tags[t], backend) == 0) {
+                slot = t;
+                break;
+            }
+        }
+        if (slot < 0) {
+            if (tagCount >= MAX_TALLIED_BACKENDS) {
+                untallied++;
+                continue;
+            }
+            slot = tagCount++;
+            Str::Copy(tags[slot], BACKEND_TAG_CHARS, backend);
+            tallies[slot] = 0;
+        }
+        tallies[slot]++;
+    }
+
+    for (int t = 0; t < tagCount; t++) {
+        Str::Append(out, cap, TEXT("\n  "));
+        Str::AppendInt(out, cap, (long)tallies[t]);
+        Str::Append(out, cap, TEXT(" for "));
+        Str::Append(out, cap, tags[t]);
+    }
+    if (untallied > 0) {
+        Str::Append(out, cap, TEXT("\n  "));
+        Str::AppendInt(out, cap, (long)untallied);
+        Str::Append(out, cap, TEXT(" unrecognised"));
+    }
+
+    Str::Append(out, cap, TEXT("\nThey have not reached a server and cannot be recovered."));
+    return true;
+}
+
 void QueueView::OnClearClick()
 {
-    // Confirm before clearing
+    // State exactly what is about to be destroyed. The count comes from the
+    // engine rather than the list because the list can be empty after a
+    // WM_HIBERNATE dropped its rows, while the journal still holds the work.
+    TCHAR prompt[512];
+    if (!BuildClearPrompt(prompt, 512)) {
+        MessageBox(m_hwnd, TEXT("The queue is empty. Nothing to clear."),
+                   TEXT("Clear Queue"), MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
     int result = MessageBox(
         m_hwnd,
-        TEXT("Clear all queued transactions? This cannot be undone."),
+        prompt,
         TEXT("Confirm Clear"),
         MB_YESNO | MB_ICONWARNING
     );
@@ -466,6 +691,7 @@ void QueueView::OnClearClick()
             }
         }
 
+        UpdateSkippedIndicator();
         NotifyQueueChanged();
     }
 }
@@ -485,7 +711,7 @@ void QueueView::OnRetryClick()
         return;
     }
 
-    ListView_SetItemText(m_listView, m_selectedIndex, 1, (TCHAR*)TEXT("Failed"));
+    ListView_SetItemText(m_listView, m_selectedIndex, 2, (TCHAR*)TEXT("Failed"));
     MessageBox(m_hwnd, TEXT("Retry failed. The transaction stays queued."),
                TEXT("Retry"), MB_OK | MB_ICONWARNING);
 }
@@ -543,7 +769,11 @@ void QueueView::LayoutControls()
     const int margin = 8;
     const int buttonHeight = 30;
     const int gap = 4;
-    const int listTop = 60;
+
+    // The skipped indicator only exists when a sync actually skipped something,
+    // so the list keeps its full height in the normal case. On a 268 px client
+    // area a permanently reserved line costs a visible row.
+    const int listTop = (m_skippedCount > 0) ? 78 : 58;
 
     int contentWidth = width - (2 * margin);
     if (contentWidth < 60) {
@@ -556,6 +786,10 @@ void QueueView::LayoutControls()
 
     if (m_countLabel) {
         MoveWindow(m_countLabel, margin, 32, contentWidth, 20, TRUE);
+    }
+
+    if (m_skippedLabel) {
+        MoveWindow(m_skippedLabel, margin, 54, contentWidth, 20, TRUE);
     }
 
     // Two rows of buttons, anchored to the bottom of whatever client area we
@@ -606,15 +840,21 @@ void QueueView::InitializeListView()
     LVCOLUMN column = {0};
     column.mask = LVCF_TEXT | LVCF_WIDTH;
 
+    // Backend column. Narrow on purpose: instance ids are short by convention
+    // ("hb", "nb-prod") and every pixel it takes comes off the payload.
+    column.pszText = (TCHAR*)TEXT("BE");
+    column.cx = 44;
+    ListView_InsertColumn(m_listView, 0, &column);
+
     // Transaction column
     column.pszText = (TCHAR*)TEXT("Transaction");
-    column.cx = 150;
-    ListView_InsertColumn(m_listView, 0, &column);
+    column.cx = 116;
+    ListView_InsertColumn(m_listView, 1, &column);
 
     // Status column
     column.pszText = (TCHAR*)TEXT("Status");
-    column.cx = 60;
-    ListView_InsertColumn(m_listView, 1, &column);
+    column.cx = 56;
+    ListView_InsertColumn(m_listView, 2, &column);
 }
 
 } // namespace Views

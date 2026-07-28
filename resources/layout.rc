@@ -17,6 +17,10 @@ BEGIN
         MENUITEM "&Queue",          IDM_VIEW_QUEUE
         MENUITEM "S&ync now",       IDM_ACTION_SYNC
         MENUITEM SEPARATOR
+        // Which inventory system takes new work. The title bar names the
+        // current one at all times; this is how it is changed.
+        MENUITEM "S&witch system",  IDM_ACTION_SWITCHBACKEND
+        MENUITEM SEPARATOR
         MENUITEM "&About",          IDM_HELP_ABOUT
         MENUITEM "E&xit",           IDM_FILE_EXIT
     END

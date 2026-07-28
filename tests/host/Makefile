@@ -2,9 +2,10 @@
 # Host test Makefile for the MC75 HomeBox client
 #
 # Builds and runs the platform-independent core logic (JsonLite, Item,
-# Location, Config, Journal, HttpClient, HbClient) against a small Win32/CE
-# shim (tests/host/shim) using the native host compiler, so unit and
-# integration tests can run in CI without the Windows Mobile SDK or a device.
+# Location, Device, Config, Journal, HttpClient, HbClient, NbClient) against a
+# small Win32/CE shim (tests/host/shim) using the native host compiler, so unit
+# and integration tests can run in CI without the Windows Mobile SDK or a
+# device.
 #
 # Usage (from anywhere):
 #     make -C tests/host          # build the test runner
@@ -40,11 +41,13 @@ CORE_SRC := \
     $(ROOT)/src/Models/JsonLite.cpp \
     $(ROOT)/src/Models/Item.cpp \
     $(ROOT)/src/Models/Location.cpp \
+    $(ROOT)/src/Models/Device.cpp \
     $(ROOT)/src/Models/AssetSummary.cpp \
     $(ROOT)/src/Config.cpp \
     $(ROOT)/src/Journal.cpp \
     $(ROOT)/src/HttpClient.cpp \
     $(ROOT)/src/HbClient.cpp \
+    $(ROOT)/src/NbClient.cpp \
     $(ROOT)/src/SyncEngine.cpp
 
 # Every production source, including the GUI / scanner / controller layer.
@@ -69,6 +72,7 @@ TEST_SRC := \
     $(ROOT)/tests/unit/test_json.cpp \
     $(ROOT)/tests/unit/test_journal.cpp \
     $(ROOT)/tests/unit/test_http.cpp \
+    $(ROOT)/tests/unit/test_netbox.cpp \
     $(ROOT)/tests/integration/test_api_endpoints.cpp \
     $(ROOT)/tests/integration/test_hb_backend.cpp \
     $(ROOT)/tests/integration/test_offline_sync.cpp \

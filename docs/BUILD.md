@@ -139,9 +139,10 @@ src/StrUtil.cpp              // Bounded string / UTF-8 helpers (HBX::Str)
 // Networking
 src/HttpClient.cpp           // HTTP client
 src/HbClient.cpp            // HomeBox API client
+src/NbClient.cpp            // NetBox DCIM client
 
 // Synchronization
-src/SyncEngine.cpp          // Sync manager
+src/SyncEngine.cpp          // Sync manager (multi-backend queue routing)
 src/Journal.cpp             // Transaction journal
 
 // Hardware
@@ -149,15 +150,25 @@ src/ScannerHAL.cpp          // Scanner abstraction
 
 // Views
 src/Views/ScanView.cpp      // Scan interface
-src/Views/ItemView.cpp      // Item editor
+src/Views/ItemView.cpp      // Item editor (HomeBox)
 src/Views/QueueView.cpp     // Queue manager
+src/Views/DeviceView.cpp    // NetBox device detail
+src/Views/PickerView.cpp    // Reusable chooser + match disambiguation
 src/Views/ViewHelpers.cpp   // UI utilities
 
 // Models
-src/Models/Item.cpp         // Item model
+src/Models/Item.cpp         // Item model (HomeBox)
 src/Models/Location.cpp     // Location model
+src/Models/Device.cpp       // Device model (NetBox)
+src/Models/AssetSummary.cpp // Backend-neutral detail-screen projection
 src/Models/JsonLite.cpp     // JSON parser
 ```
+
+Both `.cpp` and `.hpp` files are listed in `proj/HBXClient.vcproj`; a new source
+that is not added there is silently left out of the device build. The two
+`VCCLCompilerTool` blocks set `RuntimeTypeInfo="false"` — the codebase uses no
+RTTI or `dynamic_cast`, and the type information is dead weight in an ARMV4I
+binary.
 
 #### Include Directories
 
@@ -394,8 +405,13 @@ the subset of the Windows API the code uses onto the host:
 
 | Layer | Host build |
 |-------|-----------|
-| `StrUtil`, `JsonLite`, `Item`, `Location`, `Journal`, `Config`, `SyncEngine` queue/replay, `HttpClient` URL parsing, `HbClient` request gating | **compiled + unit/integration tested** |
+| `StrUtil`, `JsonLite`, `Item`, `Location`, `Device`, `AssetSummary`, `Journal`, `Config`, `SyncEngine` queue/replay + backend routing, `HttpClient` URL parsing, `HbClient` request gating, `NbClient` URL/payload construction and device parsing | **compiled + unit/integration tested** |
 | GUI views, `Controller`, `main`, `ScannerHAL` | **compile-checked** (need a real device to run) |
+
+`NbClient`'s static helpers — `ClassifyCode`, `BuildLookupPath`,
+`BuildDevicePath`, `BuildMoveBody`, `BuildStatusPayload`, `BuildMovePayload`,
+`SummarizeDevice` — are pure functions of their arguments, which is what lets
+the host suite cover the NetBox-specific behaviour with no server involved.
 
 The compiled-and-tested set is `CORE_SRC` in `tests/host/Makefile`; every source
 under `src/` is compile-checked by the two gates regardless.
@@ -435,9 +451,16 @@ tests/host/
 ├── test_framework.hpp    # tiny zero-dependency assertion framework (TEST_CASE / CHECK*)
 ├── test_main.cpp         # runner entry point
 └── Makefile              # build gate + test runner
-tests/unit/               # test_strutil.cpp, test_json.cpp, test_journal.cpp, test_http.cpp
-tests/integration/        # test_api_endpoints.cpp, test_offline_sync.cpp
+tests/unit/               # test_strutil.cpp, test_json.cpp, test_journal.cpp,
+                          # test_http.cpp, test_netbox.cpp
+tests/integration/        # test_api_endpoints.cpp, test_hb_backend.cpp,
+                          # test_offline_sync.cpp
 ```
+
+A new test file must be added to `TEST_SRC` in `tests/host/Makefile`, and a new
+production source to `CORE_SRC` if the suite links against it. `compile-all` and
+`compile-device` glob `src/` and pick new sources up on their own, so a source
+missing from `CORE_SRC` is still compile-checked — just never run.
 
 > The shim is **host-only** — it lives on the test include path and is never
 > seen by the real Windows Mobile build.
